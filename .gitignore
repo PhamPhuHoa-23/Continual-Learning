@@ -53,9 +53,9 @@ wandb/
 runs/
 tensorboard/
 
-# Data
-data/
-datasets/
+# Data (actual datasets, not src/data/ code)
+/data/
+/datasets/
 *.csv
 *.h5
 *.hdf5
