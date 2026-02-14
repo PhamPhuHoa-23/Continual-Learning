@@ -55,7 +55,8 @@ def load_slot_attention_checkpoint(
     
     # Load checkpoint
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # weights_only=False for PyTorch 2.6+ compatibility with Lightning checkpoints
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         print(f"✓ Checkpoint loaded successfully")
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
@@ -154,7 +155,7 @@ def load_agent_checkpoint(
     
     print(f"Loading agent checkpoint from: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Load student agents
     if 'student_agents' in checkpoint:
@@ -210,7 +211,7 @@ def load_estimator_checkpoint(
     
     print(f"Loading estimator checkpoint from: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'estimators' in checkpoint:
         estimators.load_state_dict(checkpoint['estimators'], strict=strict)
