@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+*.pkl
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+wandb/
+runs/
+tensorboard/
+
+# Data
+data/
+datasets/
+*.csv
+*.h5
+*.hdf5
+
+# Checkpoints & Models
+checkpoints/
+saved_models/
+outputs/
+results/
+
+# Setup folder (downloaded repos & pretrained weights)
+Setup/
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# Experiments
+experiments/
+temp/
+tmp/
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Ignore specific large documentation (keep essential ones)
+# (None to ignore for now, all docs are useful)
