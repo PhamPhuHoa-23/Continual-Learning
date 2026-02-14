@@ -1,0 +1,43 @@
+name: continual-learning
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.10
+  
+  # Deep Learning with CUDA
+  - pytorch::pytorch=2.1.0
+  - pytorch::torchvision=0.16.0
+  - pytorch::torchaudio=2.1.0
+  - pytorch::pytorch-cuda=12.1
+  
+  # Scientific Computing
+  - numpy=1.24.3
+  - pandas=2.0.3
+  - scipy=1.11.1
+  
+  # Visualization
+  - matplotlib=3.7.2
+  - seaborn=0.12.2
+  
+  # Testing
+  - pytest=7.4.0
+  - pytest-cov=4.1.0
+  
+  # Development
+  - jupyter=1.0.0
+  - ipython=8.14.0
+  
+  # Pip packages
+  - pip=23.2.1
+  - pip:
+      - avalanche-lib==0.4.0
+      - wandb==0.15.8
+      - tensorboard==2.13.0
+      - timm==0.9.7
+      - tqdm==4.66.1
+
