@@ -117,65 +117,171 @@ predictions = tree.predict(hidden_labels)
 
 ## 🎓 Training Strategy
 
-### Supervised + Self-Supervised (DINOv2-style)
+### Phase 1: DINO-style Self-Supervised Learning (Agents)
+
+Agents learn hidden representations via **simplified DINO** (no augmentation, only centering + sharpening):
 
 ```python
-# Supervised
-hidden_labels = model(images, return_hidden=True)
-tree.fit(hidden_labels, targets)
+from src.slot_multi_agent import DINOLoss
 
-# Self-supervised
-aug1, aug2 = augment(images)
-h1 = model(aug1, return_hidden=True)
-h2 = model(aug2, return_hidden=True)
-loss = contrastive_loss(h1, h2)
+# Student and Teacher agents (Teacher updated via EMA)
+student_logits = student_agent(slot)  # (B, num_prototypes)
+teacher_logits = teacher_agent(slot)  # (B, num_prototypes)
+
+# DINO Loss: Centering + Temperature Sharpening
+dino_loss = DINOLoss(
+    num_prototypes=256,
+    student_temp=0.1,    # Higher temp (softer)
+    teacher_temp=0.07,   # Lower temp (sharper, more confident)
+    center_momentum=0.9  # EMA for center (prevents collapse)
+)
+loss = dino_loss(student_logits, teacher_logits)
+```
+
+**Key mechanisms:**
+- ✅ **Centering**: Subtract running mean from teacher outputs (prevent mode collapse)
+- ✅ **Sharpening**: Lower temperature for teacher (more confident predictions)
+- ✅ **EMA Teacher**: Teacher updated via exponential moving average (no backprop)
+- ❌ **NO multi-crop augmentation** (simplified version)
+
+### Phase 2: Supervised Tree Training
+
+```python
+# Get hidden labels from trained agents
+hidden_labels = []
+for slot in slots:
+    selected_agents = selector.select_top_k(slot, k=3)
+    labels = [agent(slot) for agent in selected_agents]
+    hidden_labels.append(torch.cat(labels))
+
+# Train Hoeffding Tree incrementally
+tree.partial_fit(hidden_labels, targets)  # Supports new classes
 ```
 
 ## 📊 Key Features
 
-- ✅ **Slot Attention**: Object-centric decomposition
-- ✅ **VAE/MLP Estimators**: Performance estimation
-- ✅ **Top-k Selection**: Efficient agent selection (k=3)
-- ✅ **50 Agents**: ResidualMLP (same architecture, different weights)
-- ✅ **Hoeffding Tree**: True incremental learning
-- ✅ **Hidden Labels**: DINO-style embeddings
-- ✅ **Complete System**: End-to-end pipeline
+- ✅ **Slot Attention**: Object-centric decomposition (adaptive slots 3-10)
+- ✅ **VAE/MLP Estimators**: Lightweight performance estimation
+- ✅ **Top-k Selection**: Efficient agent selection per slot (k=3)
+- ✅ **Bandit Strategies**: UCB, Thompson Sampling, Epsilon-Greedy
+- ✅ **50 Agents**: ResidualMLP (same architecture, specialized weights)
+- ✅ **Hoeffding Tree**: True incremental learning (no retraining)
+- ✅ **Hidden Labels**: Softmax probabilities over 256 prototypes
+- ✅ **DINO Training**: Centering + sharpening (simplified, no augmentation)
+- ✅ **Complete System**: End-to-end pipeline with checkpointing
 
 ## 🚀 Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements_slot_agent.txt
-pip install river  # For Hoeffding Tree
+# 1. Install dependencies
+pip install -r requirements.txt
 
-# Run system
+# 2. Load configuration
 python -c "
-from src.slot_multi_agent import SlotMultiAgentSystem
-system = SlotMultiAgentSystem(num_agents=50, k=3, device='cuda')
-print('System ready!')
+from src.utils import load_config
+cfg = load_config('config.yaml')
+print(f'Agents: {cfg.agents.num_agents}')
+print(f'Prototypes: {cfg.agents.num_prototypes}')
+print(f'Slots: {cfg.slot_attention.min_slots}-{cfg.slot_attention.max_slots}')
+"
+
+# 3. Quick test
+python -c "
+from src.slot_multi_agent import create_agent_pool
+students, teachers = create_agent_pool(50, 64, 256)
+print(f'✓ Created {len(students)} agents')
 "
 ```
 
-See **QUICKSTART.md** for complete examples!
+See **QUICKSTART.md** for training examples and **CONFIG_GUIDE.md** for all options!
+
+## ⚙️ Configuration
+
+All system parameters are managed via **`config.yaml`**:
+
+```yaml
+# Example: config.yaml
+slot_attention:
+  adaptive: true        # AdaSlot (adaptive slot count)
+  min_slots: 3
+  max_slots: 10
+  slot_dim: 64
+
+agents:
+  num_agents: 50
+  num_prototypes: 256   # Hidden label dimension
+  dino:
+    student_temp: 0.1
+    teacher_temp: 0.07
+    center_momentum: 0.9
+
+selection:
+  strategy: "top_k"     # "top_k" | "ucb" | "thompson" | "epsilon_greedy"
+  k: 3
+
+aggregator:
+  type: "hoeffding_tree"  # Incremental learning
+```
+
+**8 Pre-configured Variants:**
+- `01_baseline_adaptive_slots.yaml` - Standard setup
+- `02_ucb_bandit_exploration.yaml` - UCB agent selection
+- `03_large_prototypes.yaml` - 512 prototypes (more expressive)
+- `04_ensemble_tree.yaml` - 5 trees for robustness
+- `05_thompson_sampling.yaml` - Bayesian agent selection
+- `06_fixed_slots.yaml` - Fixed 7 slots (no adaptation)
+- `07_pretrained_slot_attention.yaml` - Load AdaSlot checkpoint
+- `08_pretrained_agents_phase2.yaml` - Skip Phase 1
+
+See **CONFIG_GUIDE.md** for all options!
 
 ## 🔧 Next Steps
 
 1. ✅ ~~Implement all components~~ **DONE!**
-2. 🎯 Train on CIFAR-100 continual learning
-3. 🎯 Experiment with different k values
-4. 🎯 Compare VAE vs MLP estimators
-5. 🎯 Research better estimation methods (see RESEARCH_PROMPT...md)
+2. 🎯 Train Phase 1 (agents with DINO)
+3. 🎯 Train Phase 2 (incremental tree)
+4. 🎯 Compare selection strategies (top-k vs bandit)
+5. 🎯 Experiment with prototype dimensions
+6. 🎯 Research better estimation methods (see RESEARCH_PROMPT...md)
 
-## 📝 Notes
+## 📚 Documentation
 
-- **Agents có cùng architecture**, khác nhau ở weights (specialized)
-- **Sub-networks**: VAE hoặc MLP đơn giản
-- **Top-k selection**: Không phức tạp, chỉ sort scores
-- **Decision tree**: Hỗ trợ học thêm classes mới
-- **Aggregation**: Bạn sẽ bàn chi tiết cách kết hợp outputs
+- **ARCHITECTURE_FINAL.md** (651 lines) - Complete system architecture
+- **CONFIG_GUIDE.md** (700+ lines) - All configuration options
+- **CHECKPOINT_GUIDE.md** (500+ lines) - Loading/saving models
+- **DINOV2_TRAINING_DETAILS.md** (376 lines) - DINO mechanism deep dive
+- **RESEARCH_PROMPT_PERFORMANCE_ESTIMATION.md** (304 lines) - Research directions
+- **QUICKSTART.md** (190 lines) - Step-by-step examples
+
+## 📝 Implementation Notes
+
+- **Agents**: Same architecture (ResidualMLP), specialized via DINO training
+- **Estimators**: VAE (reconstruction-based) or MLP (direct prediction)
+- **Selection**: Top-k (deterministic) or bandit (exploration)
+- **Hidden Labels**: Softmax probabilities (continuous, not discrete)
+- **Tree**: Hoeffding Tree (true incremental, no retraining)
+- **DINO**: Simplified version (centering + sharpening, no augmentation)
+- **Checkpoints**: Full support for resuming training
+
+## 🌟 Key Design Decisions
+
+1. **Why simplified DINO?** 
+   - Full DINOv2 requires multi-crop augmentation (expensive)
+   - Centering + sharpening capture core mechanism
+   - Faster training, still prevents collapse
+
+2. **Why softmax probabilities?**
+   - Decision trees handle continuous features well
+   - More expressive than discrete IDs
+   - Gradual confidence levels
+
+3. **Why Hoeffding Tree?**
+   - True online learning (no retraining)
+   - Supports new classes dynamically
+   - Handles high-dimensional continuous features
 
 ---
 
-**Status**: ✅ **COMPLETE** - All 5 components implemented (~1,600 lines)
+**Status**: ✅ **COMPLETE** - All components implemented (~10,500+ lines)
 
-See **COMPLETE_IMPLEMENTATION.md** for full details!
+**Last Updated**: 2026-02-14
