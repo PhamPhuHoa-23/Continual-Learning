@@ -1,0 +1,365 @@
+"""
+Bandit-based Agent Selection and Weighting.
+
+Uses multi-armed bandit algorithms to balance exploration-exploitation
+when selecting and weighting agents for each slot.
+
+Supported algorithms:
+    - UCB (Upper Confidence Bound)
+    - Thompson Sampling
+    - Epsilon-Greedy
+    - Weighted combination based on estimated performance
+
+NOTE: Specific methodology to be determined by professor.
+This module provides a flexible framework for different bandit strategies.
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import List, Tuple, Optional
+from abc import ABC, abstractmethod
+
+
+class BanditSelector(ABC):
+    """
+    Abstract base class for bandit-based agent selection.
+    
+    Each slot requires selecting k agents from a pool of N agents.
+    Bandit algorithms balance:
+        - Exploitation: Choose agents with high estimated performance
+        - Exploration: Try less-explored agents to gather information
+    """
+    
+    @abstractmethod
+    def select_and_weight(
+        self,
+        slot: torch.Tensor,
+        estimated_scores: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k agents and compute their weights.
+        
+        Args:
+            slot: Input slot (batch_size, slot_dim)
+            estimated_scores: Estimated performance for each agent (batch_size, num_agents)
+                Higher score = better expected performance
+            k: Number of agents to select
+        
+        Returns:
+            selected_indices: (batch_size, k) - indices of selected agents
+            weights: (batch_size, k) - weights for each selected agent (sum to 1)
+        """
+        pass
+    
+    @abstractmethod
+    def update(
+        self,
+        agent_idx: int,
+        slot: torch.Tensor,
+        reward: float
+    ):
+        """
+        Update bandit statistics after observing reward.
+        
+        Args:
+            agent_idx: Index of agent that was selected
+            slot: Slot that was processed
+            reward: Observed reward (e.g., negative loss, accuracy)
+        """
+        pass
+
+
+class UCBSelector(BanditSelector):
+    """
+    Upper Confidence Bound (UCB) for agent selection.
+    
+    UCB balances exploitation (mean reward) and exploration (uncertainty).
+    
+    Formula:
+        UCB(agent_i) = μ_i + c * sqrt(log(t) / n_i)
+        where:
+            μ_i = mean reward for agent i
+            n_i = number of times agent i was selected
+            t = total number of selections
+            c = exploration constant
+    
+    Args:
+        num_agents: Total number of agents
+        exploration_constant: UCB exploration constant (default: 2.0)
+    
+    Reference:
+        Auer et al. (2002) "Finite-time Analysis of the Multiarmed Bandit Problem"
+    """
+    
+    def __init__(self, num_agents: int, exploration_constant: float = 2.0):
+        self.num_agents = num_agents
+        self.c = exploration_constant
+        
+        # Statistics (per agent)
+        self.counts = np.zeros(num_agents)  # n_i
+        self.values = np.zeros(num_agents)  # μ_i
+        self.total_count = 0  # t
+    
+    def select_and_weight(
+        self,
+        slot: torch.Tensor,
+        estimated_scores: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k agents using UCB, then weight by softmax of UCB scores.
+        """
+        batch_size = slot.size(0)
+        device = slot.device
+        
+        # Compute UCB scores
+        ucb_scores = self._compute_ucb()  # (num_agents,)
+        ucb_scores_tensor = torch.tensor(ucb_scores, device=device)
+        
+        # Combine with estimated scores (e.g., average or product)
+        # Here we use weighted sum
+        combined_scores = estimated_scores + 0.5 * ucb_scores_tensor.unsqueeze(0)
+        
+        # Select top-k
+        top_k_values, top_k_indices = torch.topk(combined_scores, k=k, dim=1)
+        
+        # Compute weights via softmax
+        weights = torch.softmax(top_k_values, dim=1)  # (batch_size, k)
+        
+        return top_k_indices, weights
+    
+    def _compute_ucb(self) -> np.ndarray:
+        """Compute UCB scores for all agents."""
+        ucb_scores = np.zeros(self.num_agents)
+        
+        for i in range(self.num_agents):
+            if self.counts[i] == 0:
+                # Infinite bonus for unexplored agents
+                ucb_scores[i] = float('inf')
+            else:
+                # μ_i + c * sqrt(log(t) / n_i)
+                exploration_bonus = self.c * np.sqrt(
+                    np.log(self.total_count + 1) / self.counts[i]
+                )
+                ucb_scores[i] = self.values[i] + exploration_bonus
+        
+        return ucb_scores
+    
+    def update(self, agent_idx: int, slot: torch.Tensor, reward: float):
+        """Update statistics for agent after observing reward."""
+        self.counts[agent_idx] += 1
+        self.total_count += 1
+        
+        # Incremental mean update
+        n = self.counts[agent_idx]
+        self.values[agent_idx] += (reward - self.values[agent_idx]) / n
+
+
+class ThompsonSamplingSelector(BanditSelector):
+    """
+    Thompson Sampling for agent selection.
+    
+    Maintains Beta distributions for each agent's success probability.
+    Samples from posterior to balance exploration-exploitation.
+    
+    Args:
+        num_agents: Total number of agents
+        alpha_init: Initial alpha (successes + 1) for Beta prior (default: 1.0)
+        beta_init: Initial beta (failures + 1) for Beta prior (default: 1.0)
+    
+    Reference:
+        Thompson (1933) "On the Likelihood that One Unknown Probability 
+        Exceeds Another in View of the Evidence of Two Samples"
+    """
+    
+    def __init__(
+        self,
+        num_agents: int,
+        alpha_init: float = 1.0,
+        beta_init: float = 1.0
+    ):
+        self.num_agents = num_agents
+        self.alphas = np.full(num_agents, alpha_init)  # Successes
+        self.betas = np.full(num_agents, beta_init)    # Failures
+    
+    def select_and_weight(
+        self,
+        slot: torch.Tensor,
+        estimated_scores: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k agents by sampling from Beta posteriors.
+        """
+        batch_size = slot.size(0)
+        device = slot.device
+        
+        # Sample from Beta posteriors
+        sampled_probs = np.random.beta(self.alphas, self.betas)  # (num_agents,)
+        sampled_probs_tensor = torch.tensor(sampled_probs, device=device, dtype=torch.float32)
+        
+        # Combine with estimated scores
+        combined_scores = estimated_scores + sampled_probs_tensor.unsqueeze(0)
+        
+        # Select top-k
+        top_k_values, top_k_indices = torch.topk(combined_scores, k=k, dim=1)
+        
+        # Compute weights (softmax of sampled probabilities)
+        weights = torch.softmax(top_k_values, dim=1)
+        
+        return top_k_indices, weights
+    
+    def update(self, agent_idx: int, slot: torch.Tensor, reward: float):
+        """
+        Update Beta distribution for agent.
+        
+        Reward should be in [0, 1] or converted to binary success/failure.
+        """
+        # Convert reward to success probability
+        # Assume reward in [0, 1] where 1 = success, 0 = failure
+        success = reward  # Can be fractional for soft updates
+        failure = 1 - reward
+        
+        self.alphas[agent_idx] += success
+        self.betas[agent_idx] += failure
+
+
+class EpsilonGreedySelector(BanditSelector):
+    """
+    Epsilon-Greedy selection strategy.
+    
+    With probability ε: explore (random selection)
+    With probability 1-ε: exploit (select top-k by estimated score)
+    
+    Args:
+        num_agents: Total number of agents
+        epsilon: Exploration probability (default: 0.1)
+        epsilon_decay: Decay rate for epsilon (default: 0.995)
+        min_epsilon: Minimum epsilon value (default: 0.01)
+    """
+    
+    def __init__(
+        self,
+        num_agents: int,
+        epsilon: float = 0.1,
+        epsilon_decay: float = 0.995,
+        min_epsilon: float = 0.01
+    ):
+        self.num_agents = num_agents
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.min_epsilon = min_epsilon
+        
+        # Statistics
+        self.counts = np.zeros(num_agents)
+        self.values = np.zeros(num_agents)
+    
+    def select_and_weight(
+        self,
+        slot: torch.Tensor,
+        estimated_scores: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k agents with epsilon-greedy strategy.
+        """
+        batch_size = slot.size(0)
+        device = slot.device
+        
+        # Explore or exploit?
+        if np.random.rand() < self.epsilon:
+            # Explore: random selection
+            indices = torch.randperm(self.num_agents, device=device)[:k]
+            indices = indices.unsqueeze(0).expand(batch_size, -1)
+            weights = torch.ones(batch_size, k, device=device) / k
+        else:
+            # Exploit: top-k by estimated score
+            top_k_values, indices = torch.topk(estimated_scores, k=k, dim=1)
+            weights = torch.softmax(top_k_values, dim=1)
+        
+        # Decay epsilon
+        self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+        
+        return indices, weights
+    
+    def update(self, agent_idx: int, slot: torch.Tensor, reward: float):
+        """Update statistics for agent."""
+        self.counts[agent_idx] += 1
+        n = self.counts[agent_idx]
+        self.values[agent_idx] += (reward - self.values[agent_idx]) / n
+
+
+class WeightedTopKSelector(BanditSelector):
+    """
+    Simple weighted top-k selection (no exploration).
+    
+    Selects top-k agents by estimated score and weights them via softmax.
+    This is the baseline without bandit algorithms.
+    
+    Args:
+        num_agents: Total number of agents
+        temperature: Temperature for softmax weighting (default: 1.0)
+    """
+    
+    def __init__(self, num_agents: int, temperature: float = 1.0):
+        self.num_agents = num_agents
+        self.temperature = temperature
+    
+    def select_and_weight(
+        self,
+        slot: torch.Tensor,
+        estimated_scores: torch.Tensor,
+        k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-k agents by score and weight via softmax.
+        """
+        # Select top-k
+        top_k_values, top_k_indices = torch.topk(estimated_scores, k=k, dim=1)
+        
+        # Compute weights via softmax
+        weights = torch.softmax(top_k_values / self.temperature, dim=1)
+        
+        return top_k_indices, weights
+    
+    def update(self, agent_idx: int, slot: torch.Tensor, reward: float):
+        """No-op for simple top-k selector."""
+        pass
+
+
+def create_bandit_selector(
+    strategy: str,
+    num_agents: int,
+    **kwargs
+) -> BanditSelector:
+    """
+    Factory function to create bandit selectors.
+    
+    Args:
+        strategy: One of ['ucb', 'thompson', 'epsilon_greedy', 'weighted_topk']
+        num_agents: Total number of agents
+        **kwargs: Additional arguments for specific selectors
+    
+    Returns:
+        BanditSelector instance
+    
+    Example:
+        >>> selector = create_bandit_selector('ucb', num_agents=50, exploration_constant=2.0)
+    """
+    if strategy == 'ucb':
+        return UCBSelector(num_agents, **kwargs)
+    elif strategy == 'thompson':
+        return ThompsonSamplingSelector(num_agents, **kwargs)
+    elif strategy == 'epsilon_greedy':
+        return EpsilonGreedySelector(num_agents, **kwargs)
+    elif strategy == 'weighted_topk':
+        return WeightedTopKSelector(num_agents, **kwargs)
+    else:
+        raise ValueError(
+            f"Unknown strategy: {strategy}. "
+            f"Choose from: ucb, thompson, epsilon_greedy, weighted_topk"
+        )
+
+
