@@ -1,0 +1,25 @@
+# VARIANT 4: Ensemble Tree Aggregator
+# - Adaptive Random Forest (10 trees)
+# - Better performance but slower
+# - Handles concept drift well
+
+_base_: ../config.yaml
+
+experiment:
+  name: "ensemble_tree"
+  description: |
+    Uses Adaptive Random Forest (ensemble of 10 trees) instead of single tree.
+    Better performance but slower inference.
+  tags:
+    - "ensemble"
+    - "random-forest"
+
+aggregator:
+  type: "ensemble"
+  ensemble:
+    n_models: 10
+    max_features: "sqrt"
+    grace_period: 200
+    split_confidence: 1.0e-5
+
+

@@ -1,0 +1,44 @@
+# VARIANT 8: Pretrained Agents (Skip Phase 1, Start Phase 2)
+# - Load pretrained agent weights from Phase 1
+# - Skip agent training (Phase 1)
+# - Go directly to tree training (Phase 2)
+
+_base_: ../config.yaml
+
+experiment:
+  name: "pretrained_agents_phase2"
+  description: |
+    Load pretrained agents from Phase 1 (DINO SSL training).
+    Skip Phase 1, directly train incremental tree (Phase 2).
+  tags:
+    - "pretrained-agents"
+    - "phase2-only"
+
+agents:
+  num_agents: 50
+  num_prototypes: 256
+  
+  # Enable pretrained checkpoint
+  pretrained:
+    enabled: true
+    checkpoint_path: "./checkpoints/agents/agents_phase1_epoch10.pth"
+    load_teacher: true   # Load teacher weights (for EMA)
+    strict_load: false
+    freeze: true         # Freeze agents (skip Phase 1 training)
+
+training:
+  # Disable Phase 1 (agents already trained)
+  phase1_agents:
+    enabled: false
+  
+  # Enable Phase 2 only
+  phase2_tree:
+    enabled: true
+    eval_every_n_examples: 100
+
+# Note: Run Phase 1 first to generate the checkpoint:
+#   python train_phase1.py --config config.yaml
+# This will save checkpoint to: ./checkpoints/agents/agents_phase1_epoch10.pth
+# Then use this config to skip Phase 1 and go directly to Phase 2.
+
+

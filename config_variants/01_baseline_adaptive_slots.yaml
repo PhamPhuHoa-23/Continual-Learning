@@ -1,0 +1,34 @@
+# VARIANT 1: Baseline with Adaptive Slots
+# - AdaSlot (3-10 slots)
+# - VAE estimators
+# - Simple top-k selection
+# - Hoeffding Adaptive Tree
+
+# Inherit from base config and override specific values
+_base_: ../config.yaml
+
+experiment:
+  name: "baseline_adaptive_slots"
+  description: |
+    Baseline configuration with adaptive slot count (AdaSlot).
+    Simple top-k selection without bandit exploration.
+  tags:
+    - "baseline"
+    - "adaptive-slots"
+    - "topk"
+
+slot_attention:
+  adaptive: true
+  min_slots: 3
+  max_slots: 10
+
+selection:
+  strategy: "topk_estimator"
+  k: 3
+
+estimators:
+  type: "vae"
+
+agents:
+  num_prototypes: 256
+

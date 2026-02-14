@@ -1,0 +1,35 @@
+# VARIANT 7: With Pretrained Slot Attention
+# - Load pretrained AdaSlot checkpoint (CLEVR10.ckpt)
+# - Train agents from scratch (Phase 1)
+# - Train tree incrementally (Phase 2)
+
+_base_: ../config.yaml
+
+experiment:
+  name: "pretrained_slot_attention"
+  description: |
+    Uses pretrained Slot Attention weights (AdaSlot CLEVR10).
+    Agents are trained from scratch with DINO SSL.
+  tags:
+    - "pretrained"
+    - "adaslot"
+    - "clevr"
+
+slot_attention:
+  adaptive: true
+  min_slots: 3
+  max_slots: 10
+  slot_dim: 64
+  
+  # Enable pretrained checkpoint
+  pretrained:
+    enabled: true
+    checkpoint_path: "./checkpoints/slot_attention/CLEVR10.ckpt"  # AdaSlot pretrained on CLEVR
+    strict_load: false  # Ignore missing keys (shape mismatch may occur)
+    freeze: false       # Fine-tune Slot Attention (set true to freeze)
+
+# Note: If checkpoint not found, download from:
+# https://drive.google.com/drive/folders/1vLSh34sM_HQQbGTG3FPi-d7RXLfG8wSf
+# Or train Slot Attention from scratch (set pretrained.enabled=false)
+
+

@@ -1,0 +1,31 @@
+# VARIANT 2: UCB Bandit with Exploration
+# - AdaSlot (3-10 slots)
+# - VAE estimators
+# - UCB bandit selection (exploration-exploitation)
+# - Hoeffding Adaptive Tree
+
+_base_: ../config.yaml
+
+experiment:
+  name: "ucb_bandit_exploration"
+  description: |
+    UCB bandit-based agent selection for exploration-exploitation.
+    Balances trying new agents vs. exploiting known good ones.
+  tags:
+    - "bandit"
+    - "ucb"
+    - "exploration"
+
+selection:
+  strategy: "bandit_ucb"
+  k: 3
+  bandit:
+    ucb:
+      exploration_constant: 2.0  # Higher = more exploration
+
+training:
+  phase2_tree:
+    update_bandit: true
+    reward_type: "accuracy"
+
+

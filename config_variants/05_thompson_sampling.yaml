@@ -1,0 +1,31 @@
+# VARIANT 5: Thompson Sampling Bandit
+# - Thompson Sampling (Bayesian bandit)
+# - Maintains Beta distributions for each agent
+# - More principled exploration than UCB
+
+_base_: ../config.yaml
+
+experiment:
+  name: "thompson_sampling"
+  description: |
+    Thompson Sampling for agent selection.
+    Bayesian approach with Beta posteriors.
+  tags:
+    - "bandit"
+    - "thompson-sampling"
+    - "bayesian"
+
+selection:
+  strategy: "bandit_thompson"
+  k: 3
+  bandit:
+    thompson:
+      alpha_init: 1.0
+      beta_init: 1.0
+
+training:
+  phase2_tree:
+    update_bandit: true
+    reward_type: "accuracy"
+
+

@@ -1,0 +1,26 @@
+# VARIANT 6: Fixed Slots (No AdaSlot)
+# - Fixed number of slots (7)
+# - For ablation: compare with adaptive slots
+# - Simpler but less flexible
+
+_base_: ../config.yaml
+
+experiment:
+  name: "fixed_slots"
+  description: |
+    Fixed slot count (7 slots) instead of adaptive.
+    For ablation study to compare with AdaSlot.
+  tags:
+    - "fixed-slots"
+    - "ablation"
+
+slot_attention:
+  adaptive: false
+  num_slots: 7  # Fixed count
+  slot_dim: 64
+
+ablation:
+  enabled: true
+  disable_adaptive_slots: true
+
+
