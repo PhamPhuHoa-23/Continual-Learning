@@ -1,0 +1,60 @@
+# Data Pipeline Configuration for CIFAR-100 Continual Learning
+# Author: Your Team
+# Date: 2026-02-12
+
+# Dataset configuration
+data:
+  dataset: cifar100
+  root: ./data
+  download: true
+
+# Continual learning settings
+continual_learning:
+  n_tasks: 5  # Number of sequential tasks (2, 5, 10, 20, 50, 100)
+  seed: 42    # Random seed for reproducibility
+
+# Data loader settings
+dataloader:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  drop_last: false
+
+# Data augmentation settings
+augmentation:
+  train:
+    random_crop:
+      enabled: true
+      size: 32
+      padding: 4
+    
+    random_horizontal_flip:
+      enabled: true
+      p: 0.5
+  
+  normalize:
+    mean: [0.5071, 0.4867, 0.4408]
+    std: [0.2675, 0.2565, 0.2761]
+
+# Experimental settings (for different difficulty levels)
+presets:
+  easy:
+    n_tasks: 2
+    batch_size: 128
+  
+  medium:
+    n_tasks: 5
+    batch_size: 128
+  
+  hard:
+    n_tasks: 10
+    batch_size: 128
+  
+  very_hard:
+    n_tasks: 20
+    batch_size: 64
+  
+  extreme:
+    n_tasks: 100
+    batch_size: 32
+
