@@ -27,7 +27,7 @@
 # To do so automatically, `train.py` handles the `--pretrained` argument to download models if absent.
 
 # %%
-!python -m src.models.adaslot.train --phase 1 --p1_steps 1000 --save_dir checkpoints/adaslot
+!python -m src.models.adaslot.train --phase 1 --p1_steps 1000
 
 # %% [markdown]
 # ## 3. Phase 2: Train Atomic Agents (DINO SSL)
