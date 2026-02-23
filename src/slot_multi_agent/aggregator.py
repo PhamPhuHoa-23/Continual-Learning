@@ -12,9 +12,7 @@ Two core problems solved:
     1. Which expert does input x belong to? (Prototype matching + cosine similarity)
     2. Create new expert or assign to existing? (CRP + Gradient Alignment Score)
 
-Score formula:
-    Score(k) = (N_k / (N_total + α)) × Alignment(g_new, g_old^k)
-               \_______Popularity______/   \____Compatibility____/
+
 
 Reference:
     - CRP: Aldous (1985), Pitman (2006)

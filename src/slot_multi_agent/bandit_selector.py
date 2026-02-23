@@ -329,24 +329,215 @@ class WeightedTopKSelector(BanditSelector):
         pass
 
 
+class UCBWeightedMoE:
+    """
+    UCB-based Weighted Mixture of Experts.
+
+    Adapted from omoe-codebase UCB_Bandit for the slot-based multi-agent
+    continual-learning system.  Instead of selecting a single subset of
+    experts (as in combo_bandit.py), this class computes UCB-derived
+    weights for ALL pre-filtered agents to form a weighted committee.
+
+    Full inference pipeline (per slot):
+        1. VAE/MLP estimators fast-filter 50 agents → top-K candidates
+        2. UCBWeightedMoE computes UCB score for each of the K agents
+        3. Softmax(UCB / temperature) → committee weights  (sums to 1)
+        4. All K agents run on the slot → weighted sum of outputs
+
+    UCB formula per agent i:
+        UCB(i) = μ_i + c × √(ln t / n_i)
+    where
+        μ_i  = empirical mean reward for agent i
+        n_i  = number of rounds in which agent i participated
+        t    = total number of selection rounds
+        c    = exploration constant (default √2)
+
+    During a burn-in period (first ``burn_in`` rounds) all agents
+    receive uniform weights to ensure sufficient exploration.
+
+    Reward distribution:  After the CRP aggregator makes a prediction
+    the binary reward (correct/incorrect) is distributed to every
+    committee member *proportionally to its weight*.
+
+    Reference:
+        Auer et al. (2002) "Finite-time Analysis of the Multiarmed
+        Bandit Problem"
+        omoe-codebase: combo_bandit.py (UCB_Bandit), theta_wmv.py
+
+    Args:
+        num_agents: Total number of agents in the pool.
+        exploration_constant: UCB exploration bonus coefficient.
+        temperature: Softmax temperature for weight computation.
+        burn_in: Number of initial rounds with uniform weights.
+    """
+
+    def __init__(
+        self,
+        num_agents: int,
+        exploration_constant: float = 1.414,   # √2
+        temperature: float = 1.0,
+        burn_in: int = 100,
+    ):
+        self.num_agents = num_agents
+        self.c = exploration_constant
+        self.temperature = temperature
+        self.burn_in = burn_in
+
+        # Per-agent statistics
+        self.counts = np.zeros(num_agents)          # n_i
+        self.values = np.zeros(num_agents)          # μ_i  (mean reward)
+        self.total_count = 0                        # t
+
+    # ------------------------------------------------------------------
+    #  Core API
+    # ------------------------------------------------------------------
+
+    def get_ucb_scores(self, agent_ids: List[int]) -> np.ndarray:
+        """
+        Compute raw UCB scores for a subset of agents.
+
+        Args:
+            agent_ids: List of agent indices (already filtered by estimators).
+
+        Returns:
+            ucb_scores: (len(agent_ids),) — raw UCB values.
+        """
+        scores = np.zeros(len(agent_ids))
+        for i, aid in enumerate(agent_ids):
+            if self.counts[aid] == 0:
+                scores[i] = float('inf')
+            else:
+                scores[i] = self.values[aid] + self.c * np.sqrt(
+                    np.log(self.total_count + 1) / self.counts[aid]
+                )
+        return scores
+
+    def get_weights(
+        self,
+        filtered_agent_ids: List[int],
+    ) -> Tuple[List[int], np.ndarray]:
+        """
+        Compute committee weights for ALL filtered agents.
+
+        During burn-in (total_count < burn_in) returns uniform weights
+        to encourage exploration.  Afterwards uses softmax over UCB
+        scores.
+
+        Args:
+            filtered_agent_ids: Agent IDs that passed the VAE/MLP filter.
+
+        Returns:
+            agent_ids:  Same list (for downstream convenience).
+            weights:    (K,) array summing to 1.
+        """
+        K = len(filtered_agent_ids)
+        if K == 0:
+            return filtered_agent_ids, np.array([])
+
+        # Burn-in → uniform
+        if self.total_count < self.burn_in:
+            return filtered_agent_ids, np.ones(K) / K
+
+        ucb_scores = self.get_ucb_scores(filtered_agent_ids)
+
+        # Handle unexplored agents (inf UCB)
+        has_inf = np.isinf(ucb_scores)
+        if has_inf.any():
+            weights = np.zeros(K)
+            weights[has_inf] = 1.0 / has_inf.sum()
+        else:
+            s = ucb_scores / self.temperature
+            s -= s.max()                       # numerical stability
+            exp_s = np.exp(s)
+            weights = exp_s / exp_s.sum()
+
+        return filtered_agent_ids, weights
+
+    # ------------------------------------------------------------------
+    #  Reward updates
+    # ------------------------------------------------------------------
+
+    def update(self, agent_id: int, reward: float):
+        """Incremental mean-reward update for a single agent."""
+        self.counts[agent_id] += 1
+        self.total_count += 1
+        n = self.counts[agent_id]
+        self.values[agent_id] += (reward - self.values[agent_id]) / n
+
+    def update_batch(
+        self,
+        agent_ids: List[int],
+        weights: np.ndarray,
+        reward: float,
+    ):
+        """
+        Distribute reward to all committee members proportional to weight.
+
+        Args:
+            agent_ids: Committee agent IDs.
+            weights:   Their committee weights (sum to 1).
+            reward:    Global reward (1.0 = correct, 0.0 = wrong).
+        """
+        for aid, w in zip(agent_ids, weights):
+            # Each agent's attributed reward = global reward × its weight
+            self.update(aid, reward * w)
+
+    # ------------------------------------------------------------------
+    #  Convenience / analysis
+    # ------------------------------------------------------------------
+
+    def get_stats(self) -> dict:
+        """Return per-agent UCB statistics (only for agents that were used)."""
+        stats: dict = {'total_count': int(self.total_count), 'per_agent': {}}
+        for i in range(self.num_agents):
+            if self.counts[i] > 0:
+                stats['per_agent'][i] = {
+                    'count': int(self.counts[i]),
+                    'value': float(self.values[i]),
+                    'ucb': float(
+                        self.values[i]
+                        + self.c * np.sqrt(np.log(self.total_count + 1) / self.counts[i])
+                    ),
+                }
+        return stats
+
+    def save(self, path: str):
+        """Persist bandit state to disk."""
+        np.savez(
+            path,
+            counts=self.counts,
+            values=self.values,
+            total_count=np.array([self.total_count]),
+        )
+
+    def load(self, path: str):
+        """Restore bandit state from disk."""
+        data = np.load(path)
+        self.counts = data['counts']
+        self.values = data['values']
+        self.total_count = int(data['total_count'][0])
+
+
 def create_bandit_selector(
     strategy: str,
     num_agents: int,
     **kwargs
-) -> BanditSelector:
+) -> "BanditSelector | UCBWeightedMoE":
     """
     Factory function to create bandit selectors.
-    
+
     Args:
-        strategy: One of ['ucb', 'thompson', 'epsilon_greedy', 'weighted_topk']
+        strategy: One of ['ucb', 'thompson', 'epsilon_greedy',
+                  'weighted_topk', 'ucb_weighted_moe']
         num_agents: Total number of agents
         **kwargs: Additional arguments for specific selectors
-    
+
     Returns:
-        BanditSelector instance
-    
+        BanditSelector (or UCBWeightedMoE) instance.
+
     Example:
         >>> selector = create_bandit_selector('ucb', num_agents=50, exploration_constant=2.0)
+        >>> moe = create_bandit_selector('ucb_weighted_moe', num_agents=50)
     """
     if strategy == 'ucb':
         return UCBSelector(num_agents, **kwargs)
@@ -356,10 +547,13 @@ def create_bandit_selector(
         return EpsilonGreedySelector(num_agents, **kwargs)
     elif strategy == 'weighted_topk':
         return WeightedTopKSelector(num_agents, **kwargs)
+    elif strategy == 'ucb_weighted_moe':
+        return UCBWeightedMoE(num_agents, **kwargs)
     else:
         raise ValueError(
             f"Unknown strategy: {strategy}. "
-            f"Choose from: ucb, thompson, epsilon_greedy, weighted_topk"
+            f"Choose from: ucb, thompson, epsilon_greedy, weighted_topk, "
+            f"ucb_weighted_moe"
         )
 
 

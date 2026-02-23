@@ -1,0 +1,13 @@
+expert_p: [0.1290, 0.1569, 0.2553]
+expert_llm_list: ['mistral-openorca', 'samantha-mistral', 'notus']
+
+t_burn_in: 100
+t: 1100 
+
+delta_confidence: 0.1
+alpha_learn: 0.5
+voting_epsilon: 0.0
+theta_lb: 0.0
+delay_lp_interval: 50
+
+hugging_face_data_name: 'tau/commonsense_qa'

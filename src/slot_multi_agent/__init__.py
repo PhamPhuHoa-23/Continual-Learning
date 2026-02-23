@@ -84,6 +84,7 @@ from .bandit_selector import (
     ThompsonSamplingSelector,
     EpsilonGreedySelector,
     WeightedTopKSelector,
+    UCBWeightedMoE,
     create_bandit_selector
 )
 
@@ -118,6 +119,7 @@ __all__ = [
     'ThompsonSamplingSelector',
     'EpsilonGreedySelector',
     'WeightedTopKSelector',
+    'UCBWeightedMoE',
     'create_bandit_selector',
     
     # Aggregators (CRP)

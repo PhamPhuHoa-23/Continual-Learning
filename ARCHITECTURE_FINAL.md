@@ -2,650 +2,346 @@
 
 ## Overview
 
-A novel continual learning system that combines:
-1. **Slot Attention** - Object-centric decomposition
-2. **DINO-style SSL** - Self-supervised agent training
-3. **Bandit Theory** - Agent selection with exploration-exploitation
-4. **Incremental Trees** - Online learning without catastrophic forgetting
+A continual learning system that chains five major modules:
+
+1. **AdaSlot** – Adaptive object-centric decomposition with Gumbel-based slot pruning
+2. **Atomic Agents (DINO SSL)** – Pool of 50 specialized agents trained self-supervisedly on slot tokens
+3. **Performance Estimators (VAE + MLP)** – Lightweight fast-filter scoring each agent–slot pair; eliminates expensive all-agent inference
+4. **UCB Weighted MoE** – Weighted committee of top-K filtered agents; weights learned via UCB bandit (all K members contribute)
+5. **CRP Expert Aggregator** – Chinese Restaurant Process + Gradient Projection for incremental class-learning without forgetting
+
+Default dataset: **CIFAR-100 continual benchmark** (split into tasks, resolution 128x128).
 
 ---
 
 ## Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         INPUT IMAGE (32×32)                          │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │
-                        ┌────────▼────────┐
-                        │ Slot Attention  │
-                        │  (num_slots=7)  │
-                        └────────┬────────┘
-                                 │
-                     ┌───────────▼───────────┐
-                     │   7 Slot Tokens       │
-                     │   (batch, 7, 64)      │
-                     └───────────┬───────────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            │                    │                    │
-         Slot 1               Slot 2        ...    Slot 7
-            │                    │                    │
-    ┌───────▼──────┐    ┌───────▼──────┐    ┌───────▼──────┐
-    │   STEP 1:    │    │   STEP 1:    │    │   STEP 1:    │
-    │  Estimate    │    │  Estimate    │    │  Estimate    │
-    │ Performance  │    │ Performance  │    │ Performance  │
-    │  (50 agents) │    │  (50 agents) │    │  (50 agents) │
-    └───────┬──────┘    └───────┬──────┘    └───────┬──────┘
-            │                    │                    │
-            │ VAE/MLP           │ VAE/MLP           │ VAE/MLP
-            │ Estimators        │ Estimators        │ Estimators
-            │                    │                    │
-            ├─► scores[50]       ├─► scores[50]       ├─► scores[50]
-            │                    │                    │
-    ┌───────▼──────┐    ┌───────▼──────┐    ┌───────▼──────┐
-    │   STEP 2:    │    │   STEP 2:    │    │   STEP 2:    │
-    │ Bandit-based │    │ Bandit-based │    │ Bandit-based │
-    │  Selection   │    │  Selection   │    │  Selection   │
-    │  + Weighting │    │  + Weighting │    │  + Weighting │
-    └───────┬──────┘    └───────┬──────┘    └───────┬──────┘
-            │                    │                    │
-            │ UCB/Thompson      │ UCB/Thompson      │ UCB/Thompson
-            │ Sampling          │ Sampling          │ Sampling
-            │                    │                    │
-            ├─► top-k=3         ├─► top-k=3         ├─► top-k=3
-            │   weights          │   weights          │   weights
-            │                    │                    │
-    ┌───────▼──────┐    ┌───────▼──────┐    ┌───────▼──────┐
-    │   STEP 3:    │    │   STEP 3:    │    │   STEP 3:    │
-    │ Apply agents │    │ Apply agents │    │ Apply agents │
-    │ to get       │    │ to get       │    │ to get       │
-    │ hidden labels│    │ hidden labels│    │ hidden labels│
-    └───────┬──────┘    └───────┬──────┘    └───────┬──────┘
-            │                    │                    │
-            │ Agent_i(slot)     │ Agent_j(slot)     │ Agent_k(slot)
-            │ → softmax(256)    │ → softmax(256)    │ → softmax(256)
-            │                    │                    │
-            ├─► [p1, p2, p3]    ├─► [p1, p2, p3]    ├─► [p1, p2, p3]
-            │   (3 × 256)       │   (3 × 256)       │   (3 × 256)
-            │                    │                    │
-            └────────────────────┴────────────────────┴─────────┐
-                                                                 │
-                                                       ┌─────────▼─────────┐
-                                                       │   STEP 4:         │
-                                                       │  Concatenate      │
-                                                       │  All Hidden       │
-                                                       │  Labels           │
-                                                       └─────────┬─────────┘
-                                                                 │
-                                                    (7 slots × 3 agents × 256)
-                                                    = 5376 features
-                                                                 │
-                                                       ┌─────────▼─────────┐
-                                                       │   STEP 5:         │
-                                                       │ Hoeffding Tree    │
-                                                       │  (Incremental)    │
-                                                       │                   │
-                                                       │ Learn online:     │
-                                                       │ features → class  │
-                                                       └─────────┬─────────┘
-                                                                 │
-                                                       ┌─────────▼─────────┐
-                                                       │   FINAL CLASS     │
-                                                       │   PREDICTION      │
-                                                       └───────────────────┘
+INPUT IMAGE (B x 3 x 128 x 128)
+         |
++--------+---------+
+|   AdaSlot        |  CNN -> RandomConditioning -> SlotAttention (3 iters)
+|   Model          |  + Gumbel Pruning -> hard_keep_decision (B, 11) in {0,1}
++--------+---------+
+         |  slots (B, S, 64)   S <= 11
+         |
+   [For each slot independently]
+         |
++--------+--------------------------------------------------+
+| Estimators  (trained in Phase 2.5, frozen in Phase 3)     |
+|   VAE_i(slot) reconstructs slot; score = f(recon error)   |
+|   MLP(slot, agent_id) -> quality score                    |
+|   hybrid_score[50] = 0.5 x VAE + 0.5 x MLP               |
+|   -> top-10 agent IDs (filter_k=10)                       |
++--------+--------------------------------------------------+
+         |  filtered_ids [K]
++--------+--------------------------------------------------+
+| UCB Weighted MoE                                          |
+|   UCB(i) = mu_i + c * sqrt(ln t / n_i)                   |
+|   burn-in (t < 100): uniform weights                      |
+|   post burn-in: weights = softmax(UCB[K] / temp)          |
+|   weighted_out = sum_i w_i * agent_i(slot)  -> (256,)     |
++--------+--------------------------------------------------+
+         |  (256,) per slot
+         |  concat S slots -> 11 x 256 = 2816
++--------+--------------------------------------------------+
+| CRP Expert Aggregator                                     |
+|   Score(k) = Similarity x Alignment x Capacity           |
+|   Route to existing expert OR create new expert           |
+|   Expert: 2-layer MLP + Gradient Projection (GPM)        |
+|   -> prediction -> reward -> ucb_moe.update_batch()       |
++--------+--------------------------------------------------+
+         |
+   FINAL PREDICTION (class in [0, 99])
 ```
 
 ---
 
 ## Component Details
 
-### 1. Slot Attention (Object-Centric Decomposition)
+### 1. AdaSlot
 
-**Purpose:** Decompose image into semantically meaningful slots (object-centric tokens).
+**Source:** `src/models/adaslot/model.py`
 
-**Architecture:**
-```python
-SlotAttentionAutoEncoder(
-    num_slots=7,
-    slot_dim=64,
-    num_iterations=3
-)
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_slots` | 11 | Max slots; Gumbel reduces at runtime |
+| `slot_dim` | 64 | Slot embedding dimension |
+| `kvq_dim` | 128 | Key/Query/Value projection dim |
+| `num_iterations` | 3 | Slot Attention refinement rounds |
+| `low_bound` | 1 | Minimum kept slots |
 
-**Output:**
-- `slots`: (batch_size, 7, 64) - 7 slot tokens per image
-- Each slot roughly corresponds to an object or semantic region
+Gumbel score network applies hard binary keep/drop to each slot (differentiable via Gumbel-Softmax). Only kept slots pass downstream.
 
-**Why?**
-- Disentangles objects in the scene
-- Makes agent specialization meaningful (per-object processing)
-- Provides structured input to agents
+**Pre-trained checkpoint:** `checkpoints/slot_attention/adaslot_real/AdaSlotCkpt/CLEVR10_Custom.ckpt`
 
 ---
 
-### 2. Atomic Agents (DINO-Trained, Output Hidden Labels)
+### 2. Atomic Agents (ResidualMLPAgent + DINO)
 
-**Purpose:** Each agent learns to extract discrete concepts from slots via self-supervised learning.
+**Source:** `src/slot_multi_agent/atomic_agent.py`
 
-**Architecture:**
-```python
-ResidualMLPAgent(
-    slot_dim=64,
-    hidden_dim=256,
-    num_prototypes=256,  # 256 discrete concepts
-    num_blocks=3
-)
+```
+slot (B, 64)
+  -> Linear(64->256) + LayerNorm
+  -> 3x ResidualBlock(256)
+  -> DINO head: Linear(256->256->128->256)   bottleneck projection
+  -> softmax -> hidden label (B, 256)
 ```
 
-**Training (Phase 1): DINO-Style SSL**
-
-```python
-# For each slot:
-student_logits = student_agent(slot)  # (batch, 256)
-teacher_logits = teacher_agent(slot)  # (batch, 256) - no grad
-
-# Teacher: centering + sharpening
-teacher_probs = softmax((teacher_logits - center) / temp_teacher)
-
-# Student: sharpening
-student_log_probs = log_softmax(student_logits / temp_student)
-
-# Cross-entropy loss
-loss = -sum(teacher_probs * student_log_probs)
-
-# Update teacher via EMA
-θ_teacher = 0.996 * θ_teacher + 0.004 * θ_student
-```
-
-**Output (Phase 2): Hidden Labels**
-```python
-agent(slot) → logits (256,) → softmax → probabilities (256,)
-```
-- NOT argmax! Tree handles continuous features.
-- Each probability distribution = "hidden label" (concept representation)
-
-**Key Hyperparameters:**
-- `num_prototypes=256`: Number of discrete concepts per agent
-- `teacher_temp=0.07`: Sharp teacher (confident)
-- `student_temp=0.1`: Less sharp student (learning)
-- `momentum=0.996`: Slow EMA for teacher
-
-**Why DINO?**
-- Self-supervised: No labels needed for agent training
-- Prevents collapse: Centering mechanism
-- Rich representations: Learns diverse concepts
-- Proven at scale: DINOv2 uses this
+Pool: **50 student + 50 teacher agents**.
+DINO: student_temp=0.1, teacher_temp=0.07, EMA momentum=0.996.
+Each step randomly samples 5/50 agents; trained on all active slots from batch.
 
 ---
 
-### 3. Performance Estimators (VAE/MLP)
+### 3. Performance Estimators (Phase 2.5)
 
-**Purpose:** Estimate how well each agent would perform on a given slot (without actually running the agent).
+**Source:** `src/slot_multi_agent/estimators.py`
 
-**VAE Estimator:**
-```python
-VAEEstimator(
-    slot_dim=64,
-    latent_dim=16
-)
+**Quality signal:**
+```
+quality_i(slot) = 1 - H(agent_i(slot)) / log(256)
+```
+Values: peaked output -> quality ~1;  uniform output -> quality ~0.
 
-# Returns reconstruction error as performance estimate
-score = -vae.reconstruction_error(slot)  # Lower error = higher score
+**VAEEstimator** (one per agent, 50 total):
+- Encoder: slot(64) -> fc_mu(16) / fc_logvar(16)
+- Decoder: z(16) -> recon(64)
+- Loss: `sum_i quality_i * MSE(recon_i, slot)  +  0.5 * KL`
+- Score: `sigmoid(threshold - MSE_recon)` in [0,1]
+
+**MLPEstimator** (shared, all agents):
+- Input: `concat[slot(64), agent_embedding(32)] = 96-dim`
+- MLP: `Linear(96->128) -> LN -> ReLU -> Linear(128->64) -> LN -> ReLU -> Linear(64->1) -> Sigmoid`
+- Loss: `MSE(predicted_quality, true_quality)`
+
+**Hybrid score at inference:**
+```
+hybrid_score[i] = 0.5 * vae_score[i] + 0.5 * mlp_score[i]
+filtered_K = argsort(hybrid_score, descending=True)[:filter_k]
 ```
 
-**MLP Estimator:**
-```python
-MLPEstimator(
-    slot_dim=64,
-    hidden_dim=128
-)
-
-# Directly predicts performance score
-score = mlp(slot)  # (batch,) - scalar score
-```
-
-**Why?**
-- Running all 50 agents is expensive
-- Estimators are lightweight (VAE: ~100K params, MLP: ~50K params)
-- Agent is heavy (~1M params)
-- Amortized inference: Learn to predict performance
+**Checkpoint:** `checkpoints/estimators/estimators_final.pth`
 
 ---
 
-### 4. Bandit-Based Agent Selection + Weighting ⭐ NEW
+### 4. UCB Weighted MoE (Phase 3)
 
-**Purpose:** Select top-k agents while balancing exploration-exploitation.
+**Source:** `src/slot_multi_agent/bandit_selector.py` -> `UCBWeightedMoE`
 
-**Problem:**
-- Pure greedy (always top-k by estimate) → No exploration
-- May miss better agents that are under-explored
-- Bandit theory solves this!
+```
+UCB(i) = mu_i + c * sqrt(ln t / n_i)
+   mu_i = empirical mean reward
+   n_i  = rounds participated
+   t    = total rounds,  c = sqrt(2) default
 
-**Supported Strategies:**
+Burn-in (t < 100):  weights = uniform
+Post burn-in:       weights = softmax(UCB[K] / temperature)
 
-#### a) UCB (Upper Confidence Bound)
-```python
-UCBSelector(
-    num_agents=50,
-    exploration_constant=2.0
-)
+weighted_out = sum_i w_i * agent_i(slot)   ->  (256,)
 
-# UCB score for each agent:
-ucb[i] = mean_reward[i] + c * sqrt(log(t) / count[i])
-         \_____________/   \_________________________/
-          Exploitation         Exploration bonus
-
-# Agents with high reward OR low visit count get bonus
+Reward update per sample:
+  reward = 1.0 if pred correct else 0.0
+  ucb_moe.update_batch(filtered_ids, weights, reward)
+  # each agent i: local_reward = reward * w_i
 ```
 
-#### b) Thompson Sampling
-```python
-ThompsonSamplingSelector(num_agents=50)
+UCB state saved to `checkpoints/ucb_moe_state.npz`.
 
-# For each agent, maintain Beta(α, β) distribution
-# Sample from posterior: p ~ Beta(α, β)
-# Select agents with highest sampled probabilities
-```
-
-#### c) Epsilon-Greedy
-```python
-EpsilonGreedySelector(
-    num_agents=50,
-    epsilon=0.1  # 10% exploration
-)
-
-# With prob ε: random selection
-# With prob 1-ε: greedy (top-k by estimate)
-```
-
-#### d) Weighted Top-K (Baseline, No Exploration)
-```python
-WeightedTopKSelector(num_agents=50)
-
-# Simple softmax weighting of top-k agents
-# No exploration, pure exploitation
-```
-
-**Output:**
-```python
-selected_indices, weights = bandit_selector.select_and_weight(
-    slot=slot,
-    estimated_scores=scores,
-    k=3
-)
-# selected_indices: (batch, 3) - which agents
-# weights: (batch, 3) - how to weight them (sum to 1)
-```
-
-**Why Bandit Theory?**
-- Principled exploration-exploitation trade-off
-- Provably optimal in certain settings (UCB has regret bounds)
-- Adapts over time (learns which agents are best)
-- Handles non-stationary rewards (continual learning!)
-
-**TODO:** Specific methodology to be determined by professor.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `exploration_constant` | 1.414 | UCB exploration bonus c |
+| `temperature` | 1.0 | Softmax sharpness |
+| `burn_in` | 100 | Uniform-weight warmup rounds |
 
 ---
 
-### 5. Hoeffding Tree Aggregator (Incremental Learning)
+### 5. CRP Expert Aggregator
 
-**Purpose:** Learn mapping from hidden labels → final class, incrementally (one example at a time).
+**Source:** `src/slot_multi_agent/aggregator.py`
 
-**Architecture:**
-```python
-IncrementalTreeAggregator(
-    grace_period=200,
-    split_confidence=1e-5,
-    leaf_prediction='nba',  # Naive Bayes Adaptive
-    adaptive=True  # Handles concept drift
-)
+**Input dimension (pipeline mode):** `S x proto_dim = 11 x 256 = 2816`
+
+```
+Score(k) = Similarity(x, proto_k)
+         * Alignment(grad_new, grad_memory_k)
+         * Capacity(k) = exp(-beta * n_classes_k / ideal)
+
+New expert: if best_score < threshold  AND  Bernoulli(alpha / (N + alpha))
+GPM: new gradients projected orthogonal to past task subspaces
 ```
 
-**Input:** Concatenated hidden labels
-```python
-# For each image:
-hidden_labels = []
-for slot in slots:
-    top_k_agents = bandit_selector.select(slot)
-    for agent_idx in top_k_agents:
-        prob_dist = agents[agent_idx](slot)  # (256,) softmax
-        hidden_labels.append(prob_dist)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `alpha` | 1.0 | CRP concentration |
+| `max_experts` | 30 | Hard expert cap |
+| `score_threshold` | 0.05 | Min score to reuse expert |
+| `projection_rank` | 10 | GPM subspace rank |
+| `capacity_beta` | 1.5 | Load-balance penalty |
+| `prototype_momentum` | 0.95 | EMA for prototype update |
 
-# Concatenate: (7 slots × 3 agents × 256 prototypes) = 5376 features
-final_features = concatenate(hidden_labels)  # (5376,)
+---
+
+## Training Pipeline (4 Phases)
+
+### Phase 1 – AdaSlot Pretraining
+
+```
+Loss = MSE(recon, image)  +  10.0 * mean(hard_keep_decision)
+Adam lr=4e-4  |  linear warmup 10k -> exp decay  |  500,000 steps
+Output: checkpoints/adaslot/adaslot_final.pth
 ```
 
-**Training (Phase 2):**
-```python
-# Online learning (one example at a time)
-for image, label in dataloader:
-    hidden_labels = extract_hidden_labels(image)
-    tree.learn_one(hidden_labels, label)  # Incremental update
+### Phase 2 – Agent DINO Training
+
+```
+AdaSlot FROZEN.  5/50 agents random per step.
+AdamW lr=1e-3, wd=0.04  |  warmup 5k -> exp decay  |  100,000 steps
+Output: checkpoints/agents/agents_final.pth
 ```
 
-**Prediction:**
-```python
-hidden_labels = extract_hidden_labels(image)
-predicted_class = tree.predict_one(hidden_labels)
+### Phase 2.5 – Estimator Training (NEW)
+
+```
+AdaSlot + Agents FROZEN.  10/50 agents sampled per step.
+
+quality_i(slot) = 1 - H(agent_i(slot)) / log(256)
+
+VAE loss : sum_i quality_i * MSE(recon_i, slot)  +  0.5 * KL
+MLP loss : MSE(MLPEstimator(slot, agent_id), quality_i)
+
+Adam lr=1e-3  |  20,000 steps
+Output: checkpoints/estimators/estimators_final.pth
 ```
 
-**Why Hoeffding Tree?**
-- ✅ Incremental: Learns one example at a time
-- ✅ Handles continuous features: Softmax probabilities work directly
-- ✅ New classes: Can learn new classes without retraining
-- ✅ No task ID: Decision based on features alone
-- ✅ No catastrophic forgetting: Tree grows, doesn't overwrite
-- ✅ Concept drift: Adaptive variant handles distribution shift
+### Phase 3 – Filter -> UCB MoE -> CRP (Continual)
 
-**Hoeffding Bound:**
 ```
-With probability 1-δ, true best split is within ε of observed best split:
-ε = sqrt(R² * log(1/δ) / (2 * n))
+AdaSlot + Agents + Estimators FROZEN.  UCBWeightedMoE updated online.
 
-where:
-    R = range of split criterion
-    n = number of examples seen
-    δ = confidence (default: 1e-5)
+Per slot:
+  hybrid_score[50] = 0.5*VAE_score + 0.5*MLP_score
+  filtered_K = top-10
+  weights[K]  = UCBWeightedMoE.get_weights(filtered_K)
+  out(slot)   = sum_i w_i * agent_i(slot)        ->  (256,)
+
+Feature = concat(out[0..S-1])                     ->  2816-dim
+
+CRP predict -> reward (1.0/0.0)
+ucb_moe.update_batch(filtered_ids, weights, reward)
+CRP learn  -> expert routing + GPM projection
+
+Continual loop:
+  for task_id in range(n_tasks):
+    train  -> train_loaders[task_id]
+    eval   -> cumulative test_loaders[0..task_id]
+
+UCB state: checkpoints/ucb_moe_state.npz
 ```
 
 ---
 
-## Training Pipeline
+## Feature Dimension Summary
 
-### Phase 1: Train Agents (DINO SSL, Unsupervised) 🚀
+| Mode | Formula | Dim |
+|------|---------|-----|
+| **Pipeline (UCB MoE)** | 11 x 256 | **2816** |
+| Legacy first-k concat | 7 x 3 x 128 | 2688 |
 
-```python
-# Initialize
-student_agents, teacher_agents = create_agent_pool(
-    num_agents=50,
-    slot_dim=64,
-    num_prototypes=256
-)
-
-estimators = create_estimator_pool(num_agents=50, estimator_type='vae')
-dino_losses = [DINOLoss(256) for _ in range(50)]
-
-# Training loop
-for epoch in range(10):
-    for images in unlabeled_dataloader:
-        _, slots, _ = slot_attention(images)  # (batch, 7, 64)
-        
-        total_loss = 0
-        for slot_idx in range(7):
-            slot = slots[:, slot_idx, :]
-            
-            # Estimate performance
-            scores = [estimators[i](slot) for i in range(50)]
-            top_k = torch.topk(scores, k=3).indices
-            
-            # Train selected agents
-            for agent_idx in top_k:
-                # Student forward
-                student_logits = student_agents[agent_idx](slot, return_logits=True)
-                
-                # Teacher forward (no grad)
-                with torch.no_grad():
-                    teacher_logits = teacher_agents[agent_idx](slot, return_logits=True)
-                
-                # DINO loss
-                loss = dino_losses[agent_idx](student_logits, teacher_logits)
-                total_loss += loss
-        
-        # Backward
-        total_loss.backward()
-        optimizer.step()
-        
-        # Update teachers (EMA)
-        for student, teacher in zip(student_agents, teacher_agents):
-            update_teacher(student, teacher, momentum=0.996)
-```
-
-**Result:** Agents learn rich, diverse representations without labels!
+Mode auto-selected: pipeline if estimators + ucb_moe passed to `train_phase3_crp`, otherwise legacy.
 
 ---
 
-### Phase 2: Train Tree (Incremental, Supervised) 🌳
+## Directory Structure
 
-```python
-# Freeze agents
-for agent in student_agents:
-    agent.eval()
-
-# Initialize tree
-tree = IncrementalTreeAggregator(adaptive=True)
-
-# Bandit selector
-bandit_selector = create_bandit_selector('ucb', num_agents=50)
-
-# Training loop (incremental)
-for images, labels in labeled_dataloader:
-    for i in range(images.size(0)):
-        image = images[i:i+1]
-        label = labels[i].item()
-        
-        # Extract hidden labels
-        with torch.no_grad():
-            _, slots, _ = slot_attention(image)
-            
-            hidden_labels = []
-            for slot_idx in range(7):
-                slot = slots[:, slot_idx, :]
-                
-                # Estimate performance
-                scores = torch.stack([
-                    -estimators[j](slot)
-                    for j in range(50)
-                ], dim=1)
-                
-                # Bandit-based selection + weighting
-                top_k_indices, weights = bandit_selector.select_and_weight(
-                    slot, scores, k=3
-                )
-                
-                # Get hidden labels from selected agents
-                for k_idx in range(3):
-                    agent_idx = top_k_indices[0, k_idx].item()
-                    prob_dist = student_agents[agent_idx](slot)  # (1, 256)
-                    
-                    # Optionally weight by bandit weight
-                    # prob_dist = prob_dist * weights[0, k_idx]
-                    
-                    hidden_labels.append(prob_dist.cpu().numpy().flatten())
-            
-            # Concatenate
-            final_features = np.concatenate(hidden_labels)  # (5376,)
-        
-        # Online learning
-        tree.learn_one(final_features, label)
-        
-        # Optional: Update bandit statistics
-        # (requires computing reward, e.g., prediction accuracy)
 ```
+src/
+  models/adaslot/
+    model.py               AdaSlotModel
+    train.py               4-phase training CLI
+  slot_multi_agent/
+    atomic_agent.py        ResidualMLPAgent + DINOLoss
+    estimators.py          VAEEstimator, MLPEstimator
+    bandit_selector.py     UCBWeightedMoE + legacy selectors
+    aggregator.py          CRPExpertAggregator + ExpertModule
+    system.py              Inference wrapper
 
-**Result:** Tree learns incrementally, no catastrophic forgetting!
-
----
-
-### Phase 3: Continual Learning (New Tasks) 🔄
-
-```python
-# Task 1: Classes 0-9 (already trained)
-
-# Task 2: Classes 10-19 (new classes!)
-for images, labels in new_task_dataloader:
-    for i in range(images.size(0)):
-        hidden_labels = extract_hidden_labels(images[i:i+1])
-        tree.learn_one(hidden_labels, labels[i].item())
-
-# Agents are frozen, only tree is updated
-# Tree grows new branches for new classes
-# Old knowledge preserved (no overwriting)
+checkpoints/
+  adaslot/adaslot_final.pth                Phase 1 output
+  agents/agents_final.pth                  Phase 2 output
+  estimators/estimators_final.pth          Phase 2.5 output
+  ucb_moe_state.npz                        Phase 3 UCB state
+  slot_attention/adaslot_real/             Pre-trained AdaSlot
 ```
 
 ---
 
-## Key Hyperparameters
+## CLI Reference (train.py)
 
-| Component | Parameter | Value | Notes |
-|-----------|-----------|-------|-------|
-| **Slot Attention** | `num_slots` | 7 | Number of object slots |
-| | `slot_dim` | 64 | Slot embedding dimension |
-| | `num_iterations` | 3 | Attention iterations |
-| **Agents** | `num_agents` | 50 | Pool size |
-| | `hidden_dim` | 256 | MLP hidden dimension |
-| | `num_prototypes` | 256 | Discrete concepts per agent |
-| | `num_blocks` | 3 | Residual blocks |
-| **DINO Training** | `teacher_temp` | 0.07 | Sharp teacher |
-| | `student_temp` | 0.1 | Less sharp student |
-| | `momentum` | 0.996 | EMA for teacher |
-| | `center_momentum` | 0.9 | EMA for centering |
-| **Selection** | `k` | 3 | Top-k agents per slot |
-| **Bandit (UCB)** | `exploration_constant` | 2.0 | Exploration bonus |
-| **Tree** | `grace_period` | 200 | Examples before split |
-| | `split_confidence` | 1e-5 | Hoeffding bound |
-| | `leaf_prediction` | 'nba' | Naive Bayes Adaptive |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--phase` | `all` | `1`, `2`, `2.5`, `3`, or `all` |
+| `--device` | `cuda` | Device |
+| `--adaslot_ckpt` | — | AdaSlot checkpoint path |
+| `--agent_ckpt` | — | Agent pool checkpoint path |
+| `--estimator_ckpt` | — | Estimators checkpoint (for Phase 3) |
+| `--steps` | `500000` | Phase 1 steps |
+| `--agent_steps` | `100000` | Phase 2 steps |
+| `--p2b_steps` | `20000` | Phase 2.5 steps |
+| `--p2b_lr` | `1e-3` | Phase 2.5 learning rate |
+| `--filter_k` | `10` | Top-K after estimator filtering |
+| `--ucb_exploration` | `1.414` | UCB exploration constant c |
+| `--ucb_burn_in` | `100` | Burn-in rounds (uniform weights) |
+| `--num_classes` | `20` | Classes per continual task |
+| `--batch_size` | `64` | Batch size |
 
 ---
 
-## Ablation Studies (TODO)
+## Before vs After
 
-To validate design choices:
-
-1. **Slot Attention vs. No Slots**
-   - Baseline: Apply agents directly to full image features
-   - Expected: Slots improve interpretability and specialization
-
-2. **DINO SSL vs. Random Init vs. Supervised**
-   - Baseline 1: Random agent initialization
-   - Baseline 2: Train agents end-to-end with supervised loss
-   - Expected: DINO gives better representations
-
-3. **Bandit Selection vs. Fixed Top-K**
-   - Baseline: Always select same top-k agents (no exploration)
-   - Expected: Bandit improves over time by exploring
-
-4. **Hoeffding Tree vs. Standard Tree vs. MLP**
-   - Baseline 1: Retrain standard tree for each task
-   - Baseline 2: MLP classifier (prone to forgetting)
-   - Expected: Hoeffding Tree handles continual learning best
-
-5. **Hidden Labels (Softmax) vs. Argmax vs. Embeddings**
-   - Baseline 1: Use argmax (discrete ID only)
-   - Baseline 2: Use continuous embeddings (before softmax)
-   - Expected: Softmax probabilities balance discrete + continuous
-
----
-
-## Limitations & Future Work
-
-### Current Limitations
-
-1. **Fixed Slot Count**
-   - `num_slots=7` is fixed, may not fit all images
-   - Solution: AdaSlot (adaptive slot count)
-
-2. **No Agent Specialization Enforcement**
-   - Agents may learn redundant concepts
-   - Solution: Add diversity loss (e.g., orthogonality constraint)
-
-3. **Bandit Rewards Not Yet Defined**
-   - How to compute reward for agent selection?
-   - Options: Accuracy, confidence, diversity
-   - TODO: Consult with professor
-
-4. **Large Input to Tree**
-   - 5376 features (7 × 3 × 256) is high-dimensional
-   - May slow down tree learning
-   - Solution: Dimensionality reduction (PCA, autoencoder)
-
-5. **No Task Boundaries**
-   - Agents trained on all data at once (Phase 1)
-   - What if new tasks have very different images?
-   - Solution: Continual agent training (difficult!)
-
-### Future Directions
-
-1. **Adaptive Architecture**
-   - Dynamic slot count (AdaSlot)
-   - Dynamic agent count (add new agents for new tasks)
-   - Dynamic k (adaptive top-k selection)
-
-2. **Improved Agent Training**
-   - Multi-crop augmentation (like DINOv2)
-   - iBOT masking for local features
-   - Larger prototype count (1024, 4096)
-
-3. **Better Bandit Rewards**
-   - Incorporate confidence and diversity
-   - Meta-learning to learn reward function
-   - Contextual bandits (slot-dependent strategies)
-
-4. **Hierarchical Trees**
-   - Ensemble of trees (Random Forest)
-   - Hierarchical tree structure (coarse → fine classes)
-   - Mixture of experts at leaves
-
-5. **Theoretical Analysis**
-   - Regret bounds for bandit selection
-   - Generalization bounds for incremental tree
-   - Sample complexity for continual learning
+| Aspect | Before | After |
+|--------|--------|-------|
+| Estimator training | Not trained | Phase 2.5 quality-weighted |
+| Agent selection | First k=3 (hardcoded) | VAE/MLP filter -> top-10 |
+| Committee decision | Hard concat of k outputs | Weighted MoE sum |
+| Bandit | Not connected | UCB Weighted MoE + reward |
+| CRP input dim | 2688 (7x3x128) | 2816 (11x256) |
+| Phase count | 3 | 4 |
+| UCB persistence | None | ucb_moe_state.npz |
 
 ---
 
 ## Implementation Status
 
-✅ **Completed:**
-- Atomic agents with DINO training (`atomic_agent.py`)
-- Performance estimators (`estimators.py`)
-- Bandit-based selection (`bandit_selector.py`)
-- Incremental tree aggregator (`aggregator.py`)
+**Completed:**
+- AdaSlot with adaptive Gumbel slot pruning
+- 50-agent DINO SSL training
+- Phase 2.5: VAE/MLP estimator training with quality signal
+- UCBWeightedMoE with online reward feedback
+- Phase 3 full pipeline: filter -> UCB MoE -> CRP
+- CRP Expert Aggregator with GPM
+- 4-phase main() with all new CLI args
+- UCB state save/load
+- Continual multi-task loop with cumulative evaluation
 
-⏳ **In Progress:**
-- Full system integration (`system.py`)
-- Training scripts
-
-❌ **TODO:**
-- Experiments on CIFAR-100 / Tiny-ImageNet
-- Ablation studies
-- Bandit reward definition (待教授確認)
-- Hyperparameter tuning
+**To Do:**
+- Ablation studies (pipeline vs legacy, filter_k sensitivity)
+- UCB hyperparameter tuning
+- Class-IL / Task-IL benchmark evaluation
 
 ---
 
 ## References
 
-1. **Slot Attention:**
-   - Locatello et al. (2020) "Object-Centric Learning with Slot Attention"
-
-2. **DINOv2:**
-   - Oquab et al. (2023) "DINOv2: Learning Robust Visual Features without Supervision"
-   - GitHub: https://github.com/facebookresearch/dinov2
-
-3. **Hoeffding Tree:**
-   - Domingos & Hulten (2000) "Mining High-Speed Data Streams"
-   - River Library: https://riverml.xyz/
-
-4. **Multi-Armed Bandits:**
-   - Auer et al. (2002) "Finite-time Analysis of the Multiarmed Bandit Problem" (UCB)
-   - Thompson (1933) "On the Likelihood..." (Thompson Sampling)
-
-5. **Continual Learning:**
-   - Avalanche Library: https://avalanche.continualai.org/
-   - van de Ven & Tolias (2019) "Three scenarios for continual learning"
+1. AdaSlot: https://github.com/amazon-science/adaSlot
+2. DINOv2: Oquab et al. (2023)
+3. UCB Bandit: Auer et al. (2002)
+4. Weighted MoE / UCB combo: omoe-codebase/theta_wmv.py, combo_bandit.py
+5. CRP: Aldous (1985); Pitman (2006)
+6. GPM: Saha et al. (2021)
+7. Expert Gate: Aljundi et al. (2017)
+8. CL Scenarios: van de Ven & Tolias (2019)
 
 ---
-
-## Contact & Questions
-
-For methodology questions (especially bandit rewards):
-→ Consult with professor
-
-For implementation questions:
-→ See code in `src/slot_multi_agent/`
-
----
-
-**Last Updated:** 2026-02-13
-
-
+*Last Updated: 2026-02-23*
