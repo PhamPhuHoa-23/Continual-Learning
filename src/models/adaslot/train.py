@@ -153,7 +153,7 @@ def train_phase1_adaslot(
 
     start_step = 0
     if resume_ckpt and os.path.exists(resume_ckpt):
-        ckpt = torch.load(resume_ckpt, map_location=device)
+        ckpt = torch.load(resume_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         start_step = ckpt.get('step', 0)
@@ -581,7 +581,7 @@ def main():
     # ── Load pretrained weights ──
     if args.adaslot_ckpt and os.path.exists(args.adaslot_ckpt):
         # Explicit checkpoint path provided
-        ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
+        ckpt = torch.load(args.adaslot_ckpt, map_location='cpu', weights_only=False)
         state = ckpt.get('model', ckpt.get('state_dict', ckpt))
         result = adaslot.load_state_dict(state, strict=False)
         print(f"[INFO] Loaded AdaSlot weights from {args.adaslot_ckpt}")
@@ -594,7 +594,7 @@ def main():
         )
         ckpt_path = os.path.join(pretrained_dir, f"{args.pretrained}.ckpt")
         if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location='cpu')
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
             state = ckpt.get('state_dict', ckpt.get('model', ckpt))
             result = adaslot.load_state_dict(state, strict=False)
             print(f"[INFO] ✅ Loaded pretrained AdaSlot ({args.pretrained}) from {ckpt_path}")
@@ -652,7 +652,7 @@ def main():
         elif phase == "2":
             # Load AdaSlot
             if args.adaslot_ckpt:
-                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
+                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu', weights_only=False)
                 state = ckpt.get('model', ckpt.get('state_dict', ckpt))
                 adaslot.load_state_dict(state, strict=False)
 
@@ -680,7 +680,7 @@ def main():
         elif phase == "3":
             # Load AdaSlot
             if args.adaslot_ckpt:
-                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
+                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu', weights_only=False)
                 state = ckpt.get('model', ckpt.get('state_dict', ckpt))
                 adaslot.load_state_dict(state, strict=False)
 
@@ -693,7 +693,7 @@ def main():
                 device=args.device,
             )
             if args.agent_ckpt:
-                ckpt = torch.load(args.agent_ckpt, map_location='cpu')
+                ckpt = torch.load(args.agent_ckpt, map_location='cpu', weights_only=False)
                 student_agents.load_state_dict(ckpt['student_agents'])
 
             # Pass student_agents to phase 3 aggregator

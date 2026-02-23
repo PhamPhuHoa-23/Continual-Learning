@@ -375,7 +375,7 @@ class SlotMultiAgentSystem(nn.Module):
     
     def load_checkpoint(self, path: str):
         """Load system checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.encoder.load_state_dict(checkpoint['encoder'])
         self.slot_attention.load_state_dict(checkpoint['slot_attention'])
