@@ -18,7 +18,7 @@
 
 # Download pre-trained AdaSlot checkpoint from Google Drive
 !mkdir -p checkpoints/slot_attention/adaslot_real/AdaSlotCkpt
-!gdown "1lcBTpdEFKotrMQjE_xuH23AfgzxXHVd1" -O "checkpoints/slot_attention/adaslot_real/AdaSlotCkpt/CLEVR10_Custom.ckpt"
+!gdown "1lcBTpdEFKotrMQjE_xuH23AfgzxXHVd1" -O "checkpoints/slot_attention/adaslot_real/AdaSlotCkpt/CLEVR10.ckpt"
 
 # %% [markdown]
 # ## 2. Phase 1: Train AdaSlot (Pretraining)
@@ -27,16 +27,18 @@
 # To do so automatically, `train.py` handles the `--pretrained` argument to download models if absent.
 
 # %%
-!python -m src.models.adaslot.train --phase 1 --p1_steps 1000
-
+!python src/models/adaslot/train.py --phase 1 --device cuda
 # %% [markdown]
 # ## 3. Phase 2: Train Atomic Agents (DINO SSL)
 # Train the pool of generic experts on the extracted slots in an offline manner.
 # We utilize the checkpoints trained from Phase 1. 
 # Here we use `--pretrained CLEVR10` just for demonstration so it will auto-download pre-trained weights if phase 1 was skipped.
+# %%
+!python src/models/adaslot/train.py --phase 2 --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth
 
 # %%
-!python -m src.models.adaslot.train --phase 2 --p1_steps 2 --pretrained CLEVR10_Custom --p2_steps 2000
+!python src/models/adaslot/train.py --phase 2.5 \
+  --agent_ckpt checkpoints/agents/agents_final.pth
 
 # %% [markdown]
 # ## 4. Phase 3: Incremental Aggregator Training
@@ -44,4 +46,5 @@
 # This runs the CIFAR-100 continual benchmark by default.
 
 # %%
-!python -m src.models.adaslot.train --phase 3 --p1_steps 2 --pretrained CLEVR10_Custom --num_classes 100
+!python src/models/adaslot/train.py --phase 3 \
+  --estimator_ckpt checkpoints/estimators/estimators_final.pth

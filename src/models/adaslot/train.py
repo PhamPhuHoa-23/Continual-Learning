@@ -42,9 +42,16 @@ Usage:
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional
+
+# ── Allow running as a script (python src/models/adaslot/train.py)
+# ── as well as a module (python -m src.models.adaslot.train)
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 import torch.nn as nn
@@ -986,7 +993,7 @@ def main():
     args = parser.parse_args()
 
     # ── Build models ──
-    from . import AdaSlotModel
+    from src.models.adaslot.model import AdaSlotModel
 
     adaslot = AdaSlotModel(
         resolution=(args.resolution, args.resolution),
