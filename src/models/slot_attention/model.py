@@ -52,7 +52,7 @@ class SlotAttentionAutoEncoder(nn.Module):
         in_channels: int = 3,
         slot_dim: int = 64,
         hidden_dim: int = 64,
-        encoder_type: str = 'cnn',
+        encoder_type: str = 'resnet',
         decoder_type: str = 'broadcast',
     ):
         super().__init__()

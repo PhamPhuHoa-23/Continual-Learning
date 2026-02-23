@@ -37,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
 
 # ───────────────────────────────────────────────────────
 #  Phase 1: AdaSlot Losses
@@ -246,7 +247,7 @@ def train_phase2_agents(
       3. Student-teacher cross-entropy loss (DINO)
       4. Update teacher via EMA
     """
-    from .atomic_agent import DINOLoss, update_all_teachers
+    from src.slot_multi_agent.atomic_agent import DINOLoss, update_all_teachers
 
     print("=" * 60)
     print("PHASE 2: Agent DINO Training")
@@ -370,34 +371,34 @@ def train_phase2_agents(
 
 
 # ───────────────────────────────────────────────────────
-#  Phase 3: Hoeffding Tree Fitting
+#  Phase 3: CRP Expert Assignment Aggregator
 # ───────────────────────────────────────────────────────
 
-def train_phase3_tree(
+def train_phase3_crp(
     adaslot_model,
     student_agents: nn.ModuleList,
     dataloader: DataLoader,
     num_classes: int = 10,
-    aggregator_type: str = "hoeffding",
+    aggregator_type: str = "crp",
     aggregate_mode: str = "concat",
     k: int = 3,
     device: str = "cuda",
     log_every: int = 100,
 ):
     """
-    Phase 3: Incrementally fit decision tree on agent hidden labels.
+    Phase 3: Incrementally fit the aggregator on agent hidden labels.
 
     AdaSlot + Agents are FROZEN. For each batch:
       1. Extract slots
       2. Each agent produces hidden labels per slot
       3. Concatenate/mean-pool across slots
-      4. Hoeffding Tree learns incrementally (partial_fit)
+      4. Aggregator learns incrementally (learn_batch / partial_fit depending on type)
     """
-    from .aggregator import create_aggregator
+    from src.slot_multi_agent.aggregator import create_aggregator
     import numpy as np
 
     print("=" * 60)
-    print("PHASE 3: Hoeffding Tree Incremental Fitting")
+    print("PHASE 3: Incremental Aggregator Fitting")
     print(f"  Classes: {num_classes}, Aggregator: {aggregator_type}")
     print(f"  Mode: {aggregate_mode}, k={k}")
     print("=" * 60)
@@ -414,16 +415,25 @@ def train_phase3_tree(
     slot_dim = adaslot_model.slot_dim
     hidden_dim = student_agents[0].num_prototypes
 
-    # Compute tree input dimension
+    # Compute aggregator input dimension
     if aggregate_mode == "concat":
-        tree_input_dim = num_slots * k * hidden_dim
+        input_dim = num_slots * k * hidden_dim
     else:
-        tree_input_dim = k * hidden_dim
+        input_dim = k * hidden_dim
+
+    # Prepare kwargs based on aggregator type
+    agg_kwargs = {
+        "num_classes": num_classes,
+        "device": device,
+    }
+    if aggregator_type == "crp":
+        agg_kwargs["feature_dim"] = input_dim
+    else:
+        agg_kwargs["input_dim"] = input_dim
 
     aggregator = create_aggregator(
         aggregator_type=aggregator_type,
-        input_dim=tree_input_dim,
-        num_classes=num_classes,
+        **agg_kwargs
     )
 
     total_correct = 0
@@ -433,13 +443,11 @@ def train_phase3_tree(
     for batch_idx, batch in enumerate(dataloader):
         images = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch['image'].to(device)
         targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
-        targets_np = targets.cpu().numpy()
 
         with torch.no_grad():
             # 1. Slots
             adaslot_out = adaslot_model(images)
             slots = adaslot_out['slots']              # (B, S, D)
-            keep = adaslot_out['hard_keep_decision']  # (B, S)
 
             B, S, D = slots.shape
 
@@ -463,18 +471,28 @@ def train_phase3_tree(
                     feat = torch.stack(sample_hidden).mean(0)  # (k * proto,)
                 all_features.append(feat)
 
-            features_np = torch.stack(all_features).cpu().numpy()  # (B, dim)
+            # Features are tensors for CRP, we only convert to numpy when calling trees
+            features_t = torch.stack(all_features)  # (B, dim) on CPU
 
-        # 3. Tree: try to predict, then partial_fit
+        # 3. Aggregator: try to predict, then learn
         try:
-            preds = aggregator.predict(features_np)
-            correct = (preds == targets_np).sum()
+            if hasattr(aggregator, 'predict_batch'):
+                preds = aggregator.predict_batch(features_t)
+                correct = sum(1 for p, t in zip(preds, targets.cpu().numpy()) if p == t)
+            else:
+                preds = aggregator.predict(features_t.numpy())
+                correct = (preds == targets.cpu().numpy()).sum()
             total_correct += correct
         except Exception:
+            # Predict might fail on the very first batch before learning
             pass
 
-        total_samples += len(targets_np)
-        aggregator.partial_fit(features_np, targets_np)
+        total_samples += B
+        
+        if hasattr(aggregator, 'learn_batch'):
+            aggregator.learn_batch(features_t, targets.cpu())
+        else:
+            aggregator.partial_fit(features_t.numpy(), targets.cpu().numpy())
 
         if (batch_idx + 1) % log_every == 0:
             acc = total_correct / max(total_samples, 1) * 100
@@ -529,7 +547,14 @@ def main():
     parser.add_argument("--num_prototypes", type=int, default=256)
     parser.add_argument("--num_classes", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        default_device = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        default_device = "mps"
+    else:
+        default_device = "cpu"
+        
+    parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--resolution", type=int, default=128)
 
     # Phase-specific
@@ -537,18 +562,47 @@ def main():
     parser.add_argument("--p1_lr", type=float, default=4e-4)
     parser.add_argument("--p2_steps", type=int, default=100000, help="Phase 2 training steps")
     parser.add_argument("--p2_lr", type=float, default=1e-3)
+    parser.add_argument("--pretrained", type=str, default="CLEVR10",
+                        choices=["CLEVR10", "COCO", "MOVi-C", "MOVi-E", "none"],
+                        help="Pretrained AdaSlot checkpoint to load (default: CLEVR10). "
+                             "Use 'none' to train from scratch.")
 
     args = parser.parse_args()
 
     # ── Build models ──
     from . import AdaSlotModel
-    from .atomic_agent_compat import create_agent_pool_compat
 
     adaslot = AdaSlotModel(
         resolution=(args.resolution, args.resolution),
         num_slots=args.num_slots,
         slot_dim=args.slot_dim,
     )
+
+    # ── Load pretrained weights ──
+    if args.adaslot_ckpt and os.path.exists(args.adaslot_ckpt):
+        # Explicit checkpoint path provided
+        ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
+        state = ckpt.get('model', ckpt.get('state_dict', ckpt))
+        result = adaslot.load_state_dict(state, strict=False)
+        print(f"[INFO] Loaded AdaSlot weights from {args.adaslot_ckpt}")
+        print(f"       Missing keys: {len(result.missing_keys)}, Unexpected: {len(result.unexpected_keys)}")
+    elif args.pretrained != "none":
+        # Auto-detect pretrained checkpoint
+        pretrained_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "checkpoints", "slot_attention", "adaslot_real", "AdaSlotCkpt"
+        )
+        ckpt_path = os.path.join(pretrained_dir, f"{args.pretrained}.ckpt")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            state = ckpt.get('state_dict', ckpt.get('model', ckpt))
+            result = adaslot.load_state_dict(state, strict=False)
+            print(f"[INFO] ✅ Loaded pretrained AdaSlot ({args.pretrained}) from {ckpt_path}")
+            print(f"       Missing keys: {len(result.missing_keys)}, Unexpected: {len(result.unexpected_keys)}")
+        else:
+            print(f"[WARN] Pretrained checkpoint not found: {ckpt_path}")
+            print(f"       Download from: https://drive.google.com/drive/folders/1SRKE9Q5XF2UeYj1XB8kyjxORDmB7c7Mz")
+            print(f"       Training from scratch instead.")
 
     # ── Build dataloader ──
     if args.data_dir:
@@ -559,28 +613,35 @@ def main():
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
         dataset = datasets.ImageFolder(args.data_dir, transform=transform)
-    else:
-        print("[INFO] No data_dir specified, using dummy random data for testing.")
-        dataset = DummyImageDataset(
-            num_samples=500, resolution=args.resolution, num_classes=args.num_classes
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=True, drop_last=True,
         )
-
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=True, drop_last=True,
-    )
+    else:
+        print("[INFO] No data_dir specified, downloading and using CIFAR-100 continual benchmark.")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "continual_cifar100", 
+            "src/data/continual_cifar100.py"
+        )
+        data_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(data_module)
+        get_continual_cifar100_loaders = data_module.get_continual_cifar100_loaders
+        # Get loaders for task 0 as our main training data
+        train_loaders, _, _ = get_continual_cifar100_loaders(
+            n_tasks=int(100 / args.num_classes) if args.num_classes > 0 else 5,
+            batch_size=args.batch_size,
+            num_workers=0,
+            seed=42,
+            resolution=args.resolution
+        )
+        dataloader = train_loaders[0]  # Just use the first task loader
 
     # ── Execute phases ──
     phases = ["1", "2", "3"] if args.phase == "all" else [args.phase]
 
     for phase in phases:
         if phase == "1":
-            if args.adaslot_ckpt and os.path.exists(args.adaslot_ckpt):
-                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
-                state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-                adaslot.load_state_dict(state, strict=False)
-                print(f"[INFO] Loaded AdaSlot pretrained weights from {args.adaslot_ckpt}")
-
             adaslot_ckpt_path = train_phase1_adaslot(
                 model=adaslot,
                 dataloader=dataloader,
@@ -588,7 +649,6 @@ def main():
                 lr=args.p1_lr,
                 device=args.device,
             )
-
         elif phase == "2":
             # Load AdaSlot
             if args.adaslot_ckpt:
@@ -597,7 +657,7 @@ def main():
                 adaslot.load_state_dict(state, strict=False)
 
             # Create agent pool
-            from ..slot_multi_agent.atomic_agent import create_agent_pool
+            from src.slot_multi_agent.atomic_agent import create_agent_pool
             student_agents, teacher_agents = create_agent_pool(
                 num_agents=args.num_agents,
                 slot_dim=args.slot_dim,
@@ -625,7 +685,7 @@ def main():
                 adaslot.load_state_dict(state, strict=False)
 
             # Load Agents
-            from ..slot_multi_agent.atomic_agent import create_agent_pool
+            from src.slot_multi_agent.atomic_agent import create_agent_pool
             student_agents, _ = create_agent_pool(
                 num_agents=args.num_agents,
                 slot_dim=args.slot_dim,
@@ -636,11 +696,14 @@ def main():
                 ckpt = torch.load(args.agent_ckpt, map_location='cpu')
                 student_agents.load_state_dict(ckpt['student_agents'])
 
-            train_phase3_tree(
+            # Pass student_agents to phase 3 aggregator
+            from src.slot_multi_agent.aggregator import create_aggregator
+            aggregator = train_phase3_crp(
                 adaslot_model=adaslot,
                 student_agents=student_agents,
                 dataloader=dataloader,
                 num_classes=args.num_classes,
+                aggregator_type="crp",
                 device=args.device,
             )
 

@@ -6,7 +6,7 @@ Architecture:
 2. Performance Estimators → Estimate agent performance on each slot (VAE/MLP)
 3. Bandit Selection → Select and weight agents (UCB/Thompson/Epsilon-Greedy)
 4. Atomic Agents → Process slots, output hidden labels (DINO-trained)
-5. Incremental Tree → Aggregate hidden labels → final class (online learning)
+5. CRP Expert Aggregator → Assign to experts, predict class (gradient alignment)
 
 Training Pipeline:
     Phase 1: Train agents with DINO SSL (unsupervised)
@@ -14,24 +14,24 @@ Training Pipeline:
         - Each agent learns K prototypes
         - Outputs: softmax over prototypes (hidden label)
     
-    Phase 2: Train tree incrementally (supervised)
+    Phase 2: Incremental expert assignment (supervised)
         - Freeze agents
         - Extract hidden labels for each example
-        - Tree learns: combination of hidden labels → class
+        - CRP dynamically creates/routes to experts
+        - Gradient projection prevents representation drift
         - Supports new classes without retraining agents
 
 Key Features:
     - Object-centric decomposition (Slot Attention)
     - Self-supervised agent training (DINO)
     - Exploration-exploitation (Bandit algorithms)
-    - Incremental learning (Hoeffding Tree)
-    - No catastrophic forgetting
+    - CRP-based expert assignment (dynamic, gradient-aligned)
+    - No catastrophic forgetting (gradient projection)
     - No task ID required at test time
 
 Quick Start:
     >>> from src.slot_multi_agent import (
     ...     create_agent_pool,
-    ...     create_estimator_pool,
     ...     create_bandit_selector,
     ...     create_aggregator
     ... )
@@ -43,19 +43,15 @@ Quick Start:
     ...     num_prototypes=256
     ... )
     >>> 
-    >>> estimators = create_estimator_pool(
-    ...     num_agents=50,
-    ...     estimator_type='vae',
-    ...     slot_dim=64
-    ... )
-    >>> 
     >>> bandit_selector = create_bandit_selector(
     ...     strategy='ucb',
     ...     num_agents=50
     ... )
     >>> 
     >>> aggregator = create_aggregator(
-    ...     aggregator_type='hoeffding_adaptive'
+    ...     aggregator_type='crp',
+    ...     feature_dim=2688,
+    ...     num_classes=100
     ... )
 """
 
@@ -73,14 +69,12 @@ from .estimators import (
     VAEEstimator,
     MLPEstimator,
     HybridEstimator,
-    create_estimator_pool
 )
 
 # Legacy Selectors (simple top-k)
 from .selector import (
     TopKAgentSelector,
     AdaptiveKSelector,
-    create_selector
 )
 
 # Bandit-based Selectors (with exploration-exploitation)
@@ -93,11 +87,11 @@ from .bandit_selector import (
     create_bandit_selector
 )
 
-# Aggregators (Incremental Decision Trees)
+# Aggregators (CRP-based Expert Assignment)
 from .aggregator import (
-    IncrementalTreeAggregator,
-    EnsembleTreeAggregator,
-    BatchTreeAggregator,
+    ExpertModule,
+    CRPExpertAggregator,
+    BatchCRPAggregator,
     create_aggregator
 )
 
@@ -113,12 +107,10 @@ __all__ = [
     'VAEEstimator',
     'MLPEstimator',
     'HybridEstimator',
-    'create_estimator_pool',
     
     # Legacy Selectors
     'TopKAgentSelector',
     'AdaptiveKSelector',
-    'create_selector',
     
     # Bandit Selectors
     'BanditSelector',
@@ -128,9 +120,9 @@ __all__ = [
     'WeightedTopKSelector',
     'create_bandit_selector',
     
-    # Aggregators
-    'IncrementalTreeAggregator',
-    'EnsembleTreeAggregator',
-    'BatchTreeAggregator',
+    # Aggregators (CRP)
+    'ExpertModule',
+    'CRPExpertAggregator',
+    'BatchCRPAggregator',
     'create_aggregator',
 ]

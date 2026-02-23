@@ -284,22 +284,26 @@ class ContinualCIFAR100Dataset(Dataset):
         return image, label
 
 
-def get_cifar100_transforms(train: bool = True) -> transforms.Compose:
+def get_cifar100_transforms(train: bool = True, resolution: Optional[int] = None) -> transforms.Compose:
     """
     Get standard data augmentation transforms for CIFAR-100.
     
     Training transforms:
         - RandomCrop(32, padding=4)
         - RandomHorizontalFlip
+        - Resize (optional)
         - ToTensor
         - Normalize (mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761])
     
     Test transforms:
+        - Resize (optional)
         - ToTensor
         - Normalize (same as train)
     
     Args:
         train: If True, return training transforms; else test transforms
+        resolution: Target resolution to resize images to (e.g., 128 for AdaSlot).
+                   If None, keeps original 32x32 resolution.
     
     Returns:
         Composition of transforms
@@ -310,18 +314,30 @@ def get_cifar100_transforms(train: bool = True) -> transforms.Compose:
         std=[0.2675, 0.2565, 0.2761]
     )
     
+    train_transform_list = [
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+    ]
+    test_transform_list = []
+
+    if resolution is not None:
+        train_transform_list.append(transforms.Resize((resolution, resolution)))
+        test_transform_list.append(transforms.Resize((resolution, resolution)))
+
+    train_transform_list.extend([
+        transforms.ToTensor(),
+        normalize,
+    ])
+    
+    test_transform_list.extend([
+        transforms.ToTensor(),
+        normalize,
+    ])
+
     if train:
-        return transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
+        return transforms.Compose(train_transform_list)
     else:
-        return transforms.Compose([
-            transforms.ToTensor(),
-            normalize,
-        ])
+        return transforms.Compose(test_transform_list)
 
 
 def get_continual_cifar100_loaders(
@@ -330,7 +346,8 @@ def get_continual_cifar100_loaders(
     num_workers: int = 4,
     root: str = './data',
     seed: Optional[int] = 42,
-    pin_memory: bool = True
+    pin_memory: bool = True,
+    resolution: Optional[int] = None
 ) -> Tuple[List[DataLoader], List[DataLoader], np.ndarray]:
     """
     Create data loaders for class-incremental learning on CIFAR-100.
@@ -350,6 +367,7 @@ def get_continual_cifar100_loaders(
         root: Root directory for data storage
         seed: Random seed for reproducibility
         pin_memory: If True, pin memory for faster GPU transfer
+        resolution: Target resolution to resize images to. Allows upscale.
     
     Returns:
         Tuple of (train_loaders, test_loaders, class_order):
@@ -395,8 +413,8 @@ def get_continual_cifar100_loaders(
     splitter = ClassIncrementalSplit(n_tasks=n_tasks, n_classes=100, seed=seed)
     
     # Get transforms
-    train_transform = get_cifar100_transforms(train=True)
-    test_transform = get_cifar100_transforms(train=False)
+    train_transform = get_cifar100_transforms(train=True, resolution=resolution)
+    test_transform = get_cifar100_transforms(train=False, resolution=resolution)
     
     train_loaders = []
     test_loaders = []

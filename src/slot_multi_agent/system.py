@@ -4,7 +4,7 @@ Complete Slot-based Multi-Agent System.
 End-to-end pipeline:
 1. Image → Slot Attention → Slots (object tokens)
 2. For each slot: Estimators → Top-k agents → Hidden labels
-3. Aggregate all slots → Decision Tree → Prediction
+3. Aggregate all slots → CRP Expert Assignment → Prediction
 """
 
 import torch
@@ -40,7 +40,7 @@ class SlotMultiAgentSystem(nn.Module):
         Aggregate all slots:
           7 slots × 384-dim → 2688-dim (or mean → 384-dim)
           ↓
-        Hoeffding Tree → Final prediction
+        CRP Expert Aggregator → Final prediction
     """
     
     def __init__(
@@ -54,7 +54,7 @@ class SlotMultiAgentSystem(nn.Module):
         input_channels: int = 3,
         input_size: int = 32,
         estimator_type: str = 'vae',  # 'vae' or 'mlp'
-        aggregator_type: str = 'hoeffding',  # 'hoeffding', 'incremental', 'soft'
+        aggregator_type: str = 'crp',  # 'crp', 'hoeffding', 'ensemble'
         aggregate_mode: str = 'concat',  # 'concat' or 'mean'
         device: str = 'cpu'
     ):
@@ -132,21 +132,22 @@ class SlotMultiAgentSystem(nn.Module):
             num_blocks=3
         ).to(device)
         
-        # 6. Aggregator (Decision Tree)
+        # 6. Aggregator (CRP Expert Assignment)
         # Input dimension depends on aggregate mode
         if aggregate_mode == 'concat':
             # num_slots × k × hidden_dim
-            tree_input_dim = num_slots * k * hidden_dim
+            agg_input_dim = num_slots * k * hidden_dim
         elif aggregate_mode == 'mean':
             # Mean over slots: k × hidden_dim
-            tree_input_dim = k * hidden_dim
+            agg_input_dim = k * hidden_dim
         else:
             raise ValueError(f"Unknown aggregate_mode: {aggregate_mode}")
         
         self.aggregator = create_aggregator(
             aggregator_type=aggregator_type,
-            input_dim=tree_input_dim,
-            num_classes=num_classes
+            feature_dim=agg_input_dim,
+            num_classes=num_classes,
+            device=device,
         )
         
         self.to(device)
@@ -227,14 +228,20 @@ class SlotMultiAgentSystem(nn.Module):
         # Stack batch
         hidden_labels = torch.stack(all_hidden_labels)  # (B, tree_input_dim)
         
-        # Step 4: Decision Tree prediction
+        # Step 4: CRP Expert prediction
         with torch.no_grad():
             hidden_labels_np = hidden_labels.cpu().numpy()
             try:
-                predictions = self.aggregator.predict(hidden_labels_np)
-                predictions = torch.tensor(predictions, device=images.device)
-            except:
-                # Tree not fitted yet
+                preds = [
+                    self.aggregator.predict_one(hl)
+                    for hl in hidden_labels_np
+                ]
+                if all(p is not None for p in preds):
+                    predictions = torch.tensor(preds, device=images.device)
+                else:
+                    predictions = None
+            except Exception:
+                # Aggregator not ready yet
                 predictions = None
         
         # Metadata
@@ -268,11 +275,12 @@ class SlotMultiAgentSystem(nn.Module):
         # Forward pass
         predictions, metadata = self.forward(images, return_metadata=True)
         
-        # Incremental tree learning
+        # Incremental CRP expert learning (one-by-one)
         hidden_labels_np = metadata['hidden_labels'].cpu().detach().numpy()
         targets_np = targets.cpu().numpy()
         
-        self.aggregator.partial_fit(hidden_labels_np, targets_np)
+        for hl, t in zip(hidden_labels_np, targets_np):
+            self.aggregator.learn_one(hl, int(t))
         
         # Compute accuracy (if tree is fitted)
         if predictions is not None:
