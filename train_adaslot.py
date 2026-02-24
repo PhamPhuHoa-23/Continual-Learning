@@ -277,8 +277,8 @@ def main():
                 })
             
             else:
-                # Standard reconstruction
-                loss_recon = F.mse_loss(out["reconstruction"], X, reduction="sum") / X.size(0)
+                # Standard reconstruction (per-pixel MSE for balanced gradients)
+                loss_recon = F.mse_loss(out["reconstruction"], X, reduction="mean")
                 loss_sparse = args.sparse_weight * out["hard_keep_decision"].float().mean()
                 loss = loss_recon + loss_sparse
                 
@@ -375,7 +375,7 @@ def main():
                 )
             
             out = model(X, global_step=args.epochs)
-            loss = F.mse_loss(out["reconstruction"], X, reduction="sum") / X.size(0)
+            loss = F.mse_loss(out["reconstruction"], X, reduction="mean")
             test_recon_loss += loss.item()
             test_batches += 1
 

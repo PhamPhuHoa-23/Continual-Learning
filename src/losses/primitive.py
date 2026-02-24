@@ -148,8 +148,9 @@ class PrimitiveLoss(nn.Module):
         label_sim = torch.clamp(label_sim, min=1e-8)
         primitive_sim = torch.clamp(primitive_sim, min=1e-8)
         
-        # KL divergence (sum over all pairs)
-        kl_div = (label_sim * torch.log(label_sim / primitive_sim)).sum()
+        # KL divergence (mean over batch for balanced gradients)
+        # Sum over all B×B pairs, then divide by B to normalize
+        kl_div = (label_sim * torch.log(label_sim / primitive_sim)).sum() / B
         
         return kl_div
 
@@ -175,9 +176,9 @@ class SlotReconstructionLoss(nn.Module):
             target: (B, N, D) or (B, D, H, W)
         
         Returns:
-            loss: MSE loss (mean per sample)
+            loss: MSE loss (mean per pixel for balanced gradients)
         """
-        return F.mse_loss(reconstructed, target, reduction='sum') / target.size(0)
+        return F.mse_loss(reconstructed, target, reduction='mean')
 
 
 # ─── Combined Loss for Concept Learning ────────────────────────────────
