@@ -90,7 +90,7 @@ from .bandit_selector import (
 
 # Aggregators (CRP-based Expert Assignment)
 from .aggregator import (
-    ExpertModule,
+    LearnableExpert,
     CRPExpertAggregator,
     BatchCRPAggregator,
     create_aggregator
@@ -123,7 +123,7 @@ __all__ = [
     'create_bandit_selector',
     
     # Aggregators (CRP)
-    'ExpertModule',
+    'LearnableExpert',
     'CRPExpertAggregator',
     'BatchCRPAggregator',
     'create_aggregator',
