@@ -208,7 +208,7 @@ class CRPExpertAggregator(nn.Module):
         # Class query vectors: classification via inner product with final_repr
         # Shape (num_classes, embed_dim); old queries frozen per task boundary
         self.class_queries = nn.Parameter(
-            torch.randn(num_classes, embed_dim) * 0.02
+            torch.randn(num_classes, embed_dim, device=device) * 0.02
         )
 
         # Set of classes whose query vectors are currently trainable
@@ -226,7 +226,7 @@ class CRPExpertAggregator(nn.Module):
 
         # CRP usage counts per expert slot
         self.register_buffer(
-            "_expert_counts", torch.zeros(max_experts, dtype=torch.long)
+            "_expert_counts", torch.zeros(max_experts, dtype=torch.long, device=device)
         )
 
     # ------------------------------------------------------------------
