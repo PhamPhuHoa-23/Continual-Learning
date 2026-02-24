@@ -252,8 +252,9 @@ class ContinualCIFAR100Dataset(Dataset):
         self.task_classes_set = set(task_classes)
         
         # Find indices of samples belonging to task_classes
+        # Use .targets to avoid O(N) __getitem__ decoding of PIL Images
         self.indices = [
-            idx for idx, (_, label) in enumerate(self.base_dataset)
+            idx for idx, label in enumerate(self.base_dataset.targets)
             if label in self.task_classes_set
         ]
         
