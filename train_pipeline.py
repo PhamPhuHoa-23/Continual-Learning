@@ -51,7 +51,7 @@
 !python src/models/adaslot/train.py \
     --phase all \
     --device cuda \
-    --num_classes 10 \
+    --num_classes 100 \
     --task_p1_steps 2000 \
     --task_p2_steps 2000 \
     --task_p2b_steps 1000 \
@@ -75,7 +75,7 @@ RESUME_TASK = 4   # task cuối đã hoàn thành
 !python src/models/adaslot/train.py \
     --phase all \
     --device cuda \
-    --num_classes 10 \
+    --num_classes 100 \
     --task_p1_steps 2000 \
     --task_p2_steps 2000 \
     --task_p2b_steps 1000 \
@@ -128,7 +128,7 @@ RESUME_TASK = 4   # task cuối đã hoàn thành
 !python src/models/adaslot/train.py \
     --phase 3 \
     --device cuda \
-    --num_classes 10 \
+    --num_classes 100 \
     --filter_k 10 \
     --ucb_exploration 1.414 \
     --ucb_burn_in 100 \
