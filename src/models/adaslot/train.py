@@ -282,8 +282,13 @@ def train_phase2_agents(
         p.requires_grad_(False)
 
     student_agents = student_agents.to(device)
+    student_agents.train()
+    for p in student_agents.parameters():
+        p.requires_grad_(True)
+
     teacher_agents = teacher_agents.to(device)
-    teacher_agents.requires_grad_(False)
+    for p in teacher_agents.parameters():
+        p.requires_grad_(False)
 
     num_prototypes = student_agents[0].num_prototypes
     dino_loss_fn = DINOLoss(
