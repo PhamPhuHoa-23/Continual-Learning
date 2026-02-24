@@ -45,7 +45,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 
 # ── Allow running as a script (python src/models/adaslot/train.py)
 # ── as well as a module (python -m src.models.adaslot.train)
@@ -594,31 +594,39 @@ def train_phase2b_estimators(
 # ───────────────────────────────────────────────────────
 
 def _estimate_agent_scores(
-    slot: torch.Tensor,
+    slots: torch.Tensor,
     vae_estimators: nn.ModuleList,
     mlp_estimator,
     num_agents: int,
     vae_weight: float = 0.5,
 ) -> torch.Tensor:
     """
-    Compute hybrid (VAE + MLP) performance score for every agent on a slot.
+    Compute hybrid (VAE + MLP) performance score for every agent on multiple slots.
 
     Args:
-        slot: (slot_dim,) single slot vector.
+        slots: (N, slot_dim) or (slot_dim,) slots vectors.
         vae_estimators: Per-agent VAE estimators.
         mlp_estimator: Shared MLP estimator.
         num_agents: Total agents.
         vae_weight: Weight for VAE score in the combination.
 
     Returns:
-        scores: (num_agents,) tensor – higher is better.
+        scores: (N, num_agents) or (num_agents,) tensor – higher is better.
     """
-    scores = torch.zeros(num_agents, device=slot.device)
+    is_single = (slots.dim() == 1)
+    if is_single:
+        slots = slots.unsqueeze(0)
+        
+    N = slots.size(0)
+    scores = torch.zeros(N, num_agents, device=slots.device)
     for i in range(num_agents):
-        vae_score = vae_estimators[i].estimate_performance(slot)
-        mlp_score = mlp_estimator.estimate_performance(slot, i)
+        vae_score = vae_estimators[i].estimate_performance(slots)
+        mlp_score = mlp_estimator.estimate_performance(slots, i)
         combined = vae_weight * vae_score + (1 - vae_weight) * mlp_score
-        scores[i] = combined
+        scores[:, i] = combined
+        
+    if is_single:
+        scores = scores.squeeze(0)
     return scores
 
 
@@ -631,40 +639,26 @@ def _extract_weighted_features_one_sample(
     filter_k: int,
     num_agents: int,
     use_estimator_pipeline: bool,
-) -> torch.Tensor:
+    precomputed_scores: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, List[Tuple[List[int], List[float]]]]:
     """
     Extract the feature vector for ONE sample using the full pipeline.
-
-    For each slot:
-      - If estimators available: score all agents → top-filter_k →
-        UCB weights → weighted sum of agent outputs.
-      - Otherwise: fall back to first-k agents (concat).
-
-    Args:
-        slots: (S, D) slots for this sample.
-        student_agents: Agent pool.
-        vae_estimators: VAE estimators (or None).
-        mlp_estimator: MLP estimator (or None).
-        ucb_moe: UCBWeightedMoE instance (or None).
-        filter_k: How many agents to keep after filtering.
-        num_agents: Total agents.
-        use_estimator_pipeline: Whether to use estimate → UCB → weighted.
-
-    Returns:
-        feature: (S * proto_dim,)  if use_estimator_pipeline  (weighted MoE)
-            or   (S * k * proto_dim,) in legacy mode.
     """
     S, D = slots.shape
     sample_hidden = []
+    sample_committees = []
 
     for s_idx in range(S):
         slot = slots[s_idx]  # (D,)
 
         if use_estimator_pipeline:
             # ── Step 1: Fast filter via VAE + MLP ──
-            scores = _estimate_agent_scores(
-                slot, vae_estimators, mlp_estimator, num_agents
-            )
+            if precomputed_scores is not None:
+                scores = precomputed_scores[s_idx]
+            else:
+                scores = _estimate_agent_scores(
+                    slot, vae_estimators, mlp_estimator, num_agents
+                )
             _, topk_ids = torch.topk(scores, k=min(filter_k, num_agents))
             filtered_ids = topk_ids.cpu().tolist()
 
@@ -673,6 +667,7 @@ def _extract_weighted_features_one_sample(
             weights_t = torch.tensor(
                 weights, dtype=torch.float32, device=slot.device
             )
+            sample_committees.append((filtered_ids, weights))
 
             # ── Step 3: Weighted sum of agent outputs (MoE gate) ──
             weighted_output = torch.zeros(
@@ -693,8 +688,9 @@ def _extract_weighted_features_one_sample(
                 ).squeeze(0)
                 slot_labels.append(label)
             sample_hidden.append(torch.cat(slot_labels))  # (k * proto_dim,)
+            sample_committees.append(([], []))
 
-    return torch.cat(sample_hidden)  # concat across all slots
+    return torch.cat(sample_hidden), sample_committees
 
 
 def train_phase3_crp(
@@ -831,12 +827,22 @@ def train_phase3_crp(
 
             B, S, D = slots.shape
 
+            # Compute scores for ALL slots in the batch at once to save time
+            if use_estimator_pipeline:
+                flat_slots = slots.reshape(B * S, D)
+                flat_scores = _estimate_agent_scores(
+                    flat_slots, vae_estimators, mlp_estimator, num_agents
+                )
+                batch_scores = flat_scores.reshape(B, S, num_agents)
+            else:
+                batch_scores = None
+
             # 2. Feature extraction (full pipeline or legacy)
             all_features = []
             all_committee_info = []  # for UCB reward update
 
             for b in range(B):
-                feat = _extract_weighted_features_one_sample(
+                feat, committees = _extract_weighted_features_one_sample(
                     slots=slots[b],
                     student_agents=student_agents,
                     vae_estimators=vae_estimators,
@@ -845,25 +851,11 @@ def train_phase3_crp(
                     filter_k=filter_k if use_estimator_pipeline else k,
                     num_agents=num_agents,
                     use_estimator_pipeline=use_estimator_pipeline,
+                    precomputed_scores=batch_scores[b] if batch_scores is not None else None,
                 )
                 all_features.append(feat)
-
-                # Store committee info for UCB update (only if pipeline)
                 if use_estimator_pipeline:
-                    # Collect the committees for every slot of this sample
-                    slot_committees = []
-                    for s_idx in range(S):
-                        slot = slots[b, s_idx]
-                        scores = _estimate_agent_scores(
-                            slot, vae_estimators, mlp_estimator, num_agents
-                        )
-                        _, topk_ids = torch.topk(
-                            scores, k=min(filter_k, num_agents)
-                        )
-                        fids = topk_ids.cpu().tolist()
-                        _, ws = ucb_moe.get_weights(fids)
-                        slot_committees.append((fids, ws))
-                    all_committee_info.append(slot_committees)
+                    all_committee_info.append(committees)
 
             features_t = torch.stack(all_features)  # (B, dim)
 
