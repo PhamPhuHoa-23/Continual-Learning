@@ -1,178 +1,125 @@
 """
-CRP-based Expert Assignment Aggregator for Continual Learning.
+MoE Cross-Attention Expert Aggregator for Continual Learning.
 
-Replaces the Hoeffding Tree with a dynamic expert assignment system
-that uses Chinese Restaurant Process (CRP), Gradient Alignment Scoring,
-and Gradient Projection to handle class-incremental learning.
+Replaces the prototype-based CRP design with learnable query embeddings
++ cross-attention, removing dependence on metric geometry of the feature space.
 
-Pipeline:
-    Agent outputs (hidden labels) → CRP Expert Assignment → Class Prediction
+Expert Identity:
+    Each expert holds L learnable query embeddings E ∈ R^(L × d).
+    It "asks" agent outputs via cross-attention:
+        z = CrossAttn(Q=E, K=agent_outputs, V=agent_outputs)
+    Score = ||z|| (magnitude = expert confidence)
+    Entropy of attention weights → OOD detector for CRP new-expert creation.
 
-Two core problems solved:
-    1. Which expert does input x belong to? (Prototype matching + cosine similarity)
-    2. Create new expert or assign to existing? (CRP + Gradient Alignment Score)
+CRP Routing (no prototype, no distance metric):
+    For each input H:
+        - Run all active experts → scores, entropies
+        - MoE gate: top-k experts by score, softmax weights
+        - final_repr = Σ gate_j × z_j
+    New expert: if (max_score < threshold OR best_entropy > entropy_threshold)
+                AND Bernoulli(alpha / (N_total + alpha))
 
+Classification (prompt-based CIL style):
+    class_queries ∈ R^(C × d) — one learnable query per class
+    logits = final_repr @ class_queries^T  →  (B, C)
+    Old class queries are frozen when training new tasks.
 
+Continual Learning guarantees:
+    - Agents: frozen throughout → feature space stable
+    - Expert queries: only appended (old frozen at task boundary)
+    - Class queries: old ones frozen when new classes arrive
+    - No prototype to become stale after feature drift
+    - Fully differentiable via backprop through cross-attention
 
-Reference:
+Inspiration:
+    - CompSLOT: Liao et al. (ICLR 2026) — primitive selection via cross-attention
+    - L2P / DualPrompt: Wang et al. (2022) — per-class learnable query vectors
     - CRP: Aldous (1985), Pitman (2006)
-    - GPM: Saha et al. (2021) "Gradient Projection Memory for Continual Learning"
-    - Prototypical Networks: Snell et al. (2017)
+    - MoE routing: Mixtral (Jiang et al., 2024)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
-import copy
+import math
 
 
-class ExpertModule(nn.Module):
+class LearnableExpert(nn.Module):
     """
-    Lightweight linear expert for class-incremental learning.
+    Expert with learnable query embeddings + cross-attention (no prototype).
 
-    Each expert:
-    - Has a small 2-layer MLP classifier.
-    - Maintains a prototype (running mean) for cosine similarity matching.
-    - Stores gradient memory (g_old^k) for alignment scoring.
-    - Stores projection bases (SVD) for gradient projection (GPM-lite).
+    Instead of a centroid in feature space, this expert holds L learnable
+    query embeddings that attend to agent outputs via cross-attention.
+    The expert identity lives in parameter space, not in the geometry of
+    agent outputs — so it never goes stale when the feature distribution
+    changes.
 
     Args:
-        expert_id: Unique expert identifier.
-        feature_dim: Dimension of input features (agent hidden labels).
-        num_classes: Maximum number of classes to predict.
-        hidden_dim: Hidden dimension of classifier MLP.
-        prototype_momentum: EMA momentum for prototype update.
-        gradient_momentum: EMA momentum for gradient memory update.
-        projection_rank: Max rank for GPM projection bases.
+        expert_id:  Unique expert identifier.
+        n_queries:  Number of learnable query embeddings (L).
+        embed_dim:  Query / key / value hidden dimension (d).
+        agent_dim:  Input agent-output dimension per slot.
     """
 
     def __init__(
         self,
         expert_id: int,
-        feature_dim: int,
-        num_classes: int,
-        hidden_dim: int = 256,
-        prototype_momentum: float = 0.95,
-        gradient_momentum: float = 0.9,
-        projection_rank: int = 10,
+        n_queries: int = 4,
+        embed_dim: int = 256,
+        agent_dim: int = 256,
     ):
         super().__init__()
 
         self.expert_id = expert_id
-        self.feature_dim = feature_dim
-        self.num_classes = num_classes
-        self.hidden_dim = hidden_dim
-        self.prototype_momentum = prototype_momentum
-        self.gradient_momentum = gradient_momentum
-        self.projection_rank = projection_rank
+        self.n_queries = n_queries
+        self.embed_dim = embed_dim
+        self.agent_dim = agent_dim
 
-        # --- Lightweight MLP Classifier ---
-        self.classifier = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, num_classes),
-        )
+        # Learnable query embeddings — expert "identity" in parameter space
+        # NOT a prototype centroid; NOT in agent feature geometry
+        self.queries = nn.Parameter(torch.randn(n_queries, embed_dim) * 0.02)
 
-        # --- Prototype (running mean of assigned inputs) ---
-        self.register_buffer("prototype", torch.zeros(feature_dim))
-        self.register_buffer("prototype_count", torch.tensor(0, dtype=torch.long))
+        # Project agent slot outputs to K, V
+        self.key_proj = nn.Linear(agent_dim, embed_dim, bias=False)
+        self.val_proj = nn.Linear(agent_dim, embed_dim, bias=False)
 
-        # --- Gradient Memory (EMA of past gradients for alignment) ---
-        self._grad_memory_initialized = False
-        self.register_buffer("gradient_memory", torch.zeros(1))  # resized on first use
-
-        # --- Projection Bases for GPM (orthogonal subspace) ---
-        self.register_buffer("projection_bases", torch.empty(0))
-
-        # --- Statistics ---
+        # Statistics (not learnable)
         self.class_counts: Dict[int, int] = defaultdict(int)
         self.total_assigned: int = 0
 
-        # --- Activation buffer for SVD (GPM) ---
-        self._activation_buffer: List[torch.Tensor] = []
-        self._buffer_max_size: int = 200
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through classifier.
+        Cross-attention: expert queries attend to agent slot outputs.
 
         Args:
-            x: (batch_size, feature_dim) or (feature_dim,)
+            H: (B, num_slots, agent_dim)
 
         Returns:
-            logits: (batch_size, num_classes) or (num_classes,)
+            z:       (B, embed_dim)  aggregated representation
+            entropy: (B,)            attention entropy — high = OOD signal
         """
-        return self.classifier(x)
+        B, k, _ = H.shape
 
-    @torch.no_grad()
-    def update_prototype(self, x: torch.Tensor):
-        """
-        Update prototype via EMA of input features.
+        K = self.key_proj(H)   # (B, k, d)
+        V = self.val_proj(H)   # (B, k, d)
+        Q = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, L, d)
 
-        Args:
-            x: (feature_dim,) — single sample feature vector.
-        """
-        if x.dim() > 1:
-            x = x.mean(dim=0)
+        # Scaled dot-product attention
+        scale = math.sqrt(self.embed_dim)
+        scores = torch.bmm(Q, K.transpose(1, 2)) / scale   # (B, L, k)
+        attn = F.softmax(scores, dim=-1)                    # (B, L, k)
 
-        if self.prototype_count == 0:
-            self.prototype.copy_(x)
-        else:
-            m = self.prototype_momentum
-            self.prototype.mul_(m).add_(x, alpha=1 - m)
+        # Mean over L queries → single representation
+        z = torch.bmm(attn, V).mean(dim=1)                  # (B, d)
 
-        self.prototype_count += 1
+        # Attention entropy averaged over queries — OOD diagnostic
+        attn_avg = attn.mean(dim=1)                         # (B, k)
+        entropy = -(attn_avg * (attn_avg + 1e-8).log()).sum(dim=-1)  # (B,)
 
-    def update_gradient_memory(self, g_new: torch.Tensor):
-        """
-        Update gradient memory via EMA.
-
-        Args:
-            g_new: Flattened gradient vector from the latest update.
-        """
-        if not self._grad_memory_initialized:
-            self.gradient_memory = torch.zeros_like(g_new)
-            self._grad_memory_initialized = True
-
-        m = self.gradient_momentum
-        self.gradient_memory.mul_(m).add_(g_new.detach(), alpha=1 - m)
-
-    def buffer_activation(self, x: torch.Tensor):
-        """Store activation for later SVD computation."""
-        self._activation_buffer.append(x.detach().cpu())
-        if len(self._activation_buffer) > self._buffer_max_size:
-            self._activation_buffer.pop(0)
-
-    @torch.no_grad()
-    def update_projection_bases(self):
-        """
-        Compute SVD on buffered activations and store top singular vectors
-        as projection bases (GPM-style).
-        """
-        if len(self._activation_buffer) < 5:
-            return  # Not enough data
-
-        activations = torch.stack(self._activation_buffer).to(self.prototype.device)
-        # Center activations
-        activations = activations - activations.mean(dim=0, keepdim=True)
-
-        try:
-            U, S, _ = torch.linalg.svd(activations, full_matrices=False)
-            # Keep top-rank columns of V^T (right singular vectors correspond to feature directions)
-            # We want bases in feature space: use columns of V = rows of Vh
-            _, _, Vh = torch.linalg.svd(activations, full_matrices=False)
-            rank = min(self.projection_rank, Vh.shape[0], activations.shape[1])
-            self.projection_bases = Vh[:rank].T  # (feature_dim, rank)
-        except Exception:
-            pass  # SVD can fail on degenerate matrices; skip silently
-
-    def get_num_assigned(self) -> int:
-        """Total number of samples assigned to this expert."""
-        return self.total_assigned
+        return z, entropy
 
     def get_info(self) -> Dict:
         """Expert statistics."""
@@ -180,525 +127,408 @@ class ExpertModule(nn.Module):
             "expert_id": self.expert_id,
             "total_assigned": self.total_assigned,
             "class_counts": dict(self.class_counts),
-            "prototype_norm": self.prototype.norm().item(),
-            "has_projection_bases": self.projection_bases.numel() > 0,
+            "n_queries": self.n_queries,
         }
 
 
 class CRPExpertAggregator(nn.Module):
     """
-    CRP-based Expert Assignment Aggregator.
+    MoE Cross-Attention Expert Aggregator (no prototypes).
 
-    Dynamically creates and routes to lightweight expert modules using
-    Chinese Restaurant Process for expert creation decisions and
-    a balanced scoring formula that prevents expert overload.
+    Combines CRP-style dynamic expert creation with learnable query
+    embeddings + cross-attention routing (no metric-space prototypes).
 
-    Pipeline for each sample (x, label):
-        1. Compute cosine similarity to all expert prototypes.
-        2. For each expert k, compute:
-           Score(k) = Similarity(x, proto_k) × Alignment(g_new, g_old^k) × Capacity(k)
-        3. Capacity(k) penalizes experts with too many diverse classes
-           (prevents "hogging" in continual learning)
-        4. CRP probability of new expert: P(new) = α / (N_total + α)
-        5. If best Score < threshold → consider creating new expert.
-        6. Train assigned expert with gradient projected orthogonal to
-           past important subspaces (GPM-lite).
+    Pipeline for each sample (hidden_labels, label):
+        1. Reshape hidden_labels → H: (1, num_slots, agent_dim).
+        2. Run all N active experts on H → scores (magnitude) + entropies.
+        3. CRP check: if (max_score < threshold OR best_entropy > ent_threshold)
+                       AND Bernoulli(alpha / (N + alpha)) → create new expert.
+        4. MoE gate: top-k experts by score, softmax weights.
+        5. final_repr = Σ gate_j × z_j.
+        6. logits = final_repr @ class_queries^T → (C,).
+        7. CE loss + backprop → update expert queries + class query for this label.
 
-    Scoring Philosophy (vs. vanilla CRP):
-        Vanilla CRP: Popularity = N_k / (N + α) → rich-get-richer → one expert
-        hogs all classes, which is terrible for continual learning.
-
-        Our approach (inspired by Switch Transformer load balancing & Expert Gate):
-        - Similarity: Route to the most relevant expert (prototype matching)
-        - Alignment: Ensure gradient compatibility (no destructive interference)
-        - Capacity: Penalize overloaded experts (exponential decay on class count)
-        This naturally distributes classes across experts and promotes specialization.
+    Key properties:
+        - Expert identity = learnable parameter vectors, NOT prototype centroids.
+        - Routing uses attention entropy (OOD signal), NOT Euclidean distance.
+        - Class queries grow by appending new vectors (old ones frozen per task).
+        - Fully differentiable end-to-end.
 
     Args:
-        feature_dim: Dimension of agent output features.
-        num_classes: Maximum number of classes.
-        alpha: CRP concentration parameter. Higher = more new experts.
-        max_experts: Max number of experts allowed.
-        hidden_dim: Hidden dim for each expert's classifier MLP.
-        buffer_size: Per-expert activation buffer for GPM SVD.
-        projection_rank: Max rank for GPM projection bases.
-        expert_lr: Learning rate for expert classifier updates.
-        score_threshold: Minimum score to accept existing expert (vs create new).
-        prototype_momentum: EMA momentum for prototype updates.
-        gradient_momentum: EMA momentum for gradient memory updates.
-        capacity_beta: Strength of capacity penalty. Higher = stronger penalty for
-            overloaded experts. Default 1.5.
-        ideal_classes_per_expert: Target number of classes per expert for capacity
-            computation. Default 5 (for CIFAR-100 with ~20 experts).
-        device: Torch device.
+        feature_dim:         Total input dim = num_slots × agent_dim.
+        num_slots:           Number of AdaSlot slots (S).
+        agent_dim:           Agent output dimension per slot (proto_dim).
+        num_classes:         Maximum total number of classes.
+        alpha:               CRP concentration. Higher → more new experts.
+        max_experts:         Hard cap on expert pool size.
+        n_queries:           Learnable query embeddings per expert (L).
+        embed_dim:           Cross-attention hidden dimension (d).
+        top_k:               Number of top experts for MoE gating.
+        expert_lr:           Learning rate for all learnable parameters.
+        entropy_threshold:   Attention entropy threshold for OOD detection.
+        score_threshold:     Min MoE score to avoid triggering new expert.
+        device:              Torch device.
     """
 
     def __init__(
         self,
         feature_dim: int,
+        num_slots: int,
+        agent_dim: int,
         num_classes: int = 100,
         alpha: float = 1.0,
-        max_experts: int = 30,
-        hidden_dim: int = 256,
-        buffer_size: int = 100,
-        projection_rank: int = 10,
+        max_experts: int = 20,
+        n_queries: int = 4,
+        embed_dim: int = 256,
+        top_k: int = 3,
         expert_lr: float = 1e-3,
-        score_threshold: float = 0.05,
-        prototype_momentum: float = 0.95,
-        gradient_momentum: float = 0.9,
-        capacity_beta: float = 1.5,
-        ideal_classes_per_expert: int = 5,
+        entropy_threshold: float = 2.0,
+        score_threshold: float = 0.3,
         device: str = "cpu",
     ):
         super().__init__()
 
         self.feature_dim = feature_dim
+        self.num_slots = num_slots
+        self.agent_dim = agent_dim
         self.num_classes = num_classes
         self.alpha = alpha
         self.max_experts = max_experts
-        self.hidden_dim = hidden_dim
-        self.buffer_size = buffer_size
-        self.projection_rank = projection_rank
+        self.n_queries = n_queries
+        self.embed_dim = embed_dim
+        self.top_k = top_k
         self.expert_lr = expert_lr
+        self.entropy_threshold = entropy_threshold
         self.score_threshold = score_threshold
-        self.prototype_momentum = prototype_momentum
-        self.gradient_momentum = gradient_momentum
-        self.capacity_beta = capacity_beta
-        self.ideal_classes_per_expert = ideal_classes_per_expert
         self.device = device
 
-        # Dynamic list of experts
+        # Expert pool — grows dynamically via CRP
         self.experts = nn.ModuleList()
 
-        # Global statistics
-        self.total_samples = 0
-        self.num_classes_seen = 0
-        self.class_counts: Dict[int, int] = defaultdict(int)
+        # Class query vectors: classification via inner product with final_repr
+        # Shape (num_classes, embed_dim); old queries frozen per task boundary
+        self.class_queries = nn.Parameter(
+            torch.randn(num_classes, embed_dim) * 0.02
+        )
 
-        # Mapping: expert_id → set of class_ids
+        # Set of classes whose query vectors are currently trainable
+        self._trainable_classes: Set[int] = set()
+
+        # Global statistics
+        self.total_samples: int = 0
+        self.num_classes_seen: int = 0
+        self.class_counts: Dict[int, int] = defaultdict(int)
+        self.seen_classes: Set[int] = set()
         self.expert_class_map: Dict[int, set] = defaultdict(set)
 
-        # Next expert ID counter
-        self._next_expert_id = 0
+        self._next_expert_id: int = 0
+        self._optimizer: Optional[torch.optim.Optimizer] = None
+
+        # CRP usage counts per expert slot
+        self.register_buffer(
+            "_expert_counts", torch.zeros(max_experts, dtype=torch.long)
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _init_optimizer(self):
+        """Build Adam optimizer over all current parameters."""
+        self._optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.expert_lr
+        )
 
     def _create_expert(
-        self, init_from: Optional["ExpertModule"] = None
-    ) -> "ExpertModule":
-        """
-        Create a new ExpertModule.
-
-        Args:
-            init_from: If provided, copy weights from this expert + add noise
-                       (smart initialization).
-
-        Returns:
-            New ExpertModule, already moved to self.device.
-        """
-        expert = ExpertModule(
+        self, init_from: Optional[LearnableExpert] = None
+    ) -> LearnableExpert:
+        """Create a new LearnableExpert, optionally warm-started."""
+        expert = LearnableExpert(
             expert_id=self._next_expert_id,
-            feature_dim=self.feature_dim,
-            num_classes=self.num_classes,
-            hidden_dim=self.hidden_dim,
-            prototype_momentum=self.prototype_momentum,
-            gradient_momentum=self.gradient_momentum,
-            projection_rank=self.projection_rank,
+            n_queries=self.n_queries,
+            embed_dim=self.embed_dim,
+            agent_dim=self.agent_dim,
         ).to(self.device)
 
-        # Smart init: copy from nearest expert + noise
         if init_from is not None:
-            expert.classifier.load_state_dict(init_from.classifier.state_dict())
             with torch.no_grad():
-                for p in expert.classifier.parameters():
+                expert.queries.data.copy_(init_from.queries.data)
+                expert.key_proj.weight.data.copy_(init_from.key_proj.weight.data)
+                expert.val_proj.weight.data.copy_(init_from.val_proj.weight.data)
+                # Small noise to break symmetry
+                for p in expert.parameters():
                     p.add_(torch.randn_like(p) * 0.01)
 
-        expert._buffer_max_size = self.buffer_size
         self._next_expert_id += 1
         return expert
 
-    def _find_nearest_expert(self, x: torch.Tensor) -> Optional[int]:
+    def _reshape(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape flat feature → (B, num_slots, agent_dim)."""
+        B = x.shape[0] if x.dim() > 1 else 1
+        return x.view(B, self.num_slots, self.agent_dim)
+
+    def _forward_all_experts(
+        self, H: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Find expert whose prototype is most similar to x (cosine similarity).
+        Run all active experts on H.
 
         Args:
-            x: (feature_dim,)
+            H: (B, num_slots, agent_dim)
 
         Returns:
-            Index into self.experts, or None if no experts exist.
+            all_z:       (B, N, embed_dim)
+            all_scores:  (B, N)   magnitude × log-CRP-count
+            all_entropy: (B, N)   attention entropy per expert
         """
-        if len(self.experts) == 0:
-            return None
+        N = len(self.experts)
+        zs, raw_scores, entropies = [], [], []
 
-        similarities = []
-        for expert in self.experts:
-            if expert.prototype_count == 0:
-                similarities.append(-1.0)
-            else:
-                sim = F.cosine_similarity(
-                    x.unsqueeze(0), expert.prototype.unsqueeze(0)
-                ).item()
-                similarities.append(sim)
+        for j, expert in enumerate(self.experts):
+            z, ent = expert(H)                      # (B, d), (B,)
+            s = z.norm(dim=-1)                      # (B,)
+            raw_scores.append(s)
+            entropies.append(ent)
+            zs.append(z)
 
-        return int(np.argmax(similarities))
+        all_z = torch.stack(zs, dim=1)              # (B, N, d)
+        all_scores = torch.stack(raw_scores, dim=1) # (B, N)
+        all_entropy = torch.stack(entropies, dim=1) # (B, N)
 
-    def _compute_gradient(
-        self, expert: ExpertModule, x: torch.Tensor, label: torch.Tensor
+        # Multiply by log(CRP count + 1) as a mild popularity bonus
+        crp_prior = (
+            self._expert_counts[:N].float().to(self.device) + 1.0
+        ).log1p()
+        all_scores = all_scores * crp_prior.unsqueeze(0)
+
+        return all_z, all_scores, all_entropy
+
+    def _moe_aggregate(
+        self, all_z: torch.Tensor, all_scores: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute gradient of cross-entropy loss w.r.t. expert classifier params.
-
-        Args:
-            expert: The expert module.
-            x: (feature_dim,) input features.
-            label: scalar class label.
+        MoE gating: top-k experts, softmax weights.
 
         Returns:
-            Flattened gradient vector.
+            output: (B, embed_dim)
         """
-        # Ensure x requires no grad tracking from outside
-        x_in = x.detach().unsqueeze(0).requires_grad_(False)
-        label_in = label.detach().unsqueeze(0) if label.dim() == 0 else label.detach()
+        N = all_z.size(1)
+        k = min(self.top_k, N)
 
-        logits = expert(x_in)
-        loss = F.cross_entropy(logits, label_in)
+        topk_scores, topk_idx = all_scores.topk(k, dim=-1)   # (B, k)
+        gate = F.softmax(topk_scores, dim=-1)                  # (B, k)
 
-        # Compute gradients w.r.t. classifier parameters only
-        grads = torch.autograd.grad(
-            loss, expert.classifier.parameters(), create_graph=False, allow_unused=True
-        )
+        selected_z = all_z.gather(
+            1, topk_idx.unsqueeze(-1).expand(-1, -1, self.embed_dim)
+        )                                                        # (B, k, d)
 
-        flat_grad = torch.cat(
-            [g.flatten() if g is not None else torch.zeros(p.numel(), device=self.device)
-             for g, p in zip(grads, expert.classifier.parameters())]
-        )
-        return flat_grad
+        return (gate.unsqueeze(-1) * selected_z).sum(dim=1)    # (B, d)
 
-    def _compute_expert_score(
-        self, expert_idx: int, x: torch.Tensor, label: torch.Tensor
-    ) -> float:
+    def _maybe_add_expert(
+        self, all_scores: torch.Tensor, all_entropy: torch.Tensor
+    ) -> bool:
         """
-        Compute balanced Score for assigning x to expert_idx.
+        CRP decision gate: add new expert if needed.
 
-        Score(k) = Similarity(x, proto_k) × Alignment(g_new, g_old^k) × Capacity(k)
+        Trigger condition:
+            (mean_max_score < score_threshold  OR
+             best_expert_entropy > entropy_threshold)
+            AND Bernoulli(alpha / (N + alpha))
 
-        Three factors:
-        - Similarity: Cosine similarity between input x and expert prototype.
-          Routes data to the most relevant expert.
-        - Alignment: Cosine similarity between new gradient and expert's gradient
-          memory. Ensures gradient compatibility (no destructive interference).
-        - Capacity: Exponential penalty for experts with too many diverse classes.
-          Prevents any single expert from hoarding all classes.
-          Capacity(k) = exp(-β × num_classes_k / ideal_classes)
+        Returns True if a new expert was created.
+        """
+        if len(self.experts) >= self.max_experts:
+            return False
 
-        This replaces the vanilla CRP "Popularity" term (rich-get-richer) which
-        was harmful for continual learning.
+        mean_max_score = all_scores.max(dim=-1).values.mean().item()
+        # Entropy of the currently most confident expert
+        best_j = int(all_scores.mean(0).argmax().item())
+        best_entropy = all_entropy[:, best_j].mean().item()
+
+        p_new = self.alpha / (self.total_samples + self.alpha + 1e-8)
+
+        if (
+            (mean_max_score < self.score_threshold or
+             best_entropy > self.entropy_threshold)
+            and np.random.rand() < p_new
+        ):
+            init_src = self.experts[best_j] if len(self.experts) > 0 else None
+            new_expert = self._create_expert(init_from=init_src)
+            self.experts.append(new_expert)
+            # Register new params in existing optimizer
+            if self._optimizer is not None:
+                self._optimizer.add_param_group(
+                    {"params": new_expert.parameters(), "lr": self.expert_lr}
+                )
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Public API (compatible with BatchCRPAggregator)
+    # ------------------------------------------------------------------
+
+    def freeze_old_classes(self, new_label_set: Set[int]):
+        """
+        Freeze class-query vectors for all classes NOT in new_label_set.
+        Call at the start of each new task to protect previous knowledge.
+        """
+        self._trainable_classes = new_label_set
+
+    def learn_one(self, hidden_labels: np.ndarray, label: int) -> Dict:
+        """
+        Online learning: one example.
 
         Args:
-            expert_idx: Index of expert in self.experts.
-            x: (feature_dim,)
-            label: scalar class label.
+            hidden_labels: (feature_dim,) — flattened agent outputs.
+            label:         Ground-truth class label (int).
 
         Returns:
-            Score value (float).
+            info Dict with expert routing details.
         """
-        expert = self.experts[expert_idx]
+        x = torch.tensor(
+            hidden_labels, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)                                          # (1, F)
+        y = torch.tensor([label], dtype=torch.long, device=self.device)
 
-        # --- Factor 1: Prototype Similarity ---
-        # Route to the expert whose prototype is most similar to x
-        if expert.prototype_count > 0:
-            similarity = F.cosine_similarity(
-                x.unsqueeze(0), expert.prototype.unsqueeze(0)
-            ).item()
-            similarity = max(0.0, (similarity + 1.0) / 2.0)  # Remap [-1,1] → [0,1]
-        else:
-            similarity = 0.5  # Neutral for uninitialized experts
-
-        # --- Factor 2: Gradient Alignment ---
-        # Ensure the new update won't conflict with past learning
-        g_new = self._compute_gradient(expert, x, label)
-
-        if expert._grad_memory_initialized and expert.gradient_memory.numel() > 1:
-            alignment = F.cosine_similarity(
-                g_new.unsqueeze(0), expert.gradient_memory.unsqueeze(0)
-            ).item()
-            alignment = max(0.0, alignment)  # Only positive alignment
-        else:
-            # No gradient history yet: use similarity as fallback
-            alignment = similarity
-
-        # --- Factor 3: Capacity (load-balancing penalty) ---
-        # Penalize experts that already handle too many different classes.
-        # Inspired by Switch Transformer's load-balancing auxiliary loss.
-        # Capacity(k) = exp(-β × num_classes_k / ideal_classes_per_expert)
-        num_classes_in_expert = len(expert.class_counts)
-        capacity = np.exp(
-            -self.capacity_beta * num_classes_in_expert / self.ideal_classes_per_expert
-        )
-
-        score = similarity * alignment * capacity
-        return score
-
-    def _project_gradient(
-        self, expert: ExpertModule, grad: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Project gradient orthogonal to expert's important past subspaces (GPM-lite).
-
-        grad_proj = grad - bases @ bases^T @ grad
-
-        Args:
-            expert: Expert whose projection bases to use.
-            grad: Flattened gradient vector.
-
-        Returns:
-            Projected gradient vector.
-        """
-        bases = expert.projection_bases
-        if bases.numel() == 0:
-            return grad
-
-        # Projection bases are in feature space, but grad is in parameter space.
-        # For lightweight GPM, we apply projection per-layer using activation-space bases.
-        # Here we use a simplified approach: project the full grad vector if sizes match.
-        # In practice, apply per-layer for correctness.
-        if bases.shape[0] == grad.shape[0]:
-            proj = bases @ (bases.T @ grad)
-            return grad - proj
-
-        return grad
-
-    def _train_expert(
-        self, expert: ExpertModule, x: torch.Tensor, label: torch.Tensor
-    ):
-        """
-        Train a single expert on (x, label) with gradient projection.
-
-        Args:
-            expert: Expert to train.
-            x: (feature_dim,)
-            label: scalar class label.
-        """
-        x_in = x.detach().unsqueeze(0)
-        label_in = (
-            label.detach().unsqueeze(0) if label.dim() == 0 else label.detach()
-        )
-
-        logits = expert(x_in)
-        loss = F.cross_entropy(logits, label_in)
-
-        # Compute gradients
-        grads = torch.autograd.grad(
-            loss, expert.classifier.parameters(), create_graph=False, allow_unused=True
-        )
-
-        # Build flat gradient for alignment memory update
-        flat_grad_parts = []
-        grad_list = []
-        for g, p in zip(grads, expert.classifier.parameters()):
-            if g is not None:
-                flat_grad_parts.append(g.flatten())
-                grad_list.append(g)
-            else:
-                flat_grad_parts.append(torch.zeros(p.numel(), device=self.device))
-                grad_list.append(torch.zeros_like(p))
-
-        flat_grad = torch.cat(flat_grad_parts)
-
-        # Update gradient memory BEFORE projection (store raw direction)
-        expert.update_gradient_memory(flat_grad)
-
-        # Apply gradient projection (GPM-lite) — project flat grad
-        flat_grad_proj = self._project_gradient(expert, flat_grad)
-
-        # Unflatten projected gradient and apply to parameters
-        offset = 0
-        with torch.no_grad():
-            for p in expert.classifier.parameters():
-                numel = p.numel()
-                p_grad = flat_grad_proj[offset : offset + numel].view_as(p)
-                p.add_(p_grad, alpha=-self.expert_lr)
-                offset += numel
-
-    def assign_expert(
-        self, x: torch.Tensor, label: torch.Tensor
-    ) -> Tuple[int, bool]:
-        """
-        Assign input x to an expert using CRP + Gradient Alignment.
-
-        Args:
-            x: (feature_dim,) feature vector.
-            label: scalar class label.
-
-        Returns:
-            (expert_idx, is_new): Index of chosen expert, whether it was newly created.
-        """
-        # --- No experts yet: must create first one ---
+        # Bootstrap: create first expert
         if len(self.experts) == 0:
-            new_expert = self._create_expert()
-            self.experts.append(new_expert)
-            return 0, True
+            self.experts.append(self._create_expert())
+            self._init_optimizer()
 
-        # --- Compute CRP probability of creating new expert ---
-        p_new = self.alpha / (self.total_samples + self.alpha)
+        H = self._reshape(x)                                    # (1, S, D)
 
-        # --- Compute scores for all existing experts ---
-        scores = []
-        for idx in range(len(self.experts)):
-            s = self._compute_expert_score(idx, x, label)
-            scores.append(s)
+        # Forward all active experts
+        all_z, all_scores, all_entropy = self._forward_all_experts(H)
 
-        best_idx = int(np.argmax(scores))
-        best_score = scores[best_idx]
+        # CRP routing: maybe add new expert
+        is_new = self._maybe_add_expert(all_scores, all_entropy)
+        if is_new:
+            all_z, all_scores, all_entropy = self._forward_all_experts(H)
 
-        # --- Decision: new expert or existing? ---
-        create_new = False
+        # MoE aggregate → final representation
+        repr_vec = self._moe_aggregate(all_z, all_scores)       # (1, d)
 
-        if best_score < self.score_threshold:
-            # All scores are low → likely OOD → probabilistic CRP decision
-            if np.random.rand() < p_new or len(self.experts) < 2:
-                create_new = True
-        elif np.random.rand() < p_new * 0.1:
-            # Small chance to explore even when score is decent
-            create_new = True
+        # Classification logits
+        logits = repr_vec @ self.class_queries.T                 # (1, C)
 
-        if create_new and len(self.experts) < self.max_experts:
-            # Smart init from nearest expert
-            nearest_idx = self._find_nearest_expert(x)
-            init_from = self.experts[nearest_idx] if nearest_idx is not None else None
-            new_expert = self._create_expert(init_from=init_from)
-            self.experts.append(new_expert)
-            return len(self.experts) - 1, True
+        # Mask unseen classes to -inf (except current label)
+        visible = list(self.seen_classes | {label})
+        mask = torch.full_like(logits, float("-inf"))
+        mask[:, visible] = 0.0
+        logits = logits + mask
 
-        return best_idx, False
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, y)
 
-    def learn_one(
-        self,
-        hidden_labels: np.ndarray,
-        label: int,
-    ) -> Dict:
-        """
-        Learn from one example (online learning).
+        # Backprop (with class-query freezing)
+        if self._optimizer is None:
+            self._init_optimizer()
 
-        Args:
-            hidden_labels: (feature_dim,) — flattened agent output vector.
-            label: Ground truth class label (int).
+        self._optimizer.zero_grad()
+        loss.backward()
 
-        Returns:
-            info: Dict with learning info.
-        """
-        x = torch.tensor(hidden_labels, dtype=torch.float32, device=self.device)
-        y = torch.tensor(label, dtype=torch.long, device=self.device)
+        # Freeze gradients for old class queries if _trainable_classes is set
+        if self._trainable_classes:
+            with torch.no_grad():
+                freeze_mask = torch.ones(
+                    self.num_classes, device=self.device
+                )
+                freeze_mask[list(self._trainable_classes)] = 0.0
+                if self.class_queries.grad is not None:
+                    self.class_queries.grad *= (1.0 - freeze_mask).unsqueeze(1)
 
-        # 1. Assign to expert
-        expert_idx, is_new = self.assign_expert(x, y)
-        expert = self.experts[expert_idx]
+        self._optimizer.step()
 
-        # 2. Train the expert
-        self._train_expert(expert, x, y)
+        # Update CRP counts for top-k used experts
+        N = len(self.experts)
+        k = min(self.top_k, N)
+        topk_idx = all_scores[0].topk(k).indices
+        for idx in topk_idx.cpu().tolist():
+            self._expert_counts[idx] += 1
+            self.experts[idx].total_assigned += 1
+            self.experts[idx].class_counts[label] += 1
+            self.expert_class_map[idx].add(label)
 
-        # 3. Update prototype
-        expert.update_prototype(x)
-
-        # 4. Buffer activation for GPM
-        expert.buffer_activation(x)
-
-        # 5. Update statistics
-        expert.total_assigned += 1
-        expert.class_counts[label] += 1
-        self.total_samples += 1
-        self.expert_class_map[expert.expert_id].add(label)
-
-        if label not in self.class_counts:
+        # Update global statistics
+        if label not in self.seen_classes:
+            self.seen_classes.add(label)
             self.num_classes_seen += 1
         self.class_counts[label] += 1
+        self.total_samples += 1
 
         return {
-            "expert_idx": expert_idx,
-            "expert_id": expert.expert_id,
+            "expert_idx": topk_idx[0].item() if len(topk_idx) > 0 else -1,
             "is_new_expert": is_new,
             "num_experts": len(self.experts),
+            "loss": loss.item(),
         }
 
-    def predict_one(
-        self, hidden_labels: np.ndarray
-    ) -> Optional[int]:
-        """
-        Predict class for one example.
-
-        Route to nearest expert (by prototype cosine similarity), then classify.
-
-        Args:
-            hidden_labels: (feature_dim,)
-
-        Returns:
-            Predicted class label, or None if no experts exist.
-        """
+    def predict_one(self, hidden_labels: np.ndarray) -> Optional[int]:
+        """Predict class for one example."""
         if len(self.experts) == 0:
             return None
 
-        x = torch.tensor(hidden_labels, dtype=torch.float32, device=self.device)
-
-        nearest_idx = self._find_nearest_expert(x)
-        if nearest_idx is None:
-            return None
-
-        expert = self.experts[nearest_idx]
+        x = torch.tensor(
+            hidden_labels, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
 
         with torch.no_grad():
-            logits = expert(x.unsqueeze(0))
+            H = self._reshape(x)
+            all_z, all_scores, _ = self._forward_all_experts(H)
+            repr_vec = self._moe_aggregate(all_z, all_scores)   # (1, d)
+            logits = repr_vec @ self.class_queries.T             # (1, C)
+
+            mask = torch.full_like(logits, float("-inf"))
+            mask[:, list(self.seen_classes)] = 0.0
+            logits = logits + mask
             pred = logits.argmax(dim=-1).item()
 
         return pred
 
-    def predict_proba_one(
-        self, hidden_labels: np.ndarray
-    ) -> Dict[int, float]:
-        """
-        Predict class probabilities for one example.
-
-        Args:
-            hidden_labels: (feature_dim,)
-
-        Returns:
-            Dict mapping class_id → probability.
-        """
+    def predict_proba_one(self, hidden_labels: np.ndarray) -> Dict[int, float]:
+        """Predict class probabilities for one example."""
         if len(self.experts) == 0:
             return {}
 
-        x = torch.tensor(hidden_labels, dtype=torch.float32, device=self.device)
-
-        nearest_idx = self._find_nearest_expert(x)
-        if nearest_idx is None:
-            return {}
-
-        expert = self.experts[nearest_idx]
+        x = torch.tensor(
+            hidden_labels, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
 
         with torch.no_grad():
-            logits = expert(x.unsqueeze(0))
+            H = self._reshape(x)
+            all_z, all_scores, _ = self._forward_all_experts(H)
+            repr_vec = self._moe_aggregate(all_z, all_scores)
+            logits = repr_vec @ self.class_queries.T
+
+            mask = torch.full_like(logits, float("-inf"))
+            mask[:, list(self.seen_classes)] = 0.0
+            logits = logits + mask
             probs = F.softmax(logits, dim=-1).squeeze(0)
 
-        return {i: probs[i].item() for i in range(self.num_classes) if probs[i].item() > 1e-6}
+        return {
+            i: probs[i].item()
+            for i in range(self.num_classes)
+            if probs[i].item() > 1e-6
+        }
 
     def update_all_projection_bases(self):
-        """
-        Trigger SVD update for all experts' GPM projection bases.
-        Call this at task boundaries.
-        """
-        for expert in self.experts:
-            expert.update_projection_bases()
+        """No-op (API compatibility). GPM not used in this design."""
+        pass
 
     def get_stats(self) -> Dict:
-        """Get aggregator statistics."""
+        """Aggregator statistics."""
         return {
             "num_experts": len(self.experts),
             "total_samples": self.total_samples,
             "num_classes_seen": self.num_classes_seen,
+            "seen_classes": sorted(self.seen_classes),
             "class_counts": dict(self.class_counts),
             "expert_class_map": {
                 k: list(v) for k, v in self.expert_class_map.items()
             },
             "expert_infos": [e.get_info() for e in self.experts],
         }
-
 
 class BatchCRPAggregator:
     """
