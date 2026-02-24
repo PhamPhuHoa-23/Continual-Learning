@@ -122,6 +122,45 @@ class VAEEstimator(nn.Module):
             
         return score
     
+    def estimate_cost_and_uncertainty(self, slot: torch.Tensor, num_samples: int = 5):
+        """
+        Sample VAE multiple times to estimate reconstruction cost and uncertainty.
+        
+        Args:
+            slot: (batch_size, slot_dim) or (slot_dim,)
+            num_samples: Number of stochastic passes
+            
+        Returns:
+            cost: (batch_size,) or scalar - Mean reconstruction MSE
+            uncertainty: (batch_size,) or scalar - Variance of reconstruction MSE
+        """
+        if slot.dim() == 1:
+            slot = slot.unsqueeze(0)
+            is_single = True
+        else:
+            is_single = False
+            
+        with torch.no_grad():
+            mu, logvar = self.encode(slot)
+            std = torch.exp(0.5 * logvar)
+            
+            errors = []
+            for _ in range(num_samples):
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                recon = self.decode(z)
+                # MSE per sample: (batch_size,)
+                err = F.mse_loss(recon, slot, reduction='none').mean(dim=-1)
+                errors.append(err)
+                
+            errors = torch.stack(errors, dim=0) # (num_samples, batch_size)
+            cost = errors.mean(dim=0) # (batch_size,)
+            uncertainty = errors.var(dim=0, unbiased=False) # (batch_size,)
+            
+        if is_single:
+            return cost.squeeze(0), uncertainty.squeeze(0)
+        return cost, uncertainty
+    
     def compute_loss(self, slot: torch.Tensor, beta: float = 1.0):
         """
         Compute VAE loss for training.
@@ -322,4 +361,74 @@ class HybridEstimator(nn.Module):
         )
         
         return combined_score
+
+
+def create_estimator_pool(
+    num_agents: int,
+    estimator_type: str = 'vae',
+    slot_dim: int = 64,
+    hidden_dim: int = 64,
+    device: str = 'cpu',
+    **kwargs
+) -> nn.ModuleList:
+    """
+    Create a pool of performance estimators for each agent.
+    
+    Args:
+        num_agents: Number of agents in the pool
+        estimator_type: 'vae', 'mlp', or 'hybrid'
+        slot_dim: Dimension of slot tokens
+        hidden_dim: Hidden dimension for estimators
+        device: Target device
+        **kwargs: Additional arguments for specific estimators
+    
+    Returns:
+        estimators: nn.ModuleList containing estimators
+    """
+    estimators = nn.ModuleList()
+    
+    # MLP estimator if needed (shared for 'mlp' and 'hybrid')
+    mlp_estimator = None
+    if estimator_type in ['mlp', 'hybrid']:
+        mlp_estimator = MLPEstimator(
+            num_agents=num_agents,
+            slot_dim=slot_dim,
+            hidden_dim=kwargs.get('mlp_hidden_dim', 128),
+            agent_embed_dim=kwargs.get('agent_embed_dim', 32)
+        ).to(device)
+    
+    for i in range(num_agents):
+        if estimator_type == 'vae':
+            est = VAEEstimator(
+                agent_id=i,
+                slot_dim=slot_dim,
+                latent_dim=kwargs.get('latent_dim', 16),
+                hidden_dim=hidden_dim
+            )
+        elif estimator_type == 'mlp':
+            # Note: For MLPEstimator we need individual wrappers if we want individual estimate_performance
+            # But the MLPEstimator.forward takes agent_id.
+            # To match the List[Estimator] API, we might need a small wrapper
+            class MLPEstimatorWrapper(nn.Module):
+                def __init__(self, mlp, agent_id):
+                    super().__init__()
+                    self.mlp = mlp
+                    self.agent_id = agent_id
+                def estimate_performance(self, slot):
+                    return self.mlp.estimate_performance(slot, self.agent_id)
+            est = MLPEstimatorWrapper(mlp_estimator, i)
+        elif estimator_type == 'hybrid':
+            est = HybridEstimator(
+                agent_id=i,
+                num_agents=num_agents,
+                slot_dim=slot_dim,
+                vae_weight=kwargs.get('vae_weight', 0.5)
+            )
+            est.set_mlp_estimator(mlp_estimator)
+        else:
+            raise ValueError(f"Unknown estimator type: {estimator_type}")
+            
+        estimators.append(est.to(device))
+        
+    return estimators
 

@@ -263,3 +263,27 @@ class AdaptiveKSelector(TopKAgentSelector):
         else:
             return selected_ids
 
+
+def create_selector(
+    selector_type: str = 'top_k',
+    estimators: List = None,
+    **kwargs
+):
+    """
+    Factory function to create selectors.
+    
+    Args:
+        selector_type: One of ['top_k', 'adaptive_k']
+        estimators: List of performance estimators
+        **kwargs: Additional arguments for selectors
+    
+    Returns:
+        Selector instance
+    """
+    if selector_type == 'top_k':
+        return TopKAgentSelector(estimators=estimators, **kwargs)
+    elif selector_type == 'adaptive_k':
+        return AdaptiveKSelector(estimators=estimators, **kwargs)
+    else:
+        raise ValueError(f"Unknown selector_type: {selector_type}")
+
