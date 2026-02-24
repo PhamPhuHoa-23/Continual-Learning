@@ -630,67 +630,83 @@ def _estimate_agent_scores(
     return scores
 
 
-def _extract_weighted_features_one_sample(
+def _extract_weighted_features_batch(
     slots: torch.Tensor,
+    batch_scores: Optional[torch.Tensor],
     student_agents: nn.ModuleList,
-    vae_estimators,
-    mlp_estimator,
     ucb_moe,
     filter_k: int,
     num_agents: int,
     use_estimator_pipeline: bool,
-    precomputed_scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, List[Tuple[List[int], List[float]]]]:
+) -> Tuple[torch.Tensor, List[List[Tuple[List[int], List[float]]]]]:
     """
-    Extract the feature vector for ONE sample using the full pipeline.
+    Extract the feature vector for a BATCH of samples, minimizing agent forward passes.
     """
-    S, D = slots.shape
-    sample_hidden = []
-    sample_committees = []
-
-    for s_idx in range(S):
-        slot = slots[s_idx]  # (D,)
-
-        if use_estimator_pipeline:
-            # ── Step 1: Fast filter via VAE + MLP ──
-            if precomputed_scores is not None:
-                scores = precomputed_scores[s_idx]
-            else:
-                scores = _estimate_agent_scores(
-                    slot, vae_estimators, mlp_estimator, num_agents
-                )
-            _, topk_ids = torch.topk(scores, k=min(filter_k, num_agents))
-            filtered_ids = topk_ids.cpu().tolist()
-
-            # ── Step 2: UCB committee weights ──
-            _, weights = ucb_moe.get_weights(filtered_ids)
-            weights_t = torch.tensor(
-                weights, dtype=torch.float32, device=slot.device
-            )
-            sample_committees.append((filtered_ids, weights))
-
-            # ── Step 3: Weighted sum of agent outputs (MoE gate) ──
-            weighted_output = torch.zeros(
-                student_agents[0].num_prototypes, device=slot.device
-            )
-            for w, aid in zip(weights_t, filtered_ids):
-                agent_out = student_agents[aid](slot.unsqueeze(0)).squeeze(0)
-                weighted_output += w * agent_out
-
-            sample_hidden.append(weighted_output)  # (proto_dim,)
-
-        else:
-            # ── Legacy: first-k agents, concat ──
-            slot_labels = []
-            for a_idx in range(min(filter_k, num_agents)):
-                label = student_agents[a_idx](
-                    slot.unsqueeze(0)
-                ).squeeze(0)
-                slot_labels.append(label)
-            sample_hidden.append(torch.cat(slot_labels))  # (k * proto_dim,)
-            sample_committees.append(([], []))
-
-    return torch.cat(sample_hidden), sample_committees
+    B, S, D = slots.shape
+    device = slots.device
+    proto_dim = student_agents[0].num_prototypes
+    
+    all_committee_info = [[] for _ in range(B)]
+    
+    if use_estimator_pipeline:
+        # Step 1: Filter
+        _, topk_ids = torch.topk(batch_scores, k=min(filter_k, num_agents), dim=-1) # (B, S, filter_k)
+        
+        # Step 2: UCB weights and gather assignments
+        weighted_outputs = torch.zeros(B, S, proto_dim, device=device)
+        agent_tasks = {aid: [] for aid in range(num_agents)}
+        
+        for b in range(B):
+            for s in range(S):
+                fids = topk_ids[b, s].cpu().tolist()
+                _, ws = ucb_moe.get_weights(fids)
+                all_committee_info[b].append((fids, ws))
+                
+                for aid, w in zip(fids, ws):
+                    agent_tasks[aid].append((b, s, w))
+                    
+        # Step 3: Batched agent inference
+        for aid, tasks in agent_tasks.items():
+            if not tasks:
+                continue
+            
+            b_indices = [t[0] for t in tasks]
+            s_indices = [t[1] for t in tasks]
+            weights = torch.tensor([t[2] for t in tasks], dtype=torch.float32, device=device)
+            
+            agent_input_slots = slots[b_indices, s_indices] 
+            agent_out = student_agents[aid](agent_input_slots)  # Batched inference
+            
+            weighted_agent_out = agent_out * weights.unsqueeze(-1)
+            # Add to output tensor (accumulation)
+            # Since b_indices, s_indices might have duplicates if an agent is selected for multiple slots,
+            # we use index_add_ or scatter_add_ theoretically, but here each (b, s) pair uniquely selects 
+            # its committee, meaning an agent is selected AT MOST ONCE per (b, s) pair.
+            # So direct assignment/addition via advanced indexing is safe.
+            weighted_outputs[b_indices, s_indices] += weighted_agent_out
+            
+        batch_hidden = weighted_outputs.reshape(B, S * proto_dim)
+        return batch_hidden, all_committee_info
+        
+    else:
+        # Legacy
+        first_k = min(filter_k, num_agents)
+        agent_outputs = [] 
+        flat_slots = slots.reshape(B * S, D)
+        
+        for aid in range(first_k):
+            # Batch inference for all slots
+            out = student_agents[aid](flat_slots) # (B*S, proto_dim)
+            agent_outputs.append(out)
+            
+        legacy_out = torch.cat(agent_outputs, dim=-1)
+        batch_hidden = legacy_out.reshape(B, S * first_k * proto_dim)
+        
+        for b in range(B):
+            for s in range(S):
+                all_committee_info[b].append(([], []))
+                
+        return batch_hidden, all_committee_info
 
 
 def train_phase3_crp(
@@ -814,8 +830,12 @@ def train_phase3_crp(
     total_correct = 0
     total_samples = 0
     t0 = time.time()
+    
+    print(f"  [DEBUG] Starting Phase 3 dataloader loop. Total batches: {len(dataloader)}")
 
     for batch_idx, batch in enumerate(dataloader):
+        print(f"  [DEBUG] Starting batch {batch_idx}")
+        t_batch_start = time.time()
         images = (batch[0].to(device) if isinstance(batch, (list, tuple))
                   else batch['image'].to(device))
         targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
@@ -838,26 +858,15 @@ def train_phase3_crp(
                 batch_scores = None
 
             # 2. Feature extraction (full pipeline or legacy)
-            all_features = []
-            all_committee_info = []  # for UCB reward update
-
-            for b in range(B):
-                feat, committees = _extract_weighted_features_one_sample(
-                    slots=slots[b],
-                    student_agents=student_agents,
-                    vae_estimators=vae_estimators,
-                    mlp_estimator=mlp_estimator,
-                    ucb_moe=ucb_moe,
-                    filter_k=filter_k if use_estimator_pipeline else k,
-                    num_agents=num_agents,
-                    use_estimator_pipeline=use_estimator_pipeline,
-                    precomputed_scores=batch_scores[b] if batch_scores is not None else None,
-                )
-                all_features.append(feat)
-                if use_estimator_pipeline:
-                    all_committee_info.append(committees)
-
-            features_t = torch.stack(all_features)  # (B, dim)
+            features_t, all_committee_info = _extract_weighted_features_batch(
+                slots=slots,
+                batch_scores=batch_scores,
+                student_agents=student_agents,
+                ucb_moe=ucb_moe,
+                filter_k=filter_k if use_estimator_pipeline else k,
+                num_agents=num_agents,
+                use_estimator_pipeline=use_estimator_pipeline,
+            )
 
         # 3. Aggregator: predict, then learn
         try:
@@ -870,6 +879,7 @@ def train_phase3_crp(
                 preds = aggregator.predict(features_t.numpy())
                 correct = (preds == targets.cpu().numpy()).sum()
             total_correct += correct
+            print(f"  [DEBUG] Batch {batch_idx} prediction took {time.time() - t_batch_start:.2f}s")
 
             # ── UCB reward update ──
             if use_estimator_pipeline and preds is not None:
@@ -902,6 +912,8 @@ def train_phase3_crp(
                 f"acc={acc:.2f}%{extra} | "
                 f"{elapsed:.0f}s"
             )
+            
+        print(f"  [DEBUG] Finished batch {batch_idx} in {time.time() - t_batch_start:.2f}s")
 
     final_acc = total_correct / max(total_samples, 1) * 100
     print(f"  [DONE] Phase 3 complete. Final accuracy: {final_acc:.2f}%")
