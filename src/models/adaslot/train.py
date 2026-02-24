@@ -1562,26 +1562,38 @@ def _eval_after_task(
             eval_slots = adaslot_out['slots']   # (B, S, D)
             B, S, D = eval_slots.shape
 
-            all_feats = []
-            for b in range(B):
-                feat = _extract_weighted_features_one_sample(
-                    slots=eval_slots[b],
-                    student_agents=student_agents,
-                    vae_estimators=vae_estimators,
-                    mlp_estimator=mlp_estimator,
-                    ucb_moe=ucb_moe,
-                    filter_k=filter_k if use_pipeline else 3,
-                    num_agents=num_agents,
-                    use_estimator_pipeline=use_pipeline,
+            # Compute scores for ALL slots in the batch at once
+            if use_pipeline:
+                flat_slots = eval_slots.reshape(B * S, D)
+                flat_scores = _estimate_agent_scores(
+                    flat_slots, vae_estimators, mlp_estimator, num_agents
                 )
-                all_feats.append(feat)
-            feats_t = torch.stack(all_feats)
+                batch_scores = flat_scores.reshape(B, S, num_agents)
+            else:
+                batch_scores = None
+
+            # Batched feature extraction
+            feats_t, _ = _extract_weighted_features_batch(
+                slots=eval_slots,
+                batch_scores=batch_scores,
+                student_agents=student_agents,
+                ucb_moe=ucb_moe,
+                filter_k=filter_k if use_pipeline else 3,
+                num_agents=num_agents,
+                use_estimator_pipeline=use_pipeline,
+            )
 
         try:
-            preds = aggregator.predict_batch(feats_t)
-            total_correct += sum(
-                1 for p, t in zip(preds, eval_targets.numpy()) if p == t
-            )
+            if hasattr(aggregator, 'predict_batch'):
+                preds = aggregator.predict_batch(feats_t)
+                correct = sum(
+                    1 for p, t in zip(preds, eval_targets.numpy()) if p == t
+                )
+            else:
+                preds = aggregator.predict(feats_t.numpy())
+                correct = (preds == eval_targets.numpy()).sum()
+            total_correct += correct
+
         except Exception:
             pass
         total_samples += B
