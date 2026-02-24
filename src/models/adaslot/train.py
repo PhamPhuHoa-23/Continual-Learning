@@ -830,12 +830,8 @@ def train_phase3_crp(
     total_correct = 0
     total_samples = 0
     t0 = time.time()
-    
-    print(f"  [DEBUG] Starting Phase 3 dataloader loop. Total batches: {len(dataloader)}")
 
     for batch_idx, batch in enumerate(dataloader):
-        print(f"  [DEBUG] Starting batch {batch_idx}")
-        t_batch_start = time.time()
         images = (batch[0].to(device) if isinstance(batch, (list, tuple))
                   else batch['image'].to(device))
         targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
@@ -879,7 +875,6 @@ def train_phase3_crp(
                 preds = aggregator.predict(features_t.numpy())
                 correct = (preds == targets.cpu().numpy()).sum()
             total_correct += correct
-            print(f"  [DEBUG] Batch {batch_idx} prediction took {time.time() - t_batch_start:.2f}s")
 
             # ── UCB reward update ──
             if use_estimator_pipeline and preds is not None:
@@ -912,8 +907,6 @@ def train_phase3_crp(
                 f"acc={acc:.2f}%{extra} | "
                 f"{elapsed:.0f}s"
             )
-            
-        print(f"  [DEBUG] Finished batch {batch_idx} in {time.time() - t_batch_start:.2f}s")
 
     final_acc = total_correct / max(total_samples, 1) * 100
     print(f"  [DONE] Phase 3 complete. Final accuracy: {final_acc:.2f}%")
