@@ -1322,11 +1322,12 @@ def main():
         if aggregator is not None and hasattr(aggregator, '_agg'):
             aggregator._agg.freeze_old_classes(set(task_classes))
 
+        total_classes = args.num_classes if args.data_dir else 100
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
             dataloader=task_loader,
-            num_classes=args.num_classes,
+            num_classes=total_classes,
             aggregator_type="crp",
             device=args.device,
             aggregator=aggregator,
@@ -1466,11 +1467,12 @@ def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
             print(f"  Classes: {_task_cls[task_id]}")
         print(f"{'=' * 60}")
 
+        total_classes = args.num_classes if args.data_dir else 100
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
             dataloader=task_loader,
-            num_classes=args.num_classes,
+            num_classes=total_classes,
             aggregator_type="crp",
             device=args.device,
             aggregator=aggregator,
