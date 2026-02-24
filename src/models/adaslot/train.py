@@ -803,6 +803,8 @@ def train_phase3_crp(
     }
     if aggregator_type == "crp":
         agg_kwargs["feature_dim"] = input_dim
+        agg_kwargs["num_slots"] = num_slots   # cross-attention input shape
+        agg_kwargs["agent_dim"] = proto_dim   # per-slot feature dimension
     else:
         agg_kwargs["input_dim"] = input_dim
 
@@ -944,15 +946,16 @@ def main():
     parser.add_argument("--phase", type=str, default="all",
                         choices=["1", "2", "2.5", "3", "all"],
                         help="Training phase: 1=AdaSlot, 2=Agents, "
-                             "2.5=Estimators, 3=CRP, all=sequential")
+                             "2.5=Estimators, 3=CRP, "
+                             "all=CompSLOT-style per-task sequential")
     parser.add_argument("--data_dir", type=str, default=None,
                         help="Dataset directory")
     parser.add_argument("--adaslot_ckpt", type=str, default=None,
-                        help="AdaSlot checkpoint path")
+                        help="AdaSlot checkpoint path (initial weights)")
     parser.add_argument("--agent_ckpt", type=str, default=None,
-                        help="Agent checkpoint path")
+                        help="Agent checkpoint path (initial weights)")
     parser.add_argument("--estimator_ckpt", type=str, default=None,
-                        help="Estimator checkpoint path (Phase 2.5 output)")
+                        help="Estimator checkpoint path (initial weights)")
     parser.add_argument("--num_slots", type=int, default=11)
     parser.add_argument("--slot_dim", type=int, default=64)
     parser.add_argument("--num_agents", type=int, default=50)
@@ -969,16 +972,25 @@ def main():
     parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--resolution", type=int, default=128)
 
-    # Phase-specific
+    # ── Single-phase step counts (used when --phase 1/2/2.5/3) ──
     parser.add_argument("--p1_steps", type=int, default=500000,
-                        help="Phase 1 training steps")
+                        help="Phase 1 training steps (single-phase run)")
     parser.add_argument("--p1_lr", type=float, default=4e-4)
     parser.add_argument("--p2_steps", type=int, default=100000,
-                        help="Phase 2 training steps")
+                        help="Phase 2 training steps (single-phase run)")
     parser.add_argument("--p2_lr", type=float, default=1e-3)
     parser.add_argument("--p2b_steps", type=int, default=20000,
-                        help="Phase 2.5 estimator training steps")
+                        help="Phase 2.5 estimator training steps (single-phase run)")
     parser.add_argument("--p2b_lr", type=float, default=1e-3)
+
+    # ── Per-task fine-tuning step counts (used in --phase all loop) ──
+    parser.add_argument("--task_p1_steps", type=int, default=2000,
+                        help="Phase 1 fine-tuning steps per task (CompSLOT mode)")
+    parser.add_argument("--task_p2_steps", type=int, default=2000,
+                        help="Phase 2 fine-tuning steps per task (CompSLOT mode)")
+    parser.add_argument("--task_p2b_steps", type=int, default=1000,
+                        help="Phase 2.5 fine-tuning steps per task (CompSLOT mode)")
+
     parser.add_argument("--filter_k", type=int, default=10,
                         help="Number of agents to keep after fast filtering")
     parser.add_argument("--ucb_exploration", type=float, default=1.414,
@@ -1001,7 +1013,7 @@ def main():
         slot_dim=args.slot_dim,
     )
 
-    # ── Load pretrained weights ──
+    # ── Load initial AdaSlot weights ──
     if args.adaslot_ckpt and os.path.exists(args.adaslot_ckpt):
         ckpt = torch.load(args.adaslot_ckpt, map_location='cpu',
                           weights_only=False)
@@ -1033,10 +1045,11 @@ def main():
                   "folders/1SRKE9Q5XF2UeYj1XB8kyjxORDmB7c7Mz")
             print("       Training from scratch instead.")
 
-    # ── Build dataloader ──
-    train_loaders = None    # will be set when using CIFAR-100
+    # ── Build task-split data loaders ──
+    train_loaders = None
     test_loaders = None
     class_order = None
+    dataloader = None   # used only by single-phase runs
 
     if args.data_dir:
         from torchvision import datasets, transforms
@@ -1050,9 +1063,11 @@ def main():
             dataset, batch_size=args.batch_size, shuffle=True,
             num_workers=0, pin_memory=True, drop_last=True,
         )
+        train_loaders = [dataloader]
+        test_loaders  = [dataloader]
+        class_order   = [list(range(args.num_classes))]
     else:
-        print("[INFO] No data_dir specified, downloading and using "
-              "CIFAR-100 continual benchmark.")
+        print("[INFO] No data_dir specified — using CIFAR-100 continual benchmark.")
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "continual_cifar100",
@@ -1068,9 +1083,9 @@ def main():
             batch_size=args.batch_size,
             num_workers=0,
             seed=42,
-            resolution=args.resolution
+            resolution=args.resolution,
         )
-        # Phase 1, 2, 2.5 use ALL tasks combined for richer training
+        # Combined loader used only for single-phase runs (--phase 1/2/2.5)
         from torch.utils.data import ConcatDataset
         _combined = ConcatDataset(
             [loader.dataset for loader in train_loaders]
@@ -1080,20 +1095,19 @@ def main():
             num_workers=0, pin_memory=True, drop_last=True,
         )
 
-    # ── Shared objects that persist across phases ──
+    # ── Shared objects that persist across phases / tasks ──
     student_agents = None
     teacher_agents = None
     vae_estimators = None
-    mlp_estimator = None
+    mlp_estimator  = None
 
-    # ── Execute phases ──
-    phases = (["1", "2", "2.5", "3"] if args.phase == "all"
-              else [args.phase])
+    # ─────────────────────────────────────────────────────────────────
+    #  SINGLE-PHASE modes  (--phase 1 / 2 / 2.5 / 3)
+    #  Behaviour identical to the original pipeline.
+    # ─────────────────────────────────────────────────────────────────
+    if args.phase != "all":
+        phase = args.phase
 
-    for phase in phases:
-        # ==============================================================
-        #  PHASE 1: AdaSlot Pretraining
-        # ==============================================================
         if phase == "1":
             train_phase1_adaslot(
                 model=adaslot,
@@ -1103,16 +1117,14 @@ def main():
                 device=args.device,
             )
 
-        # ==============================================================
-        #  PHASE 2: Agent DINO Training
-        # ==============================================================
         elif phase == "2":
             if args.adaslot_ckpt:
                 ckpt = torch.load(args.adaslot_ckpt, map_location='cpu',
                                   weights_only=False)
-                state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-                adaslot.load_state_dict(state, strict=False)
-
+                adaslot.load_state_dict(
+                    ckpt.get('model', ckpt.get('state_dict', ckpt)),
+                    strict=False,
+                )
             from src.slot_multi_agent.atomic_agent import create_agent_pool
             student_agents, teacher_agents = create_agent_pool(
                 num_agents=args.num_agents,
@@ -1122,7 +1134,6 @@ def main():
                 num_blocks=3,
                 device=args.device,
             )
-
             train_phase2_agents(
                 adaslot_model=adaslot,
                 student_agents=student_agents,
@@ -1133,18 +1144,14 @@ def main():
                 device=args.device,
             )
 
-        # ==============================================================
-        #  PHASE 2.5: Estimator Training (VAE + MLP)
-        # ==============================================================
         elif phase == "2.5":
-            # Ensure AdaSlot is loaded
             if args.adaslot_ckpt:
                 ckpt = torch.load(args.adaslot_ckpt, map_location='cpu',
                                   weights_only=False)
-                state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-                adaslot.load_state_dict(state, strict=False)
-
-            # Ensure agents are loaded
+                adaslot.load_state_dict(
+                    ckpt.get('model', ckpt.get('state_dict', ckpt)),
+                    strict=False,
+                )
             if student_agents is None:
                 from src.slot_multi_agent.atomic_agent import create_agent_pool
                 student_agents, _ = create_agent_pool(
@@ -1157,7 +1164,6 @@ def main():
                 ckpt = torch.load(args.agent_ckpt, map_location='cpu',
                                   weights_only=False)
                 student_agents.load_state_dict(ckpt['student_agents'])
-
             _, vae_estimators, mlp_estimator = train_phase2b_estimators(
                 adaslot_model=adaslot,
                 student_agents=student_agents,
@@ -1167,128 +1173,218 @@ def main():
                 device=args.device,
             )
 
-        # ==============================================================
-        #  PHASE 3: Filter → UCB Weighted MoE → CRP
-        # ==============================================================
         elif phase == "3":
-            # ── Load AdaSlot ──
-            if args.adaslot_ckpt:
-                ckpt = torch.load(args.adaslot_ckpt, map_location='cpu',
+            _run_phase3_only(args, adaslot, train_loaders, test_loaders,
+                             class_order, dataloader,
+                             student_agents, vae_estimators, mlp_estimator)
+
+        print("\n" + "=" * 60)
+        print("TRAINING COMPLETE")
+        print("=" * 60)
+        return
+
+    # ─────────────────────────────────────────────────────────────────
+    #  CompSLOT mode  (--phase all)
+    #  For each task: Phase 1 → Phase 2 → Phase 2.5 → Phase 3
+    #  Models are fine-tuned sequentially; weights carry forward across
+    #  tasks (no re-initialisation), matching the CompSLOT protocol.
+    # ─────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("CompSLOT MODE: per-task sequential training")
+    print(f"  Tasks          : {len(train_loaders)}")
+    print(f"  Phase-1 steps  : {args.task_p1_steps} per task")
+    print(f"  Phase-2 steps  : {args.task_p2_steps} per task")
+    print(f"  Phase-2.5 steps: {args.task_p2b_steps} per task")
+    print("=" * 60)
+
+    # ── One-time model initialisation ──
+    from src.slot_multi_agent.atomic_agent import create_agent_pool
+    student_agents, teacher_agents = create_agent_pool(
+        num_agents=args.num_agents,
+        slot_dim=args.slot_dim,
+        num_prototypes=args.num_prototypes,
+        hidden_dim=256,
+        num_blocks=3,
+        device=args.device,
+    )
+    if args.agent_ckpt and os.path.exists(args.agent_ckpt):
+        ckpt = torch.load(args.agent_ckpt, map_location='cpu',
+                          weights_only=False)
+        student_agents.load_state_dict(ckpt['student_agents'])
+        print(f"[INFO] Loaded initial agent weights from {args.agent_ckpt}")
+
+    # Estimators (lazy-init on first task if no checkpoint)
+    try:
+        from src.slot_multi_agent.estimators import VAEEstimator, MLPEstimator
+        vae_estimators = nn.ModuleList([
+            VAEEstimator(agent_id=i, slot_dim=args.slot_dim)
+            for i in range(args.num_agents)
+        ])
+        mlp_estimator = MLPEstimator(
+            num_agents=args.num_agents,
+            slot_dim=args.slot_dim,
+        )
+        if args.estimator_ckpt and os.path.exists(args.estimator_ckpt):
+            est_ckpt = torch.load(args.estimator_ckpt, map_location='cpu',
                                   weights_only=False)
-                state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-                adaslot.load_state_dict(state, strict=False)
+            vae_estimators.load_state_dict(est_ckpt['vae_estimators'])
+            mlp_estimator.load_state_dict(est_ckpt['mlp_estimator'])
+            print(f"[INFO] Loaded initial estimator weights from "
+                  f"{args.estimator_ckpt}")
+        _has_estimators = True
+    except (ImportError, Exception) as _e:
+        print(f"[WARN] Could not initialise estimators ({_e}); "
+              "running without quality-estimation pipeline.")
+        vae_estimators = None
+        mlp_estimator  = None
+        _has_estimators = False
 
-            # ── Load Agents ──
-            if student_agents is None:
-                from src.slot_multi_agent.atomic_agent import create_agent_pool
-                student_agents, _ = create_agent_pool(
-                    num_agents=args.num_agents,
-                    slot_dim=args.slot_dim,
-                    num_prototypes=args.num_prototypes,
-                    device=args.device,
-                )
-            if args.agent_ckpt:
-                ckpt = torch.load(args.agent_ckpt, map_location='cpu',
-                                  weights_only=False)
-                student_agents.load_state_dict(ckpt['student_agents'])
+    # UCB MoE (persists across tasks)
+    ucb_moe = None
+    if _has_estimators:
+        from src.slot_multi_agent.bandit_selector import UCBWeightedMoE
+        ucb_moe = UCBWeightedMoE(
+            num_agents=args.num_agents,
+            exploration_constant=args.ucb_exploration,
+            burn_in=args.ucb_burn_in,
+        )
+        print(f"[INFO] UCB Weighted MoE enabled "
+              f"(filter_k={args.filter_k}, c={args.ucb_exploration})")
+    else:
+        print("[INFO] No estimators → legacy first-k mode")
 
-            # ── Load Estimators (if available) ──
-            if vae_estimators is None and args.estimator_ckpt:
-                from src.slot_multi_agent.estimators import (
-                    VAEEstimator, MLPEstimator
-                )
-                vae_estimators = nn.ModuleList([
-                    VAEEstimator(agent_id=i, slot_dim=args.slot_dim)
-                    for i in range(args.num_agents)
-                ])
-                mlp_estimator = MLPEstimator(
-                    num_agents=args.num_agents,
-                    slot_dim=args.slot_dim,
-                )
-                est_ckpt = torch.load(args.estimator_ckpt,
-                                      map_location='cpu', weights_only=False)
-                vae_estimators.load_state_dict(est_ckpt['vae_estimators'])
-                mlp_estimator.load_state_dict(est_ckpt['mlp_estimator'])
-                print(f"[INFO] Loaded estimators from "
-                      f"{args.estimator_ckpt}")
+    n_tasks = len(train_loaders)
+    acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
+    aggregator = None   # aggregator accumulates knowledge across all tasks
 
-            # ── Create UCB Weighted MoE (if estimators available) ──
-            ucb_moe = None
-            if vae_estimators is not None and mlp_estimator is not None:
-                from src.slot_multi_agent.bandit_selector import (
-                    UCBWeightedMoE
-                )
-                ucb_moe = UCBWeightedMoE(
-                    num_agents=args.num_agents,
-                    exploration_constant=args.ucb_exploration,
-                    burn_in=args.ucb_burn_in,
-                )
-                print(f"[INFO] UCB Weighted MoE enabled "
-                      f"(filter_k={args.filter_k}, "
-                      f"c={args.ucb_exploration}, "
-                      f"burn_in={args.ucb_burn_in})")
-            else:
-                print("[INFO] No estimators found → legacy first-k mode")
+    for task_id, task_loader in enumerate(train_loaders):
+        task_classes = (class_order[task_id]
+                        if isinstance(class_order, list)
+                        and task_id < len(class_order) else [])
+        print(f"\n{'=' * 60}")
+        print(f"TASK {task_id + 1}/{n_tasks}  ─  classes: {task_classes}")
+        print("=" * 60)
 
-            # ── Task loaders ──
-            if train_loaders is not None:
-                _task_train_loaders = train_loaders
-                _task_test_loaders = test_loaders
-                _task_class_order = class_order
-            else:
-                _task_train_loaders = [dataloader]
-                _task_test_loaders = [dataloader]
-                _task_class_order = [list(range(args.num_classes))]
+        # ── Phase 1: fine-tune AdaSlot on current task data ──────────
+        if args.task_p1_steps > 0:
+            print(f"\n  ▶ Phase 1 — AdaSlot fine-tune "
+                  f"({args.task_p1_steps} steps)")
+            train_phase1_adaslot(
+                model=adaslot,
+                dataloader=task_loader,
+                num_steps=args.task_p1_steps,
+                lr=args.p1_lr,
+                save_dir=f"checkpoints/adaslot/task{task_id}",
+                save_every=max(args.task_p1_steps, args.task_p1_steps + 1),
+                device=args.device,
+            )
+        else:
+            print("  ▶ Phase 1 skipped (task_p1_steps=0)")
 
-            # ── Continual task loop ──
-            aggregator = None
-            for task_id, task_loader in enumerate(_task_train_loaders):
-                print(f"\n{'=' * 60}")
-                print(f"PHASE 3 — TASK {task_id + 1}/"
-                      f"{len(_task_train_loaders)}")
-                if (isinstance(_task_class_order, list)
-                        and task_id < len(_task_class_order)):
-                    print(f"  Classes: {_task_class_order[task_id]}")
-                print(f"{'=' * 60}")
+        # ── Phase 2: fine-tune agents on current task data ───────────
+        if args.task_p2_steps > 0:
+            print(f"\n  ▶ Phase 2 — Agent fine-tune "
+                  f"({args.task_p2_steps} steps)")
+            train_phase2_agents(
+                adaslot_model=adaslot,
+                student_agents=student_agents,
+                teacher_agents=teacher_agents,
+                dataloader=task_loader,
+                num_steps=args.task_p2_steps,
+                lr=args.p2_lr,
+                save_dir=f"checkpoints/agents/task{task_id}",
+                save_every=max(args.task_p2_steps, args.task_p2_steps + 1),
+                device=args.device,
+            )
+        else:
+            print("  ▶ Phase 2 skipped (task_p2_steps=0)")
 
-                aggregator = train_phase3_crp(
-                    adaslot_model=adaslot,
-                    student_agents=student_agents,
-                    dataloader=task_loader,
-                    num_classes=args.num_classes,
-                    aggregator_type="crp",
-                    device=args.device,
-                    aggregator=aggregator,
-                    # Full pipeline (None ⇒ legacy fallback)
-                    vae_estimators=vae_estimators,
-                    mlp_estimator=mlp_estimator,
-                    ucb_moe=ucb_moe,
-                    filter_k=args.filter_k,
-                )
+        # ── Phase 2.5: fine-tune estimators on current task data ─────
+        if _has_estimators and args.task_p2b_steps > 0:
+            print(f"\n  ▶ Phase 2.5 — Estimator fine-tune "
+                  f"({args.task_p2b_steps} steps)")
+            _, vae_estimators, mlp_estimator = train_phase2b_estimators(
+                adaslot_model=adaslot,
+                student_agents=student_agents,
+                dataloader=task_loader,
+                num_steps=args.task_p2b_steps,
+                lr=args.p2b_lr,
+                save_dir=f"checkpoints/estimators/task{task_id}",
+                device=args.device,
+            )
+        elif _has_estimators:
+            print("  ▶ Phase 2.5 skipped (task_p2b_steps=0)")
 
-                # ── Evaluate on all classes seen so far ──
-                _eval_after_task(
-                    task_id=task_id,
-                    adaslot=adaslot,
-                    student_agents=student_agents,
-                    aggregator=aggregator,
-                    test_loader=_task_test_loaders[task_id],
-                    device=args.device,
-                    vae_estimators=vae_estimators,
-                    mlp_estimator=mlp_estimator,
-                    ucb_moe=ucb_moe,
-                    filter_k=args.filter_k,
-                )
+        # ── Phase 3: update CRP aggregator on current task data ──────
+        print(f"\n  ▶ Phase 3 — CRP aggregator update")
 
-            # ── Save UCB state ──
-            if ucb_moe is not None:
-                ucb_path = os.path.join("checkpoints", "ucb_moe_state.npz")
-                os.makedirs(os.path.dirname(ucb_path), exist_ok=True)
-                ucb_moe.save(ucb_path)
-                print(f"  [SAVED] UCB state → {ucb_path}")
-                print(f"  [UCB STATS] {ucb_moe.get_stats()['total_count']}"
-                      f" total rounds, "
-                      f"{len(ucb_moe.get_stats()['per_agent'])} agents used")
+        # Notify aggregator about the new class set (freeze old classes)
+        if aggregator is not None and hasattr(aggregator, '_agg'):
+            aggregator._agg.freeze_old_classes(set(task_classes))
+
+        aggregator = train_phase3_crp(
+            adaslot_model=adaslot,
+            student_agents=student_agents,
+            dataloader=task_loader,
+            num_classes=args.num_classes,
+            aggregator_type="crp",
+            device=args.device,
+            aggregator=aggregator,
+            vae_estimators=vae_estimators,
+            mlp_estimator=mlp_estimator,
+            ucb_moe=ucb_moe,
+            filter_k=args.filter_k,
+        )
+
+        # ── Evaluate on every task seen so far ───────────────────────
+        print(f"\n  [EVAL] Per-task accuracy after task {task_id}:")
+        row_accs = []
+        for eval_task in range(task_id + 1):
+            acc = _eval_after_task(
+                eval_task_id=eval_task,
+                train_task_id=task_id,
+                adaslot=adaslot,
+                student_agents=student_agents,
+                aggregator=aggregator,
+                test_loader=test_loaders[eval_task],
+                device=args.device,
+                vae_estimators=vae_estimators,
+                mlp_estimator=mlp_estimator,
+                ucb_moe=ucb_moe,
+                filter_k=args.filter_k,
+            )
+            acc_matrix[task_id][eval_task] = acc
+            row_accs.append(acc)
+
+        row_str = "  | ".join(
+            f"T{j}: {acc_matrix[task_id][j]:.1f}%"
+            for j in range(task_id + 1)
+        )
+        print(f"  ├─ {row_str}")
+        print(f"  └─ Avg so far: {sum(row_accs) / len(row_accs):.2f}%")
+
+        # ── Save per-task checkpoints ────────────────────────────────
+        ckpt_dir = f"checkpoints/task{task_id}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save({'model': adaslot.state_dict()},
+                   os.path.join(ckpt_dir, "adaslot.pth"))
+        torch.save({'student_agents': student_agents.state_dict()},
+                   os.path.join(ckpt_dir, "agents.pth"))
+        if _has_estimators:
+            torch.save({'vae_estimators': vae_estimators.state_dict(),
+                        'mlp_estimator':  mlp_estimator.state_dict()},
+                       os.path.join(ckpt_dir, "estimators.pth"))
+        print(f"  [SAVED] task {task_id} checkpoints → {ckpt_dir}/")
+
+    # ── Final CL metrics ──────────────────────────────────────────────
+    _print_cl_metrics(acc_matrix, n_tasks)
+
+    # ── Save final UCB state ──────────────────────────────────────────
+    if ucb_moe is not None:
+        ucb_path = os.path.join("checkpoints", "ucb_moe_state.npz")
+        os.makedirs(os.path.dirname(ucb_path), exist_ok=True)
+        ucb_moe.save(ucb_path)
+        print(f"  [SAVED] UCB state → {ucb_path}")
 
     print("\n" + "=" * 60)
     print("ALL TRAINING COMPLETE")
@@ -1296,11 +1392,134 @@ def main():
 
 
 # ───────────────────────────────────────────────────────
-#  Cumulative Evaluation Helper
+#  Phase-3-only helper (used by --phase 3 single mode)
+# ───────────────────────────────────────────────────────
+
+def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
+                     class_order, dataloader,
+                     student_agents, vae_estimators, mlp_estimator):
+    """Run phase 3 only (original single-phase behaviour)."""
+    # ── Load AdaSlot ──
+    if args.adaslot_ckpt:
+        ckpt = torch.load(args.adaslot_ckpt, map_location='cpu',
+                          weights_only=False)
+        adaslot.load_state_dict(
+            ckpt.get('model', ckpt.get('state_dict', ckpt)), strict=False)
+
+    # ── Load / create agents ──
+    if student_agents is None:
+        from src.slot_multi_agent.atomic_agent import create_agent_pool
+        student_agents, _ = create_agent_pool(
+            num_agents=args.num_agents,
+            slot_dim=args.slot_dim,
+            num_prototypes=args.num_prototypes,
+            device=args.device,
+        )
+    if args.agent_ckpt:
+        ckpt = torch.load(args.agent_ckpt, map_location='cpu',
+                          weights_only=False)
+        student_agents.load_state_dict(ckpt['student_agents'])
+
+    # ── Load estimators ──
+    if vae_estimators is None and args.estimator_ckpt:
+        from src.slot_multi_agent.estimators import VAEEstimator, MLPEstimator
+        vae_estimators = nn.ModuleList([
+            VAEEstimator(agent_id=i, slot_dim=args.slot_dim)
+            for i in range(args.num_agents)
+        ])
+        mlp_estimator = MLPEstimator(
+            num_agents=args.num_agents, slot_dim=args.slot_dim)
+        est_ckpt = torch.load(args.estimator_ckpt, map_location='cpu',
+                              weights_only=False)
+        vae_estimators.load_state_dict(est_ckpt['vae_estimators'])
+        mlp_estimator.load_state_dict(est_ckpt['mlp_estimator'])
+        print(f"[INFO] Loaded estimators from {args.estimator_ckpt}")
+
+    # ── UCB MoE ──
+    ucb_moe = None
+    if vae_estimators is not None and mlp_estimator is not None:
+        from src.slot_multi_agent.bandit_selector import UCBWeightedMoE
+        ucb_moe = UCBWeightedMoE(
+            num_agents=args.num_agents,
+            exploration_constant=args.ucb_exploration,
+            burn_in=args.ucb_burn_in,
+        )
+
+    # ── Task split ──
+    if train_loaders is not None:
+        _task_train = train_loaders
+        _task_test  = test_loaders
+        _task_cls   = class_order
+    else:
+        _task_train = [dataloader]
+        _task_test  = [dataloader]
+        _task_cls   = [list(range(args.num_classes))]
+
+    n_tasks = len(_task_train)
+    acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
+    aggregator = None
+
+    for task_id, task_loader in enumerate(_task_train):
+        print(f"\n{'=' * 60}")
+        print(f"PHASE 3 — TASK {task_id + 1}/{n_tasks}")
+        if isinstance(_task_cls, list) and task_id < len(_task_cls):
+            print(f"  Classes: {_task_cls[task_id]}")
+        print(f"{'=' * 60}")
+
+        aggregator = train_phase3_crp(
+            adaslot_model=adaslot,
+            student_agents=student_agents,
+            dataloader=task_loader,
+            num_classes=args.num_classes,
+            aggregator_type="crp",
+            device=args.device,
+            aggregator=aggregator,
+            vae_estimators=vae_estimators,
+            mlp_estimator=mlp_estimator,
+            ucb_moe=ucb_moe,
+            filter_k=args.filter_k,
+        )
+
+        print(f"  [EVAL] Per-task accuracy after task {task_id}:")
+        row_accs = []
+        for eval_task in range(task_id + 1):
+            acc = _eval_after_task(
+                eval_task_id=eval_task,
+                train_task_id=task_id,
+                adaslot=adaslot,
+                student_agents=student_agents,
+                aggregator=aggregator,
+                test_loader=_task_test[eval_task],
+                device=args.device,
+                vae_estimators=vae_estimators,
+                mlp_estimator=mlp_estimator,
+                ucb_moe=ucb_moe,
+                filter_k=args.filter_k,
+            )
+            acc_matrix[task_id][eval_task] = acc
+            row_accs.append(acc)
+
+        row_str = "  | ".join(f"T{j}: {acc_matrix[task_id][j]:.1f}%"
+                              for j in range(task_id + 1))
+        print(f"  ├─ {row_str}")
+        print(f"  └─ Avg so far: {sum(row_accs) / len(row_accs):.2f}%")
+
+    _print_cl_metrics(acc_matrix, n_tasks)
+
+    if ucb_moe is not None:
+        ucb_path = os.path.join("checkpoints", "ucb_moe_state.npz")
+        os.makedirs(os.path.dirname(ucb_path), exist_ok=True)
+        ucb_moe.save(ucb_path)
+        print(f"  [SAVED] UCB state → {ucb_path}")
+
+
+# ───────────────────────────────────────────────────────
+#  Per-Task Evaluation Helper
 # ───────────────────────────────────────────────────────
 
 def _eval_after_task(
-    task_id: int,
+    eval_task_id: int,
+    train_task_id: int,
     adaslot,
     student_agents,
     aggregator,
@@ -1310,10 +1529,13 @@ def _eval_after_task(
     mlp_estimator=None,
     ucb_moe=None,
     filter_k: int = 10,
-):
+) -> float:
     """
-    Evaluate cumulative accuracy after a task using the same pipeline
-    as training (estimator → UCB → CRP or legacy first-k).
+    Evaluate accuracy on a single task's test set (eval_task_id) after
+    training up through train_task_id.
+
+    Returns:
+        accuracy (float) in percent [0, 100]
     """
     use_pipeline = (
         vae_estimators is not None
@@ -1365,11 +1587,130 @@ def _eval_after_task(
             pass
         total_samples += B
 
-    cum_acc = total_correct / max(total_samples, 1) * 100
-    pipeline_tag = "Filter→UCB→CRP" if use_pipeline else "legacy"
-    print(f"  [EVAL] Cumulative accuracy after task {task_id} "
-          f"({pipeline_tag}): {cum_acc:.2f}%  "
-          f"({total_correct}/{total_samples})")
+    acc = total_correct / max(total_samples, 1) * 100
+    return acc
+
+
+# ───────────────────────────────────────────────────────
+#  Continual Learning Metrics
+# ───────────────────────────────────────────────────────
+
+def _print_cl_metrics(acc_matrix, n_tasks: int) -> None:
+    """
+    Compute and print standard continual learning metrics from the accuracy matrix.
+
+    acc_matrix[i][j] = accuracy (%) on task j right after training on task i.
+    None entries = not yet evaluated (future tasks).
+
+    Metrics computed:
+      - Average Accuracy (AA)     : mean of acc_matrix[n-1][j] for j=0..n-1
+      - Backward Transfer (BWT)   : mean of acc_matrix[i][j] - acc_matrix[j][j]  for j < i
+                                    Negative BWT = forgetting occurred
+      - Forgetting (F)            : mean of max_k(acc_matrix[k][j]) - acc_matrix[n-1][j]  k<=j
+                                    Positive = performance degraded from peak
+      - Forward Transfer (FWT)    : mean of acc_matrix[i-1][i] - random_baseline
+                                    Approximated without random baseline as
+                                    mean of acc_matrix[j-1][j] for j=1..n-1
+                                    (transfer from previous task to new task)
+      - Intransigence (I)         : acc_matrix[j][j] for each task j
+                                    (how well the model learned each task right after introduction)
+    """
+    print(f"\n{'=' * 60}")
+    print("CONTINUAL LEARNING METRICS (Phase 3)")
+    print('=' * 60)
+
+    # Collect per-task final-row accuracies (after all tasks)
+    final_row = [acc_matrix[n_tasks - 1][j] for j in range(n_tasks)]
+    diagonal  = [acc_matrix[j][j] for j in range(n_tasks)]
+
+    # ── Accuracy matrix table ──
+    header = "Task →  " + "  ".join(f"{'T' + str(j):>7}" for j in range(n_tasks))
+    print("\nAccuracy Matrix (row = after training task i, col = test task j):")
+    print(header)
+    for i in range(n_tasks):
+        row_vals = ""
+        for j in range(n_tasks):
+            v = acc_matrix[i][j]
+            if v is None:
+                row_vals += "      - "
+            else:
+                row_vals += f"  {v:6.2f}%"
+        print(f"  After T{i} │{row_vals}")
+
+    print()
+
+    # ── Average Accuracy ──
+    valid_final = [v for v in final_row if v is not None]
+    avg_acc = sum(valid_final) / len(valid_final) if valid_final else 0.0
+    print(f"Average Accuracy  (AA)  : {avg_acc:.2f}%")
+    print(f"  (mean acc on all {n_tasks} tasks after full training)")
+
+    # ── Backward Transfer (BWT) ──
+    # BWT = (1 / (n-1)) * Σ_{j=0}^{n-2} [A[n-1][j] - A[j][j]]
+    # Negative → forgetting; Positive → positive backward transfer (rare)
+    bwt_terms = []
+    for j in range(n_tasks - 1):
+        a_final_j = acc_matrix[n_tasks - 1][j]
+        a_diag_j  = acc_matrix[j][j]
+        if a_final_j is not None and a_diag_j is not None:
+            bwt_terms.append(a_final_j - a_diag_j)
+    bwt = sum(bwt_terms) / len(bwt_terms) if bwt_terms else 0.0
+    print(f"\nBackward Transfer (BWT) : {bwt:+.2f}%")
+    print(f"  {'✓ No significant forgetting' if bwt >= -2.0 else '⚠ Forgetting detected'}")
+    for j, term in enumerate(bwt_terms):
+        a_diag   = acc_matrix[j][j]
+        a_final  = acc_matrix[n_tasks - 1][j]
+        print(f"  T{j}: {a_diag:.2f}% → {a_final:.2f}%  ({term:+.2f}%)")
+
+    # ── Forgetting (F) ──
+    # F_j = max_{k<=n-1} A[k][j] - A[n-1][j]
+    # Measures drop from peak performance on each task
+    forgetting_per_task = []
+    for j in range(n_tasks - 1):   # last task cannot have forgetting yet
+        peak = max(
+            acc_matrix[k][j]
+            for k in range(j, n_tasks)
+            if acc_matrix[k][j] is not None
+        )
+        final_j = acc_matrix[n_tasks - 1][j]
+        if final_j is not None:
+            forgetting_per_task.append(peak - final_j)
+    avg_forgetting = (sum(forgetting_per_task) / len(forgetting_per_task)
+                      if forgetting_per_task else 0.0)
+    print(f"\nForgetting         (F)  : {avg_forgetting:.2f}%")
+    print(f"  (peak→final drop per task; 0% = perfect retention)")
+    for j, f_j in enumerate(forgetting_per_task):
+        print(f"  T{j}: {f_j:.2f}% peak-to-final drop")
+
+    # ── Forward Transfer (FWT) ──
+    # Approximation: mean of A[j-1][j] for j=1..n-1
+    # (how well previous knowledge helps on unseen new task)
+    fwt_terms = []
+    for j in range(1, n_tasks):
+        v = acc_matrix[j - 1][j]
+        if v is not None:
+            fwt_terms.append(v)
+    fwt = sum(fwt_terms) / len(fwt_terms) if fwt_terms else 0.0
+    print(f"\nForward Transfer  (FWT) : {fwt:.2f}%")
+    print(f"  (approx: avg accuracy on task j right before training it)")
+
+    # ── Intransigence (per-task learning quality) ──
+    # A[j][j] = accuracy on task j right after being trained on it
+    # Low diagonal = model struggles to learn the task (plasticity issue)
+    print(f"\nIntransigence / Plasticity (A[j][j]):")
+    for j in range(n_tasks):
+        d = diagonal[j]
+        tag = "" if d is None else (" ✓" if d >= 50.0 else " ⚠ low")
+        print(f"  T{j}: {d:.2f}%{tag}" if d is not None else f"  T{j}: -")
+    avg_intrans = sum(v for v in diagonal if v is not None) / (
+        sum(1 for v in diagonal if v is not None) or 1)
+    print(f"  Mean: {avg_intrans:.2f}%")
+
+    # ── Summary line ──
+    print(f"\n{'─' * 60}")
+    print(f"  AA={avg_acc:.2f}%  |  BWT={bwt:+.2f}%  |  "
+          f"F={avg_forgetting:.2f}%  |  FWT={fwt:.2f}%")
+    print('=' * 60)
 
 
 if __name__ == "__main__":
