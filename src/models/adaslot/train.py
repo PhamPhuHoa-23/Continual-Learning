@@ -164,6 +164,8 @@ def train_phase1_adaslot(
 
     model = model.to(device)
     model.train()
+    for p in model.parameters():
+        p.requires_grad_(True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000)
