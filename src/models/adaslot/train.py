@@ -161,6 +161,8 @@ def train_phase1_adaslot(
     # survive across tasks in CompSLOT mode.
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler=None,
+    # H100 speed: bfloat16 mixed precision (no GradScaler needed for bf16)
+    use_amp: bool = False,
 ):
     """
     Phase 1: Train AdaSlot to decompose images into object-centric slots.
@@ -211,15 +213,16 @@ def train_phase1_adaslot(
 
         images = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch['image'].to(device)
 
-        # Forward
-        out = model(images, global_step=step)
+        # Forward + losses (with optional bf16 AMP for H100)
+        amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) \
+            if use_amp and device.startswith('cuda') else torch.amp.autocast(device_type='cpu', enabled=False)
+        with amp_ctx:
+            out = model(images, global_step=step)
+            loss_recon = recon_loss_fn(out['reconstruction'], images)
+            loss_sparse = sparse_loss_fn(out['hard_keep_decision'])
+            loss_total = loss_recon + loss_sparse
 
-        # Losses
-        loss_recon = recon_loss_fn(out['reconstruction'], images)
-        loss_sparse = sparse_loss_fn(out['hard_keep_decision'])
-        loss_total = loss_recon + loss_sparse
-
-        # Backward
+        # Backward (no GradScaler needed for bf16)
         optimizer.zero_grad()
         loss_total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -996,7 +999,11 @@ def main():
     parser.add_argument("--num_prototypes", type=int, default=256)
     parser.add_argument("--num_classes", type=int, default=20,
                         help="Classes per task (TinyImageNet: must divide 200; default: 20 → 10 tasks)")
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (default: 4; set 0 to disable)")
+    parser.add_argument("--use_amp", action="store_true",
+                        help="Enable bfloat16 mixed precision (recommended for H100/A100)")
     if torch.cuda.is_available():
         default_device = "cuda"
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -1098,7 +1105,8 @@ def main():
         dataset = datasets.ImageFolder(args.data_dir, transform=transform)
         dataloader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=0, pin_memory=True, drop_last=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            persistent_workers=args.num_workers > 0,
         )
         train_loaders = [dataloader]
         test_loaders  = [dataloader]
@@ -1115,7 +1123,7 @@ def main():
         train_loaders, test_loaders, class_order = get_continual_tinyimagenet_loaders(
             n_tasks=_n_tasks,
             batch_size=args.batch_size,
-            num_workers=0,
+            num_workers=args.num_workers,
             seed=42,
             resolution=args.resolution,
             root="./data",
@@ -1127,7 +1135,8 @@ def main():
         )
         dataloader = DataLoader(
             _combined, batch_size=args.batch_size, shuffle=True,
-            num_workers=0, pin_memory=True, drop_last=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            persistent_workers=args.num_workers > 0,
         )
 
     # ── Shared objects that persist across phases / tasks ──
@@ -1150,6 +1159,7 @@ def main():
                 num_steps=args.p1_steps,
                 lr=args.p1_lr,
                 device=args.device,
+                use_amp=args.use_amp,
             )
 
         elif phase == "2":
@@ -1323,6 +1333,7 @@ def main():
                 device=args.device,
                 optimizer=_p1_optimizer,
                 scheduler=_p1_scheduler,
+                use_amp=args.use_amp,
             )
         else:
             print("  ▶ Phase 1 skipped (task_p1_steps=0)")
