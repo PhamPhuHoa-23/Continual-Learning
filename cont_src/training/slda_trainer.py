@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from cont_src.training.configs import SLDAConfig
 
@@ -236,7 +237,9 @@ class SLDATrainer:
         total = 0
         max_b = self.config.max_batches
 
-        for batch_idx, batch in enumerate(dataloader):
+        pbar = tqdm(enumerate(dataloader), total=max_b if max_b > 0 else len(dataloader),
+                     desc="SLDA fit", unit="batch", dynamic_ncols=True)
+        for batch_idx, batch in pbar:
             if max_b > 0 and batch_idx >= max_b:
                 break
 
@@ -249,6 +252,7 @@ class SLDATrainer:
             H = self._extract_H(images)     # (B, D_h)
             self.slda.update(H, labels)
             total += images.shape[0]
+            pbar.set_postfix(samples=total)
 
         logger.info(f"[SLDATrainer] SLDA fitted on {total} samples.")
 
@@ -269,7 +273,8 @@ class SLDATrainer:
         all_preds: List[torch.Tensor] = []
         all_labels: List[torch.Tensor] = []
 
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="SLDA predict", unit="batch",
+                          dynamic_ncols=True, leave=False):
             images, labels = self._unpack(batch)
             images = images.to(self.device)
 

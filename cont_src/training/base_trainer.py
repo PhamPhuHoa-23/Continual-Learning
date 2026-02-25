@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
+from tqdm.auto import tqdm
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
 
@@ -232,14 +233,38 @@ class BaseTrainer(ABC):
         all_metrics = MetricAccumulator()
         done = False
 
-        for epoch in range(n_epochs):
+        # ── outer progress bar ─────────────────────────────────────────
+        trainer_name = type(self).__name__
+        if use_steps:
+            outer_iter = range(n_epochs)  # always 1 in steps mode
+        else:
+            outer_iter = tqdm(range(n_epochs), desc=f"{trainer_name}",
+                              unit="epoch", dynamic_ncols=True)
+
+        for epoch in outer_iter:
             if done:
                 break
             self.on_epoch_start(epoch)
             self._accumulator.reset()
 
-            for batch in dataloader:
+            # ── inner progress bar ─────────────────────────────────────
+            if use_steps:
+                remaining = cfg.max_steps - self.global_step
+                batch_iter = tqdm(
+                    dataloader, total=remaining,
+                    desc=f"{trainer_name} steps", unit="step",
+                    dynamic_ncols=True,
+                )
+            else:
+                batch_iter = tqdm(
+                    dataloader,
+                    desc=f"Epoch {epoch + 1}/{n_epochs}",
+                    unit="batch", leave=False, dynamic_ncols=True,
+                )
+
+            for batch in batch_iter:
                 if use_steps and self.global_step >= cfg.max_steps:
+                    batch_iter.close()
                     done = True
                     break
 
@@ -252,6 +277,16 @@ class BaseTrainer(ABC):
                 self._accumulator.update(metrics)
                 all_metrics.update(metrics)
                 self.global_step += 1
+
+                # ---- update progress bar postfix ----
+                loss_val = metrics.get("loss_total", 0)
+                if hasattr(loss_val, "item"):
+                    loss_val = loss_val.item()
+                postfix = {"loss": f"{loss_val:.4f}", "step": self.global_step}
+                n_slots = metrics.get("n_active_slots")
+                if n_slots is not None:
+                    postfix["slots"] = f"{n_slots:.1f}"
+                batch_iter.set_postfix(postfix)
 
                 # ---- logging ----
                 if cfg.log_every_n_steps > 0 and self.global_step % cfg.log_every_n_steps == 0:
@@ -268,6 +303,10 @@ class BaseTrainer(ABC):
 
             epoch_metrics = self._accumulator.mean()
             self.on_epoch_end(epoch, epoch_metrics)
+            if not use_steps and not isinstance(outer_iter, range):
+                outer_iter.set_postfix(
+                    {k: f"{v:.4f}" for k, v in epoch_metrics.items()
+                     if isinstance(v, (int, float))})
 
         final_metrics = all_metrics.mean()
         self.on_train_end(final_metrics)

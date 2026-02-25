@@ -125,7 +125,7 @@ D_H        = 64     # agent hidden dim / aggregator output dim
 # ===========================================================================
 # PHASE 0 — AdaSlot fine-tune
 # ===========================================================================
-P0_STEPS     = 500          # so buoc train (tang len de hoi tu tot hon)
+P0_EPOCHS    = 2            # so epoch (1 epoch ≈ 700 buoc voi CIFAR-100 bs=64)
 P0_LR        = 4e-4
 P0_W_RECON   = 1.0          # recon loss weight
 P0_W_SPARSE  = 10.0         # sparsity penalty weight
@@ -146,7 +146,7 @@ SCORING_MODE    = "generative"  # "generative" | "mahal_z" | "mahal_slot"
 # ===========================================================================
 # PHASE A — Agent warm-up (hard routing, L_agent only)
 # ===========================================================================
-PA_STEPS     = 100
+PA_EPOCHS    = 1
 PA_LR        = 3e-4
 PA_GAMMA     = 1.0
 PA_LOG_EVERY = 20
@@ -154,7 +154,7 @@ PA_LOG_EVERY = 20
 # ===========================================================================
 # PHASE B — Full training (soft routing + L_prim + L_SupCon)
 # ===========================================================================
-PB_STEPS          = 300
+PB_EPOCHS         = 2
 PB_LR             = 2e-4
 PB_GAMMA          = 1.0       # L_agent weight
 PB_ALPHA          = 0.3       # L_prim weight
@@ -197,6 +197,9 @@ if torch.cuda.is_available():
     print(f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 print(f"  Checkpoint : {CKPT_PATH}")
 print(f"  Output     : {OUTPUT_DIR}")
+print(f"  Phase 0    : {P0_EPOCHS} epochs")
+print(f"  Phase A    : {PA_EPOCHS} epochs")
+print(f"  Phase B    : {PB_EPOCHS} epochs")
 print("=" * 55)
 
 
@@ -395,8 +398,8 @@ print(f"Total trainable params: {n_total:,}")
 # %%
 cfg_p0 = AdaSlotTrainerConfig(
     lr               = P0_LR,
-    max_steps        = P0_STEPS,
-    max_epochs       = 0,
+    max_steps        = 0,
+    max_epochs       = P0_EPOCHS,
     w_recon          = P0_W_RECON,
     w_sparse         = P0_W_SPARSE,
     w_prim           = P0_W_PRIM,
@@ -489,8 +492,8 @@ print(f"Spawned {M} agents  ({CLUSTER_METHOD})")
 # %%
 cfg_pa = PhaseAConfig(
     lr               = PA_LR,
-    max_steps        = PA_STEPS,
-    max_epochs       = 0,
+    max_steps        = 0,
+    max_epochs       = PA_EPOCHS,
     gamma            = PA_GAMMA,
     routing_mode     = "hard",
     checkpoint_dir   = str(OUTPUT_DIR / "phaseA"),
@@ -515,8 +518,8 @@ print(f"Phase A done: {metrics_pa}")
 # %%
 cfg_pb = PhaseBConfig(
     lr                = PB_LR,
-    max_steps         = PB_STEPS,
-    max_epochs        = 0,
+    max_steps         = 0,
+    max_epochs        = PB_EPOCHS,
     gamma             = PB_GAMMA,
     alpha             = PB_ALPHA,
     beta              = PB_BETA,
@@ -612,7 +615,7 @@ torch.save({
     "config": {
         "dataset": DATASET, "n_classes": N_CLASSES,
         "cluster_method": CLUSTER_METHOD, "n_agents": M,
-        "p0_steps": P0_STEPS, "pa_steps": PA_STEPS, "pb_steps": PB_STEPS,
+        "p0_epochs": P0_EPOCHS, "pa_epochs": PA_EPOCHS, "pb_epochs": PB_EPOCHS,
     },
 }, ckpt_out)
 print(f"Checkpoint saved: {ckpt_out}")
