@@ -64,11 +64,11 @@ from torchvision import datasets, transforms
 # ───────────────────────────────────────────────────────
 
 class ReconstructionLoss(nn.Module):
-    """MSE reconstruction loss — mean over all elements, mean over batch.
+    """MSE reconstruction loss — sum over pixels, mean over batch.
 
-    FIX #1: changed from ``reduction='sum' / B`` (which scaled with H×W×C)
-    to ``reduction='mean'`` so the loss magnitude is resolution-independent
-    and SparsePenalty remains numerically comparable across image sizes.
+    Matches AdaSlot original ``loss_type="mse_sum"`` (CLEVR10 config):
+        loss = F.mse_loss(pred, target, reduction='sum') / B
+    so that ``sparse_linear_weight=10`` is correctly calibrated.
     """
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -77,9 +77,10 @@ class ReconstructionLoss(nn.Module):
             pred: (B, 3, H, W) reconstructed image
             target: (B, 3, H, W) original image
         Returns:
-            Scalar MSE loss (mean over all pixels and batch).
+            Scalar MSE loss (sum over pixels, mean over batch).
         """
-        return F.mse_loss(pred, target, reduction='mean')
+        B = pred.shape[0]
+        return F.mse_loss(pred, target, reduction='sum') / B
 
 
 class SparsePenalty(nn.Module):
