@@ -12,20 +12,26 @@
 #     name: python3
 # ---
 
-
 # %% [markdown]
 # # Continual Learning — Full Pipeline (Kaggle)
 #
-# **Phase 0** AdaSlot fine-tune → **Cluster Init** → **Phase A** Agent warm-up → **Phase B** Full training → **SLDA** fit → **Eval**
+# **Phase 0** AdaSlot fine-tune → **Cluster Init** → **Phase A** Agent warm-up →
+# **Phase B** Full training → **SLDA** fit → **Eval**
 #
-# Train inline — khong goi subprocess, config het o cell 4.
-
+# For each task after task 0:
+# * Phase B fine-tune (agents) + SLDA update
+# * Evaluate **all** seen tasks → build forgetting matrix **R[i][j]**
+# * Report per-task accuracy, forgetting, and BWT after every task
 
 # %% [markdown]
-# ## 1. Paths
+# ## 1. Paths  *(stdlib only — project not cloned yet)*
 
 # %%
-import os, sys
+import os
+import sys
+import shutil as _sh
+import subprocess
+import importlib as _il
 from pathlib import Path
 
 KAGGLE_WORKING = Path("/kaggle/working")
@@ -35,59 +41,57 @@ REPO_PATH      = KAGGLE_WORKING / REPO_NAME
 print(f"Repo path : {REPO_PATH}")
 print(f"CWD       : {os.getcwd()}")
 
-
 # %% [markdown]
 # ## 2. Clone & Checkout
 
 # %%
-import subprocess
-
-GIT_TOKEN  = "YOUR_GITHUB_PAT_HERE"   # Settings > Developer settings > Personal access tokens
+# Settings > Developer settings > Personal access tokens
+GIT_TOKEN  = "YOUR_GITHUB_PAT_HERE"
 GIT_USER   = "PhamPhuHoa-23"
 GIT_REPO   = "Continual-Learning"
 GIT_BRANCH = "prototype"
 
-def run(cmd):
+
+def _run(cmd: str) -> int:
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if r.stdout: print(r.stdout.strip())
-    if r.stderr: print(r.stderr.strip())
+    if r.stdout:
+        print(r.stdout.strip())
+    if r.stderr:
+        print(r.stderr.strip())
     return r.returncode
+
 
 clone_url = f"https://{GIT_USER}:{GIT_TOKEN}@github.com/{GIT_USER}/{GIT_REPO}.git"
 
 if not REPO_PATH.exists():
-    print("Cloning...")
-    run(f"git clone {clone_url} {REPO_PATH}")
+    print("Cloning ...")
+    _run(f"git clone {clone_url} {REPO_PATH}")
 
 # fetch + reset --hard: dam bao file tren Kaggle LUON khop voi origin
-# (git pull co the fail silent neu detached HEAD / merge conflict)
-run(f"git -C {REPO_PATH} fetch origin {GIT_BRANCH}")
-run(f"git -C {REPO_PATH} checkout --force {GIT_BRANCH}")
-run(f"git -C {REPO_PATH} reset --hard origin/{GIT_BRANCH}")
-run(f"git -C {REPO_PATH} log --oneline -3")
+_run(f"git -C {REPO_PATH} fetch origin {GIT_BRANCH}")
+_run(f"git -C {REPO_PATH} checkout --force {GIT_BRANCH}")
+_run(f"git -C {REPO_PATH} reset --hard origin/{GIT_BRANCH}")
+_run(f"git -C {REPO_PATH} log --oneline -3")
 
 os.chdir(REPO_PATH)
 sys.path.insert(0, str(REPO_PATH))
 print(f"CWD: {os.getcwd()}")
 
 # Xoa __pycache__ de Python khong load bytecode cu sau git pull
-import shutil as _sh
 for _p in REPO_PATH.rglob("__pycache__"):
     _sh.rmtree(_p, ignore_errors=True)
-import importlib as _il; _il.invalidate_caches()
+_il.invalidate_caches()
 print("__pycache__ cleared")
-
 
 # %% [markdown]
 # ## 3. Install Dependencies
 
 # %%
-!pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-!pip install -q tqdm numpy matplotlib scikit-learn hdbscan umap-learn
-!pip install -q -e .
-!pip install -q avalanche-lib
-print("Done!")
-
+get_ipython().system("pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+get_ipython().system("pip install -q tqdm numpy matplotlib scikit-learn hdbscan umap-learn")
+get_ipython().system("pip install -q -e .")
+get_ipython().system("pip install -q avalanche-lib")
+print("Dependencies installed!")
 
 # %% [markdown]
 # ## 4. CONFIG — chinh tat ca o day
@@ -103,62 +107,52 @@ print("Done!")
 # | SLDA | Closed-form classifier |
 
 # %%
+import os as _os
 import torch
 
 # ===========================================================================
 # DATASET
 # ===========================================================================
-DATASET   = "cifar100"      # "cifar100" | "tiny_imagenet"
-N_TASKS   = 1               # so task muon train (1 = chi task 1)
+DATASET     = "cifar100"   # "cifar100" | "tiny_imagenet"
+N_TASKS     = 10           # so task muon train (1 = chi task 0)
 BATCH_SIZE  = 64
-NUM_WORKERS = 2
-VAL_SPLIT   = 0.1           # fraction of train set dung lam validation
+NUM_WORKERS = 0
+VAL_SPLIT   = 0.1          # fraction of train set dung lam validation
 
 # ===========================================================================
 # CHECKPOINT  (upload CLEVR10.ckpt len Kaggle dataset roi dien path)
 # ===========================================================================
 CKPT_PATH = "/kaggle/input/adaslot-clevr10/CLEVR10.ckpt"
-import os as _os
 if not _os.path.exists(CKPT_PATH):
     CKPT_PATH = "checkpoints/slot_attention/adaslot_real/CLEVR10.ckpt"
 
 # ===========================================================================
 # MODEL
 # ===========================================================================
-IMG_SIZE   = 128  # decoder hardcodes initial_conv_size=(8,8) → ConvTranspose 16x → always 128x128
-                   # CANNOT change to 64: images would be 64x64 but recon always 128x128 → MSE crash
-NUM_SLOTS  = 11
-SLOT_DIM   = 64
-D_H        = 64     # agent hidden dim / aggregator output dim
+IMG_SIZE  = 128   # decoder la 4x stride-2 ConvTranspose -> output 128x128
+NUM_SLOTS = 7
+SLOT_DIM  = 64
+D_H       = 64    # agent hidden dim / aggregator output dim
 
 # ===========================================================================
 # PHASE 0 — AdaSlot fine-tune
 # ===========================================================================
-P0_EPOCHS    = 5            # so epoch — can nhieu hon vi backbone CLEVR10 adapt sang CIFAR-100
-                             # domain shift lon: gate reset + recon ca 2 train cung luc
-                             # 5 epochs ≈ 3500 buoc, recon typically giam 10x so voi ban dau
-P0_LR        = 1e-3          # tang LR: 4e-4 qua nho cho domain shift (Adam se adapt)
-P0_W_RECON   = 1.0          # recon loss weight
-P0_W_SPARSE  = 10.0         # sparsity penalty weight (match original AdaSlot: linear_weight=10 + mse_sum)
-                             # Gate duoc reset lai (CLEVR10 saturated o slots_keep_prob=1.0)
-                             # sau reset, gradient flow qua straight-through hoat dong binh thuong
-                             # w_sparse=10 tuong duong paper goc (linear_weight=10 tren mse_sum scale ~55k)
-                             # Set = 0.0 neu muon tat sparsity hoan toan (khong drop slot)
-P0_W_PRIM    = 1.0          # primitive loss weight
+P0_EPOCHS    = 1
+P0_LR        = 4e-5
+P0_W_RECON   = 1.0
+P0_W_SPARSE  = 10.0
+P0_W_PRIM    = 5.0
 P0_LOG_EVERY = 50
 
 # ===========================================================================
 # CLUSTER INIT
 # ===========================================================================
-CLUSTER_METHOD  = "hdbscan"   # "hdbscan" | "kmeans" | "dbscan" | "gmm" | "bayesian_gmm"
+CLUSTER_METHOD  = "hdbscan"   # "hdbscan" | "kmeans" | "dbscan" | "gmm"
 CLUSTER_KWARGS  = {"min_cluster_size": 30, "min_samples": 5}
-# KMeans/GMM: them {"n_clusters": 8} vao CLUSTER_KWARGS
-MAX_BATCH_CLUST = 50          # so batch dung de extract slots (0 = dung tat ca)
-                              # 50 batches x 64 x ~11 slots ~ 35k -> subsample xuong MAX_SLOTS_CLUST
-MAX_SLOTS_CLUST = 20_000      # hard cap truoc khi feed vao HDBSCAN (0 = khong cap)
-                              # HDBSCAN la O(n^2) memory -> giu <= 20k de tranh OOM
-VAE_LATENT_DIM  = 16
-VAE_EPOCHS      = 20
+MAX_BATCH_CLUST = 50
+MAX_SLOTS_CLUST = 20_000      # HDBSCAN O(n^2) -> keep <= 20k
+VAE_LATENT_DIM  = 32
+VAE_EPOCHS      = 1
 SCORING_MODE    = "generative"  # "generative" | "mahal_z" | "mahal_slot"
 
 # ===========================================================================
@@ -177,8 +171,8 @@ PB_LR             = 2e-4
 PB_GAMMA          = 1.0       # L_agent weight
 PB_ALPHA          = 0.3       # L_prim weight
 PB_BETA           = 0.3       # L_SupCon weight
-PB_T_INIT         = 2.0       # routing temperature start
-PB_T_FINAL        = 0.1       # routing temperature end
+PB_T_INIT         = 2.0
+PB_T_FINAL        = 0.1
 PB_TEMP_ANNEAL    = "cosine"  # "cosine" | "linear" | "constant"
 PB_FREEZE_ROUTERS = True
 PB_LOG_EVERY      = 20
@@ -204,8 +198,9 @@ _DS_META = {
     "tiny_imagenet": {"n_classes": 200, "data_subdir": "tiny_imagenet_data"},
 }
 assert DATASET in _DS_META, f"Unknown dataset '{DATASET}'"
-DATA_ROOT = Path(f"/kaggle/working/{_DS_META[DATASET]['data_subdir']}")
-N_CLASSES = _DS_META[DATASET]["n_classes"]
+DATA_ROOT        = Path(f"/kaggle/working/{_DS_META[DATASET]['data_subdir']}")
+N_CLASSES        = _DS_META[DATASET]["n_classes"]
+CLASSES_PER_TASK = N_CLASSES // N_TASKS
 
 print("=" * 55)
 print(f"  Dataset    : {DATASET}  ({N_CLASSES} classes, {N_TASKS} tasks)")
@@ -215,11 +210,8 @@ if torch.cuda.is_available():
     print(f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 print(f"  Checkpoint : {CKPT_PATH}")
 print(f"  Output     : {OUTPUT_DIR}")
-print(f"  Phase 0    : {P0_EPOCHS} epochs")
-print(f"  Phase A    : {PA_EPOCHS} epochs")
-print(f"  Phase B    : {PB_EPOCHS} epochs")
+print(f"  Phase 0    : {P0_EPOCHS} epochs  |  Phase A : {PA_EPOCHS}  |  Phase B : {PB_EPOCHS}")
 print("=" * 55)
-
 
 # %% [markdown]
 # ## 5. Download Dataset
@@ -235,153 +227,137 @@ if DATASET == "cifar100":
     print("CIFAR-100 ready")
 
 elif DATASET == "tiny_imagenet":
-    import urllib.request, zipfile
+    import urllib.request
+    import zipfile
     _url  = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
     _dest = DATA_ROOT / "tiny-imagenet-200.zip"
     if not _dest.exists():
-        urllib.request.urlretrieve(_url, _dest,
-            reporthook=lambda b,bs,t: print(f"  {b*bs/1e6:.0f}/{t/1e6:.0f} MB", end="\r")
-                         if b % 200 == 0 else None)
+        urllib.request.urlretrieve(
+            _url, _dest,
+            reporthook=lambda b, bs, t: (
+                print(f"  {b*bs/1e6:.0f}/{t/1e6:.0f} MB", end="\r")
+                if b % 200 == 0 else None
+            ),
+        )
     with zipfile.ZipFile(_dest) as z:
         z.extractall(DATA_ROOT)
     print("Tiny-ImageNet ready")
 
-
 # %% [markdown]
-# ## 6. Import (lan 1 — co the loi do Avalanche, binh thuong)
-#
-# > Neu cell nay loi, cu chay tiep cell 7 de re-import sach.
+# ## 6. Project Imports  *(repo is on disk now)*
 
 # %%
-try:
-    import json, random, logging
-    import numpy as np
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from tqdm.notebook import tqdm
-    import torchvision.transforms as T
-    from torchvision.datasets import CIFAR100
-    from torch.utils.data import DataLoader, random_split
-
-    from src.models.adaslot.model import AdaSlotModel
-    from cont_src.models.slot_attention.primitives import PrimitiveSelector
-    from cont_src.models.aggregators.attention_aggregator import AttentionAggregator
-    from cont_src.training import (
-        AdaSlotTrainer,    AdaSlotTrainerConfig,
-        ClusterInitialiser, ClusterInitConfig,
-        AgentPhaseATrainer, PhaseAConfig,
-        AgentPhaseBTrainer, PhaseBConfig,
-        SLDATrainer,       SLDAConfig, StreamLDA,
-    )
-    from cont_src.training.cluster_init import extract_slots
-    print("Import lan 1 OK")
-except Exception as e:
-    print(f"Import lan 1 loi: {e}")
-    print("-> Chay cell tiep theo de re-import")
-
-
-# %% [markdown]
-# ## 7. Import (lan 2 — sach)
-
-# %%
-import json, random, logging
+import json
+import random
+import logging
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm.notebook import tqdm
 import torchvision.transforms as T
+import matplotlib
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
 from torch.utils.data import DataLoader, random_split
+from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet
 
 from src.models.adaslot.model import AdaSlotModel
 from cont_src.models.slot_attention.primitives import PrimitiveSelector
 from cont_src.models.aggregators.attention_aggregator import AttentionAggregator
 from cont_src.training import (
-    AdaSlotTrainer,    AdaSlotTrainerConfig,
+    AdaSlotTrainer,     AdaSlotTrainerConfig,
     ClusterInitialiser, ClusterInitConfig,
     AgentPhaseATrainer, PhaseAConfig,
     AgentPhaseBTrainer, PhaseBConfig,
-    SLDATrainer,       SLDAConfig, StreamLDA,
+    SLDATrainer,        SLDAConfig, StreamLDA,
 )
 from cont_src.training.cluster_init import extract_slots
 
-print("Imports OK!")
-
+print("All imports OK")
 
 # %% [markdown]
-# ## 8. Data — Avalanche Benchmark
+# ## 7. Data — Avalanche Benchmark
 #
-# `SplitCIFAR100` / `SplitTinyImageNet` tu dong chia class theo task.
-# Resize 32→128 xu ly thang trong transform — khong can ResizeLoader nua.
+# `SplitCIFAR100` / `SplitTinyImageNet` chia classes theo task tu dong.
+# Resize 32->128 xu ly thang trong transform — khong can ResizeLoader nua.
 
 # %%
-from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet
-
-def _make_tf(train, size=IMG_SIZE):
+def _make_tf(train: bool, size: int = IMG_SIZE):
     aug = [T.RandomHorizontalFlip(), T.ColorJitter(0.2, 0.2, 0.2)] if train else []
     return T.Compose(aug + [
-        T.Resize((size, size)),          # 32x32 -> 128x128 trong transform
+        T.Resize((size, size)),
         T.ToTensor(),
-        T.Normalize((0.5,)*3, (0.5,)*3),
+        T.Normalize((0.5,) * 3, (0.5,) * 3),
     ])
 
-# Avalanche AvalancheDataset tra ve (x, y, task_id) — boc lai de bo task_id
+
+# Avalanche AvalancheDataset tra ve (x, y, task_id); bo task_id
 class _AvDS(torch.utils.data.Dataset):
-    def __init__(self, av_ds): self._ds = av_ds
-    def __len__(self): return len(self._ds)
+    def __init__(self, av_ds):
+        self._ds = av_ds
+
+    def __len__(self):
+        return len(self._ds)
+
     def __getitem__(self, i):
         x, y, *_ = self._ds[i]
         return x, y
 
+
 if DATASET == "cifar100":
     benchmark = SplitCIFAR100(
-        n_experiences   = N_TASKS,
-        seed            = 42,
-        return_task_id  = False,
-        dataset_root    = str(DATA_ROOT),
-        train_transform = _make_tf(True),
-        eval_transform  = _make_tf(False),
+        n_experiences=N_TASKS,
+        seed=42,
+        return_task_id=False,
+        dataset_root=str(DATA_ROOT),
+        train_transform=_make_tf(True),
+        eval_transform=_make_tf(False),
     )
-elif DATASET == "tiny_imagenet":
+else:
     benchmark = SplitTinyImageNet(
-        n_experiences   = N_TASKS,
-        seed            = 42,
-        return_task_id  = False,
-        dataset_root    = str(DATA_ROOT),
-        train_transform = _make_tf(True),
-        eval_transform  = _make_tf(False),
+        n_experiences=N_TASKS,
+        seed=42,
+        return_task_id=False,
+        dataset_root=str(DATA_ROOT),
+        train_transform=_make_tf(True),
+        eval_transform=_make_tf(False),
     )
 
-CLASSES_PER_TASK = N_CLASSES // N_TASKS
 
-def get_task_loaders(task_id):
-    """Tra ve (train_loader, val_loader, test_loader) cho task task_id."""
+def get_task_loaders(task_id: int):
+    """Return (train_loader, val_loader, test_loader) for task `task_id`."""
     tr_full = _AvDS(benchmark.train_stream[task_id].dataset)
     te_ds   = _AvDS(benchmark.test_stream[task_id].dataset)
     n_val   = int(len(tr_full) * VAL_SPLIT)
     n_tr    = len(tr_full) - n_val
-    tr_ds, val_ds = random_split(tr_full, [n_tr, n_val],
-                                  generator=torch.Generator().manual_seed(42))
-    kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+    tr_ds, val_ds = random_split(
+        tr_full, [n_tr, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+    kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
+              pin_memory=True, drop_last=True)
     return (DataLoader(tr_ds,  shuffle=True,  **kw),
             DataLoader(val_ds, shuffle=False, **kw),
             DataLoader(te_ds,  shuffle=False, **kw))
 
-# Task 0 loaders
+
 train_loader, val_loader, test_loader = get_task_loaders(0)
-print(f"Task 0  |  classes 0-{CLASSES_PER_TASK-1}  |  Train: {len(train_loader)} batches  Val: {len(val_loader)}  Test: {len(test_loader)}")
+print(f"Task 0  |  classes 0-{CLASSES_PER_TASK-1}  "
+      f"|  Train: {len(train_loader)} batches  "
+      f"Val: {len(val_loader)}  Test: {len(test_loader)}")
 print(f"Total tasks: {N_TASKS}  |  Classes per task: {CLASSES_PER_TASK}")
 
-
 # %% [markdown]
-# ## 9. Build Model
+# ## 8. Build Model
 
 # %%
-# Wrapper: maps AdaSlotModel output keys to trainer convention
 class SlotModelWrapper(nn.Module):
+    """Maps AdaSlotModel output keys to the trainer convention."""
+
     def __init__(self, backbone, prim_sel=None):
         super().__init__()
-        self.backbone  = backbone
-        self.prim_sel  = prim_sel
+        self.backbone = backbone
+        self.prim_sel = prim_sel
+
     def forward(self, images, **kw):
         out = self.backbone(images, **kw)
         result = {
@@ -394,6 +370,7 @@ class SlotModelWrapper(nn.Module):
             H = self.prim_sel(out["slots"], slot_mask=out["hard_keep_decision"])
             result["primitives"] = H.unsqueeze(1)
         return result
+
 
 backbone = AdaSlotModel(
     resolution=(IMG_SIZE, IMG_SIZE),
@@ -410,9 +387,9 @@ missing, unexpected = backbone.load_state_dict(ckpt["state_dict"], strict=True)
 print(f"Checkpoint loaded: {CKPT_PATH}")
 print(f"  missing={len(missing)}  unexpected={len(unexpected)}")
 
-# Reset gate (single_gumbel_score_network): CLEVR10 checkpoint is saturated
-# (slots_keep_prob ≈ 1.0 on CIFAR-100 inputs) → straight-through gradient ≈ 0
-# Re-initialising lets the gate learn a proper keep/drop decision on the new domain.
+
+# Reset gate: CLEVR10 checkpoint saturated (slots_keep_prob ~1.0 on CLEVR)
+# Re-init lets the gate learn proper keep/drop on the new domain.
 def _reset_gumbel_gate(model: nn.Module) -> None:
     for name, mod in model.named_modules():
         if "single_gumbel_score_network" in name or "gumbel_score" in name:
@@ -423,306 +400,446 @@ def _reset_gumbel_gate(model: nn.Module) -> None:
                     nn.init.zeros_(p)
             print(f"  Gate reset: {name}")
 
+
 _reset_gumbel_gate(backbone)
-print("Gate weights re-initialised (was saturated on CLEVR → CIFAR domain shift)")
+print("Gate weights re-initialised")
 
 prim_sel   = PrimitiveSelector(slot_dim=SLOT_DIM, hidden_dim=D_H).to(DEVICE)
 slot_model = SlotModelWrapper(backbone, prim_sel).to(DEVICE)
 aggregator = AttentionAggregator(hidden_dim=D_H).to(DEVICE)
 
 n_total = sum(p.numel() for p in slot_model.parameters())
-print(f"Total trainable params: {n_total:,}")
-
+print(f"Total params: {n_total:,}")
 
 # %% [markdown]
-# ## 10. Phase 0 — AdaSlot Fine-tune
+# ## 9. Phase 0 — AdaSlot Fine-tune
 #
 # Train backbone + PrimitiveSelector on reconstruction + sparsity + primitive loss.
 
 # %%
 cfg_p0 = AdaSlotTrainerConfig(
-    lr               = P0_LR,
-    max_steps        = 0,
-    max_epochs       = P0_EPOCHS,
-    w_recon          = P0_W_RECON,
-    w_sparse         = P0_W_SPARSE,
-    w_prim           = P0_W_PRIM,
-    checkpoint_dir   = str(OUTPUT_DIR / "phase0"),
-    log_every_n_steps= P0_LOG_EVERY,
+    lr=P0_LR,
+    max_steps=0,
+    max_epochs=P0_EPOCHS,
+    w_recon=P0_W_RECON,
+    w_sparse=P0_W_SPARSE,
+    w_prim=P0_W_PRIM,
+    checkpoint_dir=str(OUTPUT_DIR / "phase0"),
+    log_every_n_steps=P0_LOG_EVERY,
 )
 
 trainer_p0 = AdaSlotTrainer(
-    config              = cfg_p0,
-    slot_model          = slot_model,
-    primitive_predictor = None,   # wrapper already has prim_sel
+    config=cfg_p0,
+    slot_model=slot_model,
+    primitive_predictor=None,
 )
 
-print("Phase 0: AdaSlot fine-tune...")
+print("Phase 0: AdaSlot fine-tune ...")
 metrics_p0 = trainer_p0.train(train_loader)
 print(f"Phase 0 done: {metrics_p0}")
 
-# Save history for plotting
 with open(OUTPUT_DIR / "history_p0.json", "w") as f:
     json.dump({k: ([v] if not isinstance(v, list) else v)
                for k, v in metrics_p0.items()}, f)
-
 
 # %% [markdown]
 # ### Recon visualisation after Phase 0
 
 # %%
-import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+
 
 @torch.no_grad()
-def save_recon_grid(model, loader, path, n=8):
+def save_recon_grid(model, loader, path, n: int = 8):
     model.eval()
     imgs, _ = next(iter(loader))
-    imgs = imgs[:n].to(DEVICE)   # already IMG_SIZE x IMG_SIZE from transform
-    out   = model(imgs)
-    recon = out["recon"]
+    imgs   = imgs[:n].to(DEVICE)
+    out    = model(imgs)
+    recon  = out["recon"]
     active = out["mask"].sum(dim=1).float()
-    def to_np(t):
-        return (t.cpu().clamp(-1,1)*0.5+0.5).permute(0,2,3,1).numpy()
-    orig_np, recon_np = to_np(imgs), to_np(recon)
-    fig, axes = plt.subplots(2, n, figsize=(2*n, 4))
+
+    def _np(t):
+        return (t.cpu().clamp(-1, 1) * 0.5 + 0.5).permute(0, 2, 3, 1).numpy()
+
+    orig_np, recon_np = _np(imgs), _np(recon)
+    fig, axes = plt.subplots(2, n, figsize=(2 * n, 4))
     for i in range(n):
-        axes[0,i].imshow(orig_np[i]);  axes[0,i].axis("off"); axes[0,i].set_title("orig",  fontsize=7)
-        axes[1,i].imshow(recon_np[i]); axes[1,i].axis("off"); axes[1,i].set_title(f"recon\n({int(active[i])}s)", fontsize=7)
+        axes[0, i].imshow(orig_np[i])
+        axes[0, i].axis("off")
+        axes[0, i].set_title("orig", fontsize=7)
+        axes[1, i].imshow(recon_np[i])
+        axes[1, i].axis("off")
+        axes[1, i].set_title(f"recon\n({int(active[i])}s)", fontsize=7)
     fig.suptitle(f"AdaSlot recon — {DATASET}", fontsize=9)
     plt.tight_layout()
-    plt.savefig(path, dpi=120, bbox_inches="tight"); plt.show(); plt.close()
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    plt.show()
+    plt.close()
     model.train()
 
-save_recon_grid(slot_model, val_loader, OUTPUT_DIR / "recon_phase0.png")
-print("Saved recon grid")
 
+save_recon_grid(slot_model, val_loader, OUTPUT_DIR / "recon_phase0.png")
+print("Recon grid saved")
 
 # %% [markdown]
-# ## 11. Cluster Init
+# ## 10. Cluster Init
 #
 # Extract slot embeddings -> cluster -> spawn 1 SlotVAE + 1 Agent per cluster.
 
 # %%
 cfg_clust = ClusterInitConfig(
-    method                    = CLUSTER_METHOD,
-    method_kwargs             = CLUSTER_KWARGS,
-    max_batches_for_clustering= MAX_BATCH_CLUST,
-    max_slots_for_clustering  = MAX_SLOTS_CLUST,
-    vae_latent_dim            = VAE_LATENT_DIM,
-    vae_epochs                = VAE_EPOCHS,
-    scoring_mode              = SCORING_MODE,
-    device                    = str(DEVICE),
+    method=CLUSTER_METHOD,
+    method_kwargs=CLUSTER_KWARGS,
+    max_batches_for_clustering=MAX_BATCH_CLUST,
+    max_slots_for_clustering=MAX_SLOTS_CLUST,
+    vae_latent_dim=VAE_LATENT_DIM,
+    vae_epochs=VAE_EPOCHS,
+    scoring_mode=SCORING_MODE,
+    device=str(DEVICE),
 )
 
-print(f"Extracting slots with method='{CLUSTER_METHOD}'...")
+print(f"Extracting slots (method='{CLUSTER_METHOD}') ...")
 slots_np = extract_slots(slot_model, train_loader, cfg_clust, device=DEVICE)
 print(f"Slots shape: {slots_np.shape}")
 
 initialiser = ClusterInitialiser(cfg_clust)
 vaes, agents, cluster_result = initialiser.run(
     slots_np,
-    agent_input_dim  = D_H,
-    agent_output_dim = D_H,
+    agent_input_dim=D_H,
+    agent_output_dim=D_H,
 )
 M = len(agents)
 print(f"Spawned {M} agents  ({CLUSTER_METHOD})")
 
-
 # %% [markdown]
-# ## 12. Phase A — Agent Warm-up (hard routing, L_agent only)
+# ## 11. Phase A — Agent Warm-up  *(hard routing, L_agent only)*
 
 # %%
 cfg_pa = PhaseAConfig(
-    lr               = PA_LR,
-    max_steps        = 0,
-    max_epochs       = PA_EPOCHS,
-    gamma            = PA_GAMMA,
-    routing_mode     = "hard",
-    checkpoint_dir   = str(OUTPUT_DIR / "phaseA"),
-    log_every_n_steps= PA_LOG_EVERY,
+    lr=PA_LR,
+    max_steps=0,
+    max_epochs=PA_EPOCHS,
+    gamma=PA_GAMMA,
+    routing_mode="hard",
+    checkpoint_dir=str(OUTPUT_DIR / "phaseA"),
+    log_every_n_steps=PA_LOG_EVERY,
 )
 
 trainer_pa = AgentPhaseATrainer(
-    config     = cfg_pa,
-    slot_model = slot_model,
-    vaes       = vaes,
-    agents     = agents,
+    config=cfg_pa,
+    slot_model=slot_model,
+    vaes=vaes,
+    agents=agents,
 )
 
-print("Phase A: agent warm-up...")
+print("Phase A: agent warm-up ...")
 metrics_pa = trainer_pa.train(train_loader)
 print(f"Phase A done: {metrics_pa}")
 
-
 # %% [markdown]
-# ## 13. Phase B — Full Training (soft routing + L_prim + L_SupCon)
+# ## 12. Phase B — Full Training  *(soft routing + L_prim + L_SupCon)*
 
 # %%
 cfg_pb = PhaseBConfig(
-    lr                = PB_LR,
-    max_steps         = 0,
-    max_epochs        = PB_EPOCHS,
-    gamma             = PB_GAMMA,
-    alpha             = PB_ALPHA,
-    beta              = PB_BETA,
-    init_temperature  = PB_T_INIT,
-    final_temperature = PB_T_FINAL,
-    temp_anneal       = PB_TEMP_ANNEAL,
-    freeze_routers    = PB_FREEZE_ROUTERS,
-    aggregator_mode   = "attention",
-    checkpoint_dir    = str(OUTPUT_DIR / "phaseB"),
-    log_every_n_steps = PB_LOG_EVERY,
+    lr=PB_LR,
+    max_steps=0,
+    max_epochs=PB_EPOCHS,
+    gamma=PB_GAMMA,
+    alpha=PB_ALPHA,
+    beta=PB_BETA,
+    init_temperature=PB_T_INIT,
+    final_temperature=PB_T_FINAL,
+    temp_anneal=PB_TEMP_ANNEAL,
+    freeze_routers=PB_FREEZE_ROUTERS,
+    aggregator_mode="attention",
+    checkpoint_dir=str(OUTPUT_DIR / "phaseB"),
+    log_every_n_steps=PB_LOG_EVERY,
 )
 
 trainer_pb = AgentPhaseBTrainer(
-    config     = cfg_pb,
-    slot_model = slot_model,
-    vaes       = vaes,
-    agents     = agents,
-    aggregator = aggregator,
+    config=cfg_pb,
+    slot_model=slot_model,
+    vaes=vaes,
+    agents=agents,
+    aggregator=aggregator,
 )
 
-print("Phase B: full agent training...")
+print("Phase B: full agent training ...")
 metrics_pb = trainer_pb.train(train_loader)
 print(f"Phase B done: {metrics_pb}")
 
-# Freeze agents
+# Freeze agents after task-0 Phase B
 for ag in agents:
-    if hasattr(ag, "freeze"):
-        ag.freeze()
-    else:
-        for p in ag.parameters():
-            p.requires_grad_(False)
+    for p in ag.parameters():
+        p.requires_grad_(False)
 print("Agents frozen")
 
-
 # %% [markdown]
-# ## 14. SLDA — Incremental Fit (closed-form, 1 pass)
+# ## 13. SLDA — Fit on Task 0
 
 # %%
 slda = StreamLDA(
-    n_classes   = N_CLASSES,
-    feature_dim = D_H,
-    shrinkage   = SLDA_SHRINKAGE,
+    n_classes=N_CLASSES,
+    feature_dim=D_H,
+    shrinkage=SLDA_SHRINKAGE,
 )
 
 cfg_slda = SLDAConfig(
-    feature_dim = D_H,
-    n_classes   = N_CLASSES,
-    shrinkage   = SLDA_SHRINKAGE,
-    max_batches = 0,
-    device      = str(DEVICE),
+    feature_dim=D_H,
+    n_classes=N_CLASSES,
+    shrinkage=SLDA_SHRINKAGE,
+    max_batches=0,
+    device=str(DEVICE),
 )
 
 trainer_slda = SLDATrainer(
-    config     = cfg_slda,
-    slot_model = slot_model,
-    agents     = agents,
-    aggregator = aggregator,
-    slda       = slda,
-    vaes       = vaes,
+    config=cfg_slda,
+    slot_model=slot_model,
+    agents=agents,
+    aggregator=aggregator,
+    slda=slda,
+    vaes=vaes,
 )
 
-print("SLDA: fitting...")
+print("SLDA: fitting on task 0 ...")
 trainer_slda.fit(train_loader)
-print(f"SLDA fitted on {slda._n_total} samples")
-
+print(f"SLDA fitted  ({slda._n_total} samples)")
 
 # %% [markdown]
-# ## 15. Evaluation
+# ## 14. Evaluate Task 0  *(seed the forgetting matrix)*
 
 # %%
-val_metrics  = trainer_slda.evaluate(val_loader)
-test_metrics = trainer_slda.evaluate(test_loader)
+val_m0  = trainer_slda.evaluate(val_loader)
+test_m0 = trainer_slda.evaluate(test_loader)
 
 print("=" * 45)
-print(f"  Task 0 val  : {val_metrics['accuracy']*100:.2f}%")
-print(f"  Task 0 test : {test_metrics['accuracy']*100:.2f}%")
+print(f"  Task 0 val  : {val_m0['accuracy']*100:.2f}%")
+print(f"  Task 0 test : {test_m0['accuracy']*100:.2f}%")
 print("=" * 45)
 
-task_results = [{"task": 0, "val_acc": val_metrics["accuracy"], "test_acc": test_metrics["accuracy"]}]
+# ---------------------------------------------------------------------------
+# Forgetting matrix  R[i][j] = test-acc on task i  after  training up to task j
+#
+#   R[i][i]     -> accuracy right after learning task i (best case)
+#   R[i][j > i] -> accuracy on task i after learning more tasks (shows forgetting)
+#
+# After all N_TASKS are trained:
+#   Forgetting_i  = R[i][i] - R[i][N_TASKS-1]
+#   BWT           = (1/(T-1)) * sum_{i=0}^{T-2} (R[i][T-1] - R[i][i])
+# ---------------------------------------------------------------------------
+R       = [[None] * N_TASKS for _ in range(N_TASKS)]
+R[0][0] = test_m0["accuracy"]
 
+task_results = [{"task": 0,
+                 "val_acc":  val_m0["accuracy"],
+                 "test_acc": test_m0["accuracy"]}]
+
+print("Forgetting matrix initialised (R[0][0] set).")
 
 # %% [markdown]
-# ## 15b. Continual Learning — Tasks 1+
+# ## 15. Continual Learning — Tasks 1+
 #
-# Voi moi task tiep theo: backbone + agents tu task 0 duoc giu lai.
-# Chi can Phase B fine-tune + cap nhat SLDA mot lan.
-# (Spawn agent moi = extract_slots -> cluster -> PhaseA tren task t — TODO neu can)
+# For each new task t:
+# 1. **Phase B** fine-tune existing agents on task t data
+# 2. **SLDA** incremental update on task t data
+# 3. **Evaluate all seen tasks 0..t** -> fill a column of the forgetting matrix
+# 4. Print per-task accuracy and running BWT
 
 # %%
 for t in range(1, N_TASKS):
-    print(f"\n{'='*55}")
-    print(f"  TASK {t}  |  classes {t*CLASSES_PER_TASK}–{(t+1)*CLASSES_PER_TASK-1}")
-    print(f"{'='*55}")
+    print(f"\n{'='*60}")
+    print(f"  TASK {t}  |  classes "
+          f"{t * CLASSES_PER_TASK} - {(t + 1) * CLASSES_PER_TASK - 1}")
+    print(f"{'='*60}")
 
     t_train, t_val, t_test = get_task_loaders(t)
 
-    # Unfreeze agents cho Phase B
+    # -----------------------------------------------------------------------
+    # Phase B: fine-tune agents on task t
+    # -----------------------------------------------------------------------
     for ag in agents:
-        for p in ag.parameters(): p.requires_grad_(True)
+        for p in ag.parameters():
+            p.requires_grad_(True)
 
-    # Phase B: fine-tune agents tren task t
     trainer_pb_t = AgentPhaseBTrainer(
-        config     = cfg_pb,
-        slot_model = slot_model,
-        vaes       = vaes,
-        agents     = agents,
-        aggregator = aggregator,
+        config=cfg_pb,
+        slot_model=slot_model,
+        vaes=vaes,
+        agents=agents,
+        aggregator=aggregator,
     )
-    print(f"Task {t} — Phase B...")
+    print(f"  Task {t} - Phase B ...")
     trainer_pb_t.train(t_train)
 
-    # Re-freeze
     for ag in agents:
-        for p in ag.parameters(): p.requires_grad_(False)
+        for p in ag.parameters():
+            p.requires_grad_(False)
 
-    # SLDA: cap nhat phan phoi tren task t
-    print(f"Task {t} — SLDA update...")
+    # -----------------------------------------------------------------------
+    # SLDA: incremental update on task t
+    # -----------------------------------------------------------------------
+    print(f"  Task {t} - SLDA update ...")
     trainer_slda.fit(t_train)
 
-    # Eval
-    t_val_m  = trainer_slda.evaluate(t_val)
-    t_test_m = trainer_slda.evaluate(t_test)
-    print(f"  Task {t}  val={t_val_m['accuracy']*100:.2f}%  test={t_test_m['accuracy']*100:.2f}%")
-    task_results.append({"task": t, "val_acc": t_val_m["accuracy"], "test_acc": t_test_m["accuracy"]})
+    # -----------------------------------------------------------------------
+    # Evaluate ALL seen tasks  ->  fill column t of the forgetting matrix
+    # -----------------------------------------------------------------------
+    print(f"  Task {t} - evaluating all seen tasks ...")
+    for i in range(t + 1):
+        _, _, i_test = get_task_loaders(i)
+        m      = trainer_slda.evaluate(i_test)
+        R[i][t] = m["accuracy"]
+        print(f"    R[task={i}][after_task={t}] = {m['accuracy']*100:.2f}%")
 
-if N_TASKS > 1:
-    avg_acc = sum(r["test_acc"] for r in task_results) / len(task_results)
-    print(f"\nAverage test accuracy across {N_TASKS} tasks: {avg_acc*100:.2f}%")
-    print(f"SLDA total samples seen: {slda._n_total}")
+    t_val_m = trainer_slda.evaluate(t_val)
+    task_results.append({
+        "task":     t,
+        "val_acc":  t_val_m["accuracy"],
+        "test_acc": R[t][t],
+    })
 
+    # Running BWT (average backward transfer over tasks learned before t)
+    bwt_terms = [
+        R[i][t] - R[i][i]
+        for i in range(t)
+        if R[i][t] is not None and R[i][i] is not None
+    ]
+    running_bwt  = sum(bwt_terms) / len(bwt_terms) if bwt_terms else float("nan")
+    avg_acc_now  = sum(R[i][t] for i in range(t + 1) if R[i][t] is not None) / (t + 1)
+
+    print(f"\n  After task {t}:")
+    print(f"    Avg test acc (tasks 0-{t}) : {avg_acc_now * 100:.2f}%")
+    print(f"    Running BWT               : {running_bwt * 100:+.2f}%")
+    print(f"    SLDA total samples        : {slda._n_total}")
 
 # %% [markdown]
-# ## 16. Save Checkpoint
+# ## 16. Forgetting Analysis & Plots
+#
+# * Bar chart: accuracy right after learning vs. accuracy at end of all tasks
+# * Forgetting bar chart with BWT annotation
+# * Full forgetting matrix heatmap (R[i][j])
 
 # %%
-ckpt_out = OUTPUT_DIR / "pipeline_final.pt"
-torch.save({
-    "slot_model": slot_model.state_dict(),
-    "aggregator": aggregator.state_dict(),
-    "agents":     [a.state_dict() for a in agents],
-    "slda":       slda.state_dict(),
-    "vaes":       [v.state_dict() for v in vaes],
+last_t = len(task_results) - 1   # index of the last trained task
+
+acc_initial = []   # R[i][i]      - right after learning task i
+acc_final   = []   # R[i][last_t] - after all training
+forgetting  = []   # acc_initial[i] - acc_final[i]
+
+for i in range(last_t + 1):
+    ai = R[i][i]
+    af = R[i][last_t]
+    acc_initial.append(ai if ai is not None else float("nan"))
+    acc_final.append(  af if af is not None else float("nan"))
+    forgetting.append(
+        (ai - af) if (ai is not None and af is not None) else float("nan")
+    )
+
+bwt_terms = [
+    R[i][last_t] - R[i][i]
+    for i in range(last_t)
+    if R[i][last_t] is not None and R[i][i] is not None
+]
+bwt = float(np.nanmean(bwt_terms)) if bwt_terms else float("nan")
+
+# ── Console report ───────────────────────────────────────────────────────────
+print("=" * 65)
+print(f"  Final results  ({last_t + 1} tasks trained)")
+print("  " + "-" * 61)
+print(f"  {'Task':>5}  {'acc@learn':>10}  {'acc@end':>9}  {'forgetting':>11}")
+print("  " + "-" * 61)
+for i in range(last_t + 1):
+    print(f"  {i:>5}  {acc_initial[i]*100:>9.2f}%"
+          f"  {acc_final[i]*100:>8.2f}%"
+          f"  {forgetting[i]*100:>+10.2f}%")
+print("  " + "-" * 61)
+print(f"  BWT            : {bwt*100:+.2f}%")
+print(f"  Avg final acc  : {float(np.nanmean(acc_final))*100:.2f}%")
+print("=" * 65)
+
+# ── Save JSON ────────────────────────────────────────────────────────────────
+cl_metrics = {
+    "n_tasks":      N_TASKS,
+    "last_trained": last_t,
     "task_results": task_results,
-    "val_acc":    val_metrics["accuracy"],
-    "test_acc":   test_metrics["accuracy"],
-    "config": {
-        "dataset": DATASET, "n_classes": N_CLASSES, "n_tasks": N_TASKS,
-        "classes_per_task": CLASSES_PER_TASK,
-        "cluster_method": CLUSTER_METHOD, "n_agents": M,
-        "p0_epochs": P0_EPOCHS, "pa_epochs": PA_EPOCHS, "pb_epochs": PB_EPOCHS,
-    },
-}, ckpt_out)
-print(f"Checkpoint saved: {ckpt_out}")
+    "acc_initial":  [float(x) for x in acc_initial],
+    "acc_final":    [float(x) for x in acc_final],
+    "forgetting":   [float(x) for x in forgetting],
+    "bwt":          float(bwt),
+    "avg_final_acc": float(np.nanmean(acc_final)),
+    "R": [[R[i][j] for j in range(N_TASKS)] for i in range(N_TASKS)],
+}
+with open(OUTPUT_DIR / "cl_metrics.json", "w") as f:
+    json.dump(cl_metrics, f, indent=2)
+print(f"Metrics saved -> {OUTPUT_DIR / 'cl_metrics.json'}")
 
+# ── Plots ────────────────────────────────────────────────────────────────────
+matplotlib.use("Agg")
+x = np.arange(last_t + 1)
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
-# %% [markdown]
-# ## 17. Training Curves
+# --- Plot 1: per-task accuracy (initial vs final) ---
+ax = axes[0]
+w  = 0.35
+ax.bar(x - w/2, [v * 100 for v in acc_initial], w,
+       label="acc@learn", color="steelblue")
+ax.bar(x + w/2, [v * 100 for v in acc_final], w,
+       label="acc@end",   color="salmon")
+ax.set_xlabel("Task")
+ax.set_ylabel("Test accuracy (%)")
+ax.set_title("Per-task accuracy")
+ax.set_xticks(x)
+ax.legend()
+ax.grid(axis="y", alpha=0.3)
 
-# %%
+# --- Plot 2: forgetting per task ---
+ax = axes[1]
+colours = ["red" if f > 0 else "green" for f in forgetting]
+ax.bar(x, [f * 100 for f in forgetting], color=colours)
+ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+ax.set_xlabel("Task")
+ax.set_ylabel("Forgetting (%)")
+ax.set_title(f"Forgetting  |  BWT = {bwt*100:+.2f}%")
+ax.set_xticks(x)
+ax.grid(axis="y", alpha=0.3)
+
+# --- Plot 3: forgetting matrix heatmap ---
+ax = axes[2]
+if last_t > 0:
+    mat = np.full((last_t + 1, last_t + 1), float("nan"))
+    for i in range(last_t + 1):
+        for j in range(last_t + 1):
+            if R[i][j] is not None:
+                mat[i, j] = R[i][j] * 100
+    im = ax.imshow(mat, vmin=0, vmax=100, cmap="Blues", aspect="auto")
+    plt.colorbar(im, ax=ax, label="Test acc (%)")
+    ax.set_xlabel("After task j")
+    ax.set_ylabel("Task i")
+    ax.set_title("Forgetting matrix R[i][j]")
+    ax.set_xticks(range(last_t + 1))
+    ax.set_yticks(range(last_t + 1))
+    for i in range(last_t + 1):
+        for j in range(last_t + 1):
+            if not np.isnan(mat[i, j]):
+                ax.text(j, i, f"{mat[i, j]:.0f}",
+                        ha="center", va="center", fontsize=7,
+                        color="black" if mat[i, j] > 50 else "white")
+else:
+    ax.text(0.5, 0.5, "Only 1 task trained\n(N_TASKS = 1)",
+            ha="center", va="center", transform=ax.transAxes)
+    ax.axis("off")
+
+plt.suptitle(
+    f"Continual Learning — {DATASET}  ({last_t+1}/{N_TASKS} tasks)",
+    y=1.01,
+)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "cl_analysis.png", dpi=130, bbox_inches="tight")
+plt.show()
+plt.close()
+print("CL analysis plot saved")
+
+# Phase 0 training curves
 hist_path = OUTPUT_DIR / "history_p0.json"
 if hist_path.exists():
     with open(hist_path) as f:
@@ -732,32 +849,66 @@ if hist_path.exists():
     fig, ax = plt.subplots(figsize=(10, 4))
     for k in keys:
         ax.plot(step, h[k], label=k)
-    ax.set_title("Phase 0 losses"); ax.legend(); ax.grid(alpha=.3)
+    ax.set_title("Phase 0 losses")
+    ax.legend()
+    ax.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "training_curves.png", dpi=120)
-    plt.show(); plt.close()
-    print("Curves saved")
-else:
-    print(f"No history file at {hist_path}")
+    plt.savefig(OUTPUT_DIR / "training_curves_p0.png", dpi=120)
+    plt.show()
+    plt.close()
+    print("Phase 0 loss curves saved")
 
+# %% [markdown]
+# ## 17. Save Final Checkpoint
+
+# %%
+ckpt_out = OUTPUT_DIR / "pipeline_final.pt"
+torch.save({
+    "slot_model":    slot_model.state_dict(),
+    "aggregator":    aggregator.state_dict(),
+    "agents":        [a.state_dict() for a in agents],
+    "slda":          slda.state_dict(),
+    "vaes":          [v.state_dict() for v in vaes],
+    "task_results":  task_results,
+    "cl_metrics":    cl_metrics,
+    "config": {
+        "dataset":           DATASET,
+        "n_classes":         N_CLASSES,
+        "n_tasks":           N_TASKS,
+        "classes_per_task":  CLASSES_PER_TASK,
+        "cluster_method":    CLUSTER_METHOD,
+        "n_agents":          M,
+        "p0_epochs":         P0_EPOCHS,
+        "pa_epochs":         PA_EPOCHS,
+        "pb_epochs":         PB_EPOCHS,
+    },
+}, ckpt_out)
+print(f"Checkpoint saved: {ckpt_out}")
 
 # %% [markdown]
 # ## 18. Summary
 
 # %%
 ckpts = sorted(OUTPUT_DIR.rglob("*.pt"))
-print("=" * 55)
+print("=" * 65)
 print(f"  Dataset       : {DATASET}")
-print(f"  N tasks       : {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
+print(f"  Tasks trained : {last_t + 1} / {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
 print(f"  N agents      : {M}")
-for r in task_results:
-    print(f"  Task {r['task']}  val={r['val_acc']*100:.2f}%  test={r['test_acc']*100:.2f}%")
-if len(task_results) > 1:
-    avg = sum(r['test_acc'] for r in task_results) / len(task_results)
-    print(f"  Avg test acc  : {avg*100:.2f}%")
+print()
+print(f"  {'Task':>5}  {'val %':>8}  {'test %':>8}  {'forgetting':>12}")
+print(f"  {'-'*45}")
+for i, r in enumerate(task_results):
+    fg = forgetting[i] * 100 if not np.isnan(forgetting[i]) else float("nan")
+    print(f"  {r['task']:>5}  {r['val_acc']*100:>8.2f}  "
+          f"{r['test_acc']*100:>8.2f}  {fg:>+11.2f}%")
+print(f"  {'-'*45}")
+print(f"  Avg final test acc : {float(np.nanmean(acc_final))*100:.2f}%")
+print(f"  BWT                : {bwt*100:+.2f}%")
+print(f"  SLDA samples seen  : {slda._n_total}")
+print()
 print(f"  Output dir    : {OUTPUT_DIR}")
 print(f"  Checkpoints   : {len(ckpts)}")
 for c in ckpts:
     print(f"    {c.name}  ({c.stat().st_size/1e6:.1f} MB)")
-print("=" * 55)
-print("Done! Download checkpoints tu tab Output tren Kaggle.")
+print("=" * 65)
+print("Done! Download checkpoints + plots from the Output tab on Kaggle.")
