@@ -180,10 +180,19 @@ PB_LOG_EVERY      = 20
 # ===========================================================================
 # CONTINUAL LEARNING — novelty detection for agent spawning
 # ===========================================================================
-# Bottom MIN_ORPHAN_FRACTION of max-VAE-scores treated as "novel" slots.
-# If >= MIN_ORPHAN_FRACTION of task-t slots are novel, cluster them and spawn
-# new agents.  Old agents are NEVER fine-tuned (prevents catastrophic forgetting).
-MIN_ORPHAN_FRACTION = 0.15
+# Novelty is determined by an ABSOLUTE score threshold (θ_novel) calibrated
+# once from task-0 data: any slot whose best VAE score < θ_novel is truly
+# out-of-distribution (paper Section 3, "Routing and Novelty Detection").
+#
+# NOVEL_SCORE_PERCENTILE: percentile of task-0 max-VAE-scores used to set
+#   θ_novel.  5 = very conservative (only clear outliers are novel).
+#   Raise to 10-15 to be more aggressive about spawning.
+#
+# MIN_ORPHAN_FRACTION: minimum fraction of task-t slots that must be novel
+#   before clustering + spawning.  Acts as B_min from the paper — avoids
+#   spawning from a handful of noisy outliers.
+NOVEL_SCORE_PERCENTILE = 5     # percentile of task-0 scores → θ_novel
+MIN_ORPHAN_FRACTION    = 0.10  # spawn only if ≥10% of slots are novel
 
 # ===========================================================================
 # SLDA
@@ -519,6 +528,21 @@ vaes, agents, cluster_result = initialiser.run(
 M = len(agents)
 print(f"Spawned {M} agents  ({CLUSTER_METHOD})")
 
+# ---------------------------------------------------------------------------
+# Calibrate novelty threshold (θ_novel) from task-0 slots — ABSOLUTE, not
+# relative.  Any future slot whose best-VAE score < SCORE_FLOOR is novel.
+# ---------------------------------------------------------------------------
+_slots_0_t  = torch.from_numpy(slots_np).float().to(DEVICE)
+_scores_0   = []
+for _v in vaes:
+    _s = _v.score(_slots_0_t)
+    _scores_0.append(_s.cpu().numpy() if isinstance(_s, torch.Tensor) else np.asarray(_s))
+_max_scores_0 = np.max(np.stack(_scores_0, axis=1), axis=1)  # (N,)
+SCORE_FLOOR   = float(np.percentile(_max_scores_0, NOVEL_SCORE_PERCENTILE))
+print(f"Novelty threshold θ_novel = {SCORE_FLOOR:.4f}  "
+      f"({NOVEL_SCORE_PERCENTILE}th pct of task-0 max-VAE-scores)")
+del _slots_0_t, _scores_0, _max_scores_0
+
 # %% [markdown]
 # ## 11. Phase A — Agent Warm-up  *(hard routing, L_agent only)*
 
@@ -656,10 +680,14 @@ print("Forgetting matrix initialised (R[0][0] set).")
 # 4. Evaluate all seen tasks → fill forgetting matrix column t
 
 # %%
-def _find_novel_slots(vaes, slots_np, orphan_fraction=MIN_ORPHAN_FRACTION):
+def _find_novel_slots(vaes, slots_np):
     """
-    Return indices of slots in the bottom `orphan_fraction` percentile of
-    max-VAE-log-likelihood — i.e., slots not well explained by any existing VAE.
+    Return indices of slots whose best VAE score < SCORE_FLOOR.
+
+    SCORE_FLOOR is an absolute threshold calibrated from task-0 data
+    (NOVEL_SCORE_PERCENTILE-th percentile of task-0 max-VAE-scores).
+    A slot is "novel" only if it is genuinely out-of-distribution relative
+    to ALL existing agents — not just the bottom N% of the current batch.
     """
     if not vaes:
         return np.arange(len(slots_np))
@@ -669,8 +697,7 @@ def _find_novel_slots(vaes, slots_np, orphan_fraction=MIN_ORPHAN_FRACTION):
         s = vae.score(slots_t)
         scores.append(s.cpu().numpy() if isinstance(s, torch.Tensor) else np.asarray(s))
     max_score = np.max(np.stack(scores, axis=1), axis=1)   # (N,)
-    cutoff    = np.quantile(max_score, orphan_fraction)
-    return np.where(max_score < cutoff)[0]
+    return np.where(max_score < SCORE_FLOOR)[0]
 
 
 for t in range(1, N_TASKS):
