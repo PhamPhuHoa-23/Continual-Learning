@@ -127,6 +127,12 @@ class ClusterInitConfig:
     # 0 → use entire dataloader
     max_batches_for_clustering: int = 200
 
+    # Hard cap on total slot vectors fed to the clustering algorithm.
+    # After mask-filtering active slots, randomly subsample down to this.
+    # HDBSCAN/DBSCAN is O(n²) memory — keep ≤ 20 000 to avoid OOM.
+    # 0 → no cap (use all active slots)
+    max_slots_for_clustering: int = 20_000
+
     # ------- VAE training per cluster -------
     vae_latent_dim: int = 16
     vae_epochs: int = 20

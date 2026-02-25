@@ -138,7 +138,10 @@ P0_LOG_EVERY = 50
 CLUSTER_METHOD  = "hdbscan"   # "hdbscan" | "kmeans" | "dbscan" | "gmm" | "bayesian_gmm"
 CLUSTER_KWARGS  = {"min_cluster_size": 30, "min_samples": 5}
 # KMeans/GMM: them {"n_clusters": 8} vao CLUSTER_KWARGS
-MAX_BATCH_CLUST = 150         # so batch dung de extract slots (0 = dung tat ca)
+MAX_BATCH_CLUST = 50          # so batch dung de extract slots (0 = dung tat ca)
+                              # 50 batches x 64 x ~11 slots ~ 35k -> subsample xuong MAX_SLOTS_CLUST
+MAX_SLOTS_CLUST = 20_000      # hard cap truoc khi feed vao HDBSCAN (0 = khong cap)
+                              # HDBSCAN la O(n^2) memory -> giu <= 20k de tranh OOM
 VAE_LATENT_DIM  = 16
 VAE_EPOCHS      = 20
 SCORING_MODE    = "generative"  # "generative" | "mahal_z" | "mahal_slot"
@@ -466,6 +469,7 @@ cfg_clust = ClusterInitConfig(
     method                    = CLUSTER_METHOD,
     method_kwargs             = CLUSTER_KWARGS,
     max_batches_for_clustering= MAX_BATCH_CLUST,
+    max_slots_for_clustering  = MAX_SLOTS_CLUST,
     vae_latent_dim            = VAE_LATENT_DIM,
     vae_epochs                = VAE_EPOCHS,
     scoring_mode              = SCORING_MODE,

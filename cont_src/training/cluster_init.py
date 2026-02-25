@@ -116,13 +116,32 @@ def extract_slots(
         out    = slot_model(images)
         slots  = out["slots"]          # (B, K, D)
 
+        # Only keep active slots (hard_keep_decision > 0.5) when available
+        mask = out.get("hard_keep_decision", out.get("mask"))  # (B, K) or None
         B, K, D = slots.shape
-        all_slots.append(slots.reshape(B * K, D).cpu().numpy())
+        flat = slots.reshape(B * K, D).cpu().numpy()
+        if mask is not None:
+            active = (mask > 0.5).reshape(B * K).cpu().numpy().astype(bool)
+            flat = flat[active]
+
+        if flat.shape[0] > 0:
+            all_slots.append(flat)
 
     if not all_slots:
         raise RuntimeError("No slots extracted — check dataloader and model.")
 
     result = np.concatenate(all_slots, axis=0)   # (N, D)
+
+    # Subsample if over the cap
+    max_s = config.max_slots_for_clustering
+    n_before = result.shape[0]
+    if max_s > 0 and n_before > max_s:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n_before, size=max_s, replace=False)
+        result = result[idx]
+        logger.info(
+            f"[ClusterInit] Subsampled {n_before} active slots → {max_s}"
+        )
     logger.info(
         f"[ClusterInit] Extracted {result.shape[0]} slot embeddings "
         f"(dim={result.shape[1]})  method={config.method}"
