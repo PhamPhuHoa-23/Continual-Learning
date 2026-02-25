@@ -767,6 +767,7 @@ for t in range(1, N_TASKS):
             vaes=new_vaes,
             agents=new_agents,
             aggregator=aggregator,
+            agent_id_offset=old_M,   # register/lookup with global IDs
         )
         print(f"  Task {t} — Phase B (new agents, full loss) ...")
         trainer_pb_t.train(t_train)

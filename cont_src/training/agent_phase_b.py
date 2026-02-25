@@ -167,6 +167,7 @@ class AgentPhaseBTrainer(BaseTrainer):
         vaes: List[SlotVAE],
         agents: List[ResidualMLPAgent],
         aggregator: Optional[nn.Module] = None,
+        agent_id_offset: int = 0,
     ):
         self.model_components = {f"agent_{i}": a for i, a in enumerate(agents)}
         self.model_components["slot_model"] = slot_model
@@ -180,6 +181,7 @@ class AgentPhaseBTrainer(BaseTrainer):
         self.vaes = vaes
         self.agents = agents
         self.aggregator = aggregator
+        self._agent_id_offset = agent_id_offset   # global ID = local_idx + offset
 
         # Freeze backbone always
         self.freeze("slot_model")
@@ -193,7 +195,7 @@ class AgentPhaseBTrainer(BaseTrainer):
             1e6)
 
         logger.info(
-            f"[AgentPhaseBTrainer] {len(agents)} agents  "
+            f"[AgentPhaseBTrainer] {len(agents)} agents  offset={agent_id_offset}  "
             f"γ={config.gamma} α={config.alpha} β={config.beta}  "
             f"T: {config.init_temperature}→{config.final_temperature} "
             f"({config.temp_anneal})"
@@ -233,10 +235,11 @@ class AgentPhaseBTrainer(BaseTrainer):
             else f"{self.config.max_epochs} epochs"
         )
         logger.info(f"[AgentPhaseBTrainer] Phase B full training — {dur}")
-        # Register agent IDs with AttentionAggregator (creates per-agent keys)
+        # Register agent IDs with AttentionAggregator using GLOBAL IDs
+        # (offset ensures new CL agents don't collide with existing agent keys)
         if self.aggregator is not None and hasattr(self.aggregator, "register_agent"):
             for i in range(len(self.agents)):
-                self.aggregator.register_agent(i)
+                self.aggregator.register_agent(self._agent_id_offset + i)
 
     def on_after_step(self, step: int, metrics: Dict) -> None:
         """Log current temperature every log interval."""
@@ -380,8 +383,8 @@ class AgentPhaseBTrainer(BaseTrainer):
             slots, weights)   # (B, K, D_h), scalar
 
         # 4. Aggregate into one vector per sample
-        # hard assignments for aggregator keys
-        assignments = weights.argmax(dim=-1)             # (B, K)
+        # hard assignments for aggregator keys  — shift to global IDs
+        assignments = weights.argmax(dim=-1) + self._agent_id_offset  # (B, K)
         H = self._aggregate(hidden_slots, assignments=assignments)   # (B, D_h)
 
         # Sanitize H: NaN/Inf from upstream explosions would poison label losses

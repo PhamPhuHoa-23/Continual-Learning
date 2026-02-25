@@ -55,14 +55,14 @@ class StreamLDA:
     """
 
     def __init__(self, n_classes: int, feature_dim: int, shrinkage: float = 1e-4):
-        self.n_classes   = n_classes
+        self.n_classes = n_classes
         self.feature_dim = feature_dim
-        self.shrinkage   = shrinkage
+        self.shrinkage = shrinkage
 
-        self._n_c:     Dict[int, int]            = {}
-        self._mu_c:    Dict[int, torch.Tensor]   = {}
-        self._S:       torch.Tensor              = torch.zeros(feature_dim, feature_dim)
-        self._n_total: int                       = 0
+        self._n_c:     Dict[int, int] = {}
+        self._mu_c:    Dict[int, torch.Tensor] = {}
+        self._S:       torch.Tensor = torch.zeros(feature_dim, feature_dim)
+        self._n_total: int = 0
 
     # ------------------------------------------------------------------
     # Incremental update
@@ -78,25 +78,25 @@ class StreamLDA:
         labels   : (B,)   – integer class indices
         """
         features = features.detach().cpu().float()
-        labels   = labels.detach().cpu()
+        labels = labels.detach().cpu()
 
         for feat, lbl in zip(features, labels):
             c = int(lbl.item())
 
             # --- update class mean (online) ---
             if c not in self._n_c:
-                self._n_c[c]  = 0
+                self._n_c[c] = 0
                 self._mu_c[c] = torch.zeros(self.feature_dim)
 
-            n_old       = self._n_c[c]
-            n_new       = n_old + 1
-            delta       = feat - self._mu_c[c]
+            n_old = self._n_c[c]
+            n_new = n_old + 1
+            delta = feat - self._mu_c[c]
             self._mu_c[c] = self._mu_c[c] + delta / n_new
-            self._n_c[c]  = n_new
+            self._n_c[c] = n_new
 
             # --- update scatter matrix (Welford) ---
-            delta2   = feat - self._mu_c[c]
-            self._S  = self._S + torch.outer(delta, delta2)
+            delta2 = feat - self._mu_c[c]
+            self._S = self._S + torch.outer(delta, delta2)
             self._n_total += 1
 
     # ------------------------------------------------------------------
@@ -125,24 +125,26 @@ class StreamLDA:
         preds : (B,) LongTensor
         """
         if not self._mu_c:
-            raise RuntimeError("StreamLDA has not been updated with any data yet.")
+            raise RuntimeError(
+                "StreamLDA has not been updated with any data yet.")
 
         features = features.detach().cpu().float()
 
         cov_inv = torch.linalg.inv(self.cov)             # (D, D)
 
         # Gather class means into (C, D)
-        classes  = sorted(self._mu_c.keys())
-        mu_stack = torch.stack([self._mu_c[c] for c in classes], dim=0)  # (C, D)
+        classes = sorted(self._mu_c.keys())
+        mu_stack = torch.stack([self._mu_c[c]
+                               for c in classes], dim=0)  # (C, D)
 
         # Scores:  H @ Σ^{-1} @ μ_c^T  -  ½ μ_c @ Σ^{-1} @ μ_c^T
         # (B, D) @ (D, D) → (B, D) @ (D, C) → (B, C)
-        h_proj   = features @ cov_inv                           # (B, D)
-        scores   = h_proj @ mu_stack.t()                        # (B, C)
+        h_proj = features @ cov_inv                           # (B, D)
+        scores = h_proj @ mu_stack.t()                        # (B, C)
         quadform = 0.5 * (mu_stack @ cov_inv * mu_stack).sum(dim=1)   # (C,)
-        scores   = scores - quadform.unsqueeze(0)
+        scores = scores - quadform.unsqueeze(0)
 
-        idx   = scores.argmax(dim=1)                            # (B,)
+        idx = scores.argmax(dim=1)                            # (B,)
         preds = torch.tensor([classes[i] for i in idx.tolist()])
         return preds
 
@@ -159,9 +161,9 @@ class StreamLDA:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self._n_c     = state["n_c"]
-        self._mu_c    = {k: v.clone() for k, v in state["mu_c"].items()}
-        self._S       = state["S"].clone()
+        self._n_c = state["n_c"]
+        self._mu_c = {k: v.clone() for k, v in state["mu_c"].items()}
+        self._S = state["S"].clone()
         self._n_total = state["n_total"]
 
     def save(self, path: str) -> None:
@@ -208,13 +210,13 @@ class SLDATrainer:
         slda: StreamLDA,
         vaes: Optional[List[Any]] = None,
     ):
-        self.config      = config
-        self.device      = self._resolve_device(config.device)
-        self.slot_model  = slot_model.to(self.device).eval()
-        self.agents      = [a.to(self.device).eval() for a in agents]
-        self.aggregator  = aggregator.to(self.device).eval()
-        self.slda        = slda
-        self.vaes        = vaes or []
+        self.config = config
+        self.device = self._resolve_device(config.device)
+        self.slot_model = slot_model.to(self.device).eval()
+        self.agents = [a.to(self.device).eval() for a in agents]
+        self.aggregator = aggregator.to(self.device).eval()
+        self.slda = slda
+        self.vaes = vaes or []
 
         # Freeze all
         for mod in [self.slot_model, *self.agents, self.aggregator]:
@@ -243,7 +245,7 @@ class SLDATrainer:
         max_b = self.config.max_batches
 
         pbar = tqdm(enumerate(dataloader), total=max_b if max_b > 0 else len(dataloader),
-                     desc="SLDA fit", unit="batch", dynamic_ncols=True)
+                    desc="SLDA fit", unit="batch", dynamic_ncols=True)
         for batch_idx, batch in pbar:
             if max_b > 0 and batch_idx >= max_b:
                 break
@@ -289,8 +291,9 @@ class SLDATrainer:
             if labels is not None:
                 all_labels.append(labels)
 
-        preds  = torch.cat(all_preds)
-        labels = torch.cat(all_labels) if all_labels else torch.zeros_like(preds)
+        preds = torch.cat(all_preds)
+        labels = torch.cat(
+            all_labels) if all_labels else torch.zeros_like(preds)
         return preds, labels
 
     @torch.no_grad()
@@ -319,7 +322,7 @@ class SLDATrainer:
         Full pipeline: images → slots → (hard) route & agent → aggregate → H.
         """
         # 1. Slots
-        out   = self.slot_model(images)
+        out = self.slot_model(images)
         slots = out["slots"]                         # (B, K, D)
 
         # 2. Route (hard argmax)
@@ -346,7 +349,7 @@ class SLDATrainer:
         hidden_slots = []
         for m, agent in enumerate(self.agents):
             out_m = agent(slots)
-            h_m   = out_m["hidden"]           # (B, K, D_h)
+            h_m = out_m["hidden"]           # (B, K, D_h)
             if D_h is None:
                 D_h = h_m.shape[-1]
             hidden_slots.append(h_m)
@@ -363,6 +366,11 @@ class SLDATrainer:
 
         # 4. Aggregate
         H = self._agg(chosen, assignments)              # (B, D_h)
+
+        # 5. L2-normalise — Phase B trains L_SupCon on F.normalize(H, p=2);
+        #    SLDA must receive the same normalised representation, otherwise
+        #    the class means are in a different space than training.
+        H = F.normalize(H, p=2, dim=-1)
         return H
 
     def _agg(self, hidden_slots: torch.Tensor, assignments: torch.Tensor) -> torch.Tensor:
@@ -370,7 +378,10 @@ class SLDATrainer:
         try:
             result = self.aggregator(hidden_slots, assignments)
             return result["aggregated"] if isinstance(result, dict) else result
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"[SLDATrainer] aggregator failed ({e}), falling back to mean pooling."
+            )
             return hidden_slots.mean(dim=1)
 
     # ------------------------------------------------------------------
