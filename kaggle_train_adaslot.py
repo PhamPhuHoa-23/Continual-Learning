@@ -128,10 +128,11 @@ D_H        = 64     # agent hidden dim / aggregator output dim
 P0_EPOCHS    = 2            # so epoch (1 epoch ≈ 700 buoc voi CIFAR-100 bs=64)
 P0_LR        = 4e-4
 P0_W_RECON   = 1.0          # recon loss weight
-P0_W_SPARSE  = 0.0          # sparsity penalty weight — TAT HOAN TOAN cho Phase 0
-                             # CLEVR10 gate da duoc train tren CLEVR (nen no drop slot CIFAR-100 ngay)
-                             # Dung sparsity o day se gay slot collapse do domain shift
-                             # Backbone se tu adapt keepall slots khi chi co recon + prim loss
+P0_W_SPARSE  = 10.0         # sparsity penalty weight (match original AdaSlot: linear_weight=10 + mse_sum)
+                             # Gate duoc reset lai (CLEVR10 saturated o slots_keep_prob=1.0)
+                             # sau reset, gradient flow qua straight-through hoat dong binh thuong
+                             # w_sparse=10 tuong duong paper goc (linear_weight=10 tren mse_sum scale ~55k)
+                             # Set = 0.0 neu muon tat sparsity hoan toan (khong drop slot)
 P0_W_PRIM    = 1.0          # primitive loss weight
 P0_LOG_EVERY = 50
 
@@ -397,6 +398,22 @@ ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
 missing, unexpected = backbone.load_state_dict(ckpt["state_dict"], strict=True)
 print(f"Checkpoint loaded: {CKPT_PATH}")
 print(f"  missing={len(missing)}  unexpected={len(unexpected)}")
+
+# Reset gate (single_gumbel_score_network): CLEVR10 checkpoint is saturated
+# (slots_keep_prob ≈ 1.0 on CIFAR-100 inputs) → straight-through gradient ≈ 0
+# Re-initialising lets the gate learn a proper keep/drop decision on the new domain.
+def _reset_gumbel_gate(model: nn.Module) -> None:
+    for name, mod in model.named_modules():
+        if "single_gumbel_score_network" in name or "gumbel_score" in name:
+            for p in mod.parameters():
+                if p.dim() >= 2:
+                    nn.init.xavier_uniform_(p)
+                else:
+                    nn.init.zeros_(p)
+            print(f"  Gate reset: {name}")
+
+_reset_gumbel_gate(backbone)
+print("Gate weights re-initialised (was saturated on CLEVR → CIFAR domain shift)")
 
 prim_sel   = PrimitiveSelector(slot_dim=SLOT_DIM, hidden_dim=D_H).to(DEVICE)
 slot_model = SlotModelWrapper(backbone, prim_sel).to(DEVICE)
