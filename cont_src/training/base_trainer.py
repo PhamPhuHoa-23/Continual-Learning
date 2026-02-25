@@ -366,12 +366,20 @@ class BaseTrainer(ABC):
 
         loss = metrics.get("loss_total")
         if loss is not None and isinstance(loss, torch.Tensor):
-            loss.backward()
+            if not torch.isfinite(loss):
+                logger.warning(
+                    f"[{self.__class__.__name__}] loss_total={loss.item():.4g} "
+                    "is non-finite — skipping backward/step to protect weights."
+                )
+                metrics["loss_total"] = float("nan")
+            else:
+                loss.backward()
 
             if self.config.grad_clip > 0:
                 for mod in self.model_components.values():
                     if isinstance(mod, nn.Module):
-                        nn.utils.clip_grad_norm_(mod.parameters(), self.config.grad_clip)
+                        nn.utils.clip_grad_norm_(
+                            mod.parameters(), self.config.grad_clip)
 
             if self.optimizer is not None:
                 self.optimizer.step()

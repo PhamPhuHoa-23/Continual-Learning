@@ -67,7 +67,7 @@ def _primitive_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> t
     d_H = F.softmax(sim, dim=1)
 
     same = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-    d_y  = same / (same.sum(dim=1, keepdim=True) + 1e-8)
+    d_y = same / (same.sum(dim=1, keepdim=True) + 1e-8)
 
     kl = (d_y * torch.log((d_y + 1e-8) / (d_H + 1e-8))).sum() / hidden.shape[0]
     return kl
@@ -83,7 +83,7 @@ def _supcon_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> torc
     if B < 2:
         return hidden.new_zeros(()).squeeze()
 
-    h  = F.normalize(hidden, p=2, dim=-1)          # (B, D)
+    h = F.normalize(hidden, p=2, dim=-1)          # (B, D)
     sim = torch.mm(h, h.t()) / tau                  # (B, B)
 
     # Mask out diagonal (self)
@@ -101,6 +101,10 @@ def _supcon_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> torc
         sim[valid_rows]
         - torch.logsumexp(sim[valid_rows], dim=1, keepdim=True)
     )
+    # After the logsumexp subtraction, diagonal entries of log_prob are -inf.
+    # pos_mask is 0 there, but  0.0 * -inf = NaN  in IEEE 754 — zero them out
+    # explicitly so the element-wise product is always finite.
+    log_prob = log_prob.masked_fill(diag_mask, 0.0)
 
     # Positive pairs (same class, excluding self)
     pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~diag_mask
@@ -108,6 +112,10 @@ def _supcon_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> torc
     n_pos = pos_mask.sum(dim=1).clamp(min=1)
 
     loss = -(pos_mask * log_prob).sum(dim=1) / n_pos
+
+    # Guard: if any row still produced NaN (e.g. all-zero H after nan_to_num),
+    # replace with 0 so training can continue.
+    loss = torch.nan_to_num(loss, nan=0.0)
     return loss[valid_rows].mean()
 
 
@@ -169,8 +177,8 @@ class AgentPhaseBTrainer(BaseTrainer):
         self.config: PhaseBConfig  # type narrowing
 
         self.slot_model = slot_model
-        self.vaes       = vaes
-        self.agents     = agents
+        self.vaes = vaes
+        self.agents = agents
         self.aggregator = aggregator
 
         # Freeze backbone always
@@ -181,7 +189,8 @@ class AgentPhaseBTrainer(BaseTrainer):
         # SlotVAE is not nn.Module; freeze is a no-op here — fine.
 
         # Total steps for temperature schedule
-        self._total_steps = config.max_steps if config.max_steps > 0 else int(1e6)
+        self._total_steps = config.max_steps if config.max_steps > 0 else int(
+            1e6)
 
         logger.info(
             f"[AgentPhaseBTrainer] {len(agents)} agents  "
@@ -199,7 +208,8 @@ class AgentPhaseBTrainer(BaseTrainer):
         for agent in self.agents:
             params += [p for p in agent.parameters() if p.requires_grad]
         if self.aggregator is not None:
-            params += [p for p in self.aggregator.parameters() if p.requires_grad]
+            params += [p for p in self.aggregator.parameters()
+                       if p.requires_grad]
 
         if not params:
             logger.warning("[AgentPhaseBTrainer] No trainable parameters.")
@@ -242,10 +252,11 @@ class AgentPhaseBTrainer(BaseTrainer):
     def _extract_slots(self, images: torch.Tensor):
         """Return (slots (B,K,D), n_active_slots float)."""
         self.slot_model.eval()
-        out   = self.slot_model(images)
+        out = self.slot_model(images)
         slots = out["slots"]
-        mask  = out.get("hard_keep_decision", out.get("mask"))
-        n_active = (mask > 0.5).float().sum(dim=-1).mean().item() if mask is not None else float(slots.shape[1])
+        mask = out.get("hard_keep_decision", out.get("mask"))
+        n_active = (mask > 0.5).float().sum(
+            dim=-1).mean().item() if mask is not None else float(slots.shape[1])
         return slots, n_active
 
     def _soft_route(
@@ -304,7 +315,8 @@ class AgentPhaseBTrainer(BaseTrainer):
 
         for m, agent in enumerate(self.agents):
             agent.train()
-            out = agent(slots)                          # {"hidden": ..., "reconstructed": ...}
+            # {"hidden": ..., "reconstructed": ...}
+            out = agent(slots)
             h_m = out["hidden"]                         # (B, K, D_h)
             agent_hiddens.append(h_m)
 
@@ -339,8 +351,8 @@ class AgentPhaseBTrainer(BaseTrainer):
                 # AttentionAggregator returns a dict with key 'aggregated'
                 if isinstance(result, dict):
                     return result.get("aggregated",
-                           result.get("pooled",
-                           result.get("output", hidden_slots.mean(dim=1))))
+                                      result.get("pooled",
+                                                 result.get("output", hidden_slots.mean(dim=1))))
                 return result
             return hidden_slots.mean(dim=1)
         return hidden_slots.mean(dim=1)                # (B, D_h)
@@ -353,16 +365,19 @@ class AgentPhaseBTrainer(BaseTrainer):
             labels = labels.to(self.device)
 
         # Current temperature
-        temp = _compute_temperature(self.global_step, self._total_steps, self.config)
+        temp = _compute_temperature(
+            self.global_step, self._total_steps, self.config)
 
         # 1. Extract slots (frozen backbone)
-        slots, n_active_slots = self._extract_slots(images)   # (B, K, D), float
+        slots, n_active_slots = self._extract_slots(
+            images)   # (B, K, D), float
 
         # 2. Soft routing weights
         weights = self._soft_route(slots, temp)          # (B, K, n_agents)
 
         # 3. Compute per-slot hidden and L_agent
-        hidden_slots, l_agent = self._compute_hidden(slots, weights)   # (B, K, D_h), scalar
+        hidden_slots, l_agent = self._compute_hidden(
+            slots, weights)   # (B, K, D_h), scalar
 
         # 4. Aggregate into one vector per sample
         # hard assignments for aggregator keys
@@ -374,11 +389,11 @@ class AgentPhaseBTrainer(BaseTrainer):
             H = torch.nan_to_num(H, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # 5. Label losses
-        l_prim   = torch.tensor(0.0, device=self.device)
+        l_prim = torch.tensor(0.0, device=self.device)
         l_supcon = torch.tensor(0.0, device=self.device)
 
         if has_labels:
-            l_prim   = _primitive_loss(H, labels, self.config.prim_temperature)
+            l_prim = _primitive_loss(H, labels, self.config.prim_temperature)
             l_supcon = _supcon_loss(H, labels, self.config.supcon_temperature)
 
         # 6. Total loss
@@ -386,13 +401,13 @@ class AgentPhaseBTrainer(BaseTrainer):
         loss_total = (
             cfg.gamma * l_agent
             + cfg.alpha * l_prim
-            + cfg.beta  * l_supcon
+            + cfg.beta * l_supcon
         )
 
         return {
             "loss_total":     loss_total,
             "l_agent":        l_agent.detach(),
-            "l_prim":         l_prim.detach()   if isinstance(l_prim,   torch.Tensor) else l_prim,
+            "l_prim":         l_prim.detach() if isinstance(l_prim,   torch.Tensor) else l_prim,
             "l_supcon":       l_supcon.detach() if isinstance(l_supcon, torch.Tensor) else l_supcon,
             "temperature":    temp,
             "n_active_slots": n_active_slots,
