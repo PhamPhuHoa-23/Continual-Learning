@@ -543,6 +543,7 @@ class BatchCRPAggregator:
 
     def __init__(self, aggregator: CRPExpertAggregator):
         self.aggregator = aggregator
+        self._agg = aggregator   # alias so train.py can reach freeze_old_classes
 
     def learn_batch(
         self,

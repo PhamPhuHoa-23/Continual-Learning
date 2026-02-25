@@ -882,6 +882,10 @@ def train_phase3_crp(
     for epoch in range(epochs):
         if epochs > 1:
             print(f"  [Epoch {epoch + 1}/{epochs}]")
+        # Reset per-epoch accumulators so reported accuracy reflects the
+        # current epoch only (not a diluted average across all epochs).
+        epoch_correct = 0
+        epoch_samples = 0
 
         for batch_idx, batch in enumerate(dataloader):  # FIX #1: entire processing inside loop
             images = (batch[0].to(device) if isinstance(batch, (list, tuple))
@@ -924,9 +928,10 @@ def train_phase3_crp(
                         1 for p, t in zip(preds, targets.cpu().numpy()) if p == t
                     )
                 else:
-                    preds = aggregator.predict(features_t.numpy())
+                    preds = aggregator.predict(features_t.cpu().numpy())
                     correct = (preds == targets.cpu().numpy()).sum()
                 total_correct += correct
+                epoch_correct += correct
 
                 # ── UCB reward update ──
                 if use_estimator_pipeline and preds is not None:
@@ -941,6 +946,7 @@ def train_phase3_crp(
                 pass
 
             total_samples += B
+            epoch_samples += B
 
             if hasattr(aggregator, 'learn_batch'):
                 aggregator.learn_batch(features_t, targets.cpu())
@@ -948,14 +954,14 @@ def train_phase3_crp(
                 aggregator.partial_fit(features_t.numpy(), targets.cpu().numpy())
 
             if (batch_idx + 1) % log_every == 0:
-                acc = total_correct / max(total_samples, 1) * 100
+                acc = epoch_correct / max(epoch_samples, 1) * 100
                 elapsed = time.time() - t0
                 extra = ""
                 if use_estimator_pipeline:
                     extra = f" | ucb_rounds={ucb_moe.total_count}"
                 print(
                     f"    Batch {batch_idx + 1:>5d} | "
-                    f"samples={total_samples} | "
+                    f"samples={epoch_samples} | "
                     f"acc={acc:.2f}%{extra} | "
                     f"{elapsed:.0f}s"
                 )
@@ -1046,6 +1052,8 @@ def main():
                         help="Phase 2.5 fine-tuning steps per task (CompSLOT mode)")
     parser.add_argument("--task_p3_epochs", type=int, default=1,
                         help="Phase 3 epochs per task (CompSLOT mode)")
+    parser.add_argument("--cl_metrics_every", type=int, default=3,
+                        help="Print full CL metrics table every N tasks (default: 3)")
 
     parser.add_argument("--filter_k", type=int, default=10,
                         help="Number of agents to keep after fast filtering")
@@ -1313,6 +1321,8 @@ def main():
     n_tasks = len(train_loaders)
     acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
     aggregator = None   # aggregator accumulates knowledge across all tasks
+    # Track all classes seen so far (for freeze_old_classes in Phase 3)
+    seen_classes: set = set()
 
     # FIX #5: create Phase-1 optimizer & scheduler once so Adam second-moment
     # buffers persist across task boundaries (avoids momentum reset each task).
@@ -1390,11 +1400,13 @@ def main():
         # ── Phase 3: update CRP aggregator on current task data ──────
         print(f"\n  ▶ Phase 3 — CRP aggregator update")
 
-        # Notify aggregator about the new class set (freeze old classes)
-        if aggregator is not None and hasattr(aggregator, '_agg'):
-            aggregator._agg.freeze_old_classes(set(task_classes))
+        # Freeze previously seen classes so the aggregator doesn't overwrite them.
+        # Pass seen_classes (previous tasks only), NOT task_classes (current task).
+        if aggregator is not None and hasattr(aggregator, '_agg') and seen_classes:
+            aggregator._agg.freeze_old_classes(seen_classes)
 
-        total_classes = args.num_classes if args.data_dir else 200  # TinyImageNet = 200
+        # total_classes = total across ALL tasks (not per-task num_classes)
+        total_classes = n_tasks * args.num_classes
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
@@ -1409,6 +1421,9 @@ def main():
             filter_k=args.filter_k,
             epochs=args.task_p3_epochs,
         )
+
+        # Update seen_classes AFTER training on current task
+        seen_classes |= set(task_classes)
 
         # ── Evaluate on every task seen so far ───────────────────────
         print(f"\n  [EVAL] Per-task accuracy after task {task_id}:")
@@ -1437,7 +1452,14 @@ def main():
         print(f"  ├─ {row_str}")
         print(f"  └─ Avg so far: {sum(row_accs) / len(row_accs):.2f}%")
 
-        # ── Save per-task checkpoints ────────────────────────────────
+        # ── Intermediate CL metrics every N tasks ────────────────────
+        _every = getattr(args, 'cl_metrics_every', 3)
+        is_last = (task_id == n_tasks - 1)
+        if task_id > 0 and ((task_id + 1) % _every == 0 or is_last):
+            print(f"\n  [CL METRICS — after task {task_id}]")
+            _print_cl_metrics(acc_matrix, task_id + 1)
+
+        # ── Save per-task checkpoints ─────────────────────────────────
         ckpt_dir = f"checkpoints/task{task_id}"
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save({'model': adaslot.state_dict()},
@@ -1540,7 +1562,8 @@ def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
             print(f"  Classes: {_task_cls[task_id]}")
         print(f"{'=' * 60}")
 
-        total_classes = args.num_classes if args.data_dir else 200  # TinyImageNet = 200
+        # total_classes = total across ALL tasks (not per-task num_classes)
+        total_classes = n_tasks * args.num_classes
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
@@ -1579,6 +1602,13 @@ def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
                               for j in range(task_id + 1))
         print(f"  ├─ {row_str}")
         print(f"  └─ Avg so far: {sum(row_accs) / len(row_accs):.2f}%")
+
+        # ── Intermediate CL metrics every N tasks ────────────────────
+        _every = getattr(args, 'cl_metrics_every', 3)
+        is_last = (task_id == n_tasks - 1)
+        if task_id > 0 and ((task_id + 1) % _every == 0 or is_last):
+            print(f"\n  [CL METRICS — after task {task_id}]")
+            _print_cl_metrics(acc_matrix, task_id + 1)
 
     _print_cl_metrics(acc_matrix, n_tasks)
 
@@ -1667,7 +1697,7 @@ def _eval_after_task(
                     1 for p, t in zip(preds, eval_targets.numpy()) if p == t
                 )
             else:
-                preds = aggregator.predict(feats_t.numpy())
+                preds = aggregator.predict(feats_t.cpu().numpy())
                 correct = (preds == eval_targets.numpy()).sum()
             total_correct += correct
 

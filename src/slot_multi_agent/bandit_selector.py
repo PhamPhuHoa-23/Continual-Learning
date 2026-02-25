@@ -458,9 +458,10 @@ class UCBWeightedMoE:
     # ------------------------------------------------------------------
 
     def update(self, agent_id: int, reward: float):
-        """Incremental mean-reward update for a single agent."""
+        """Incremental mean-reward update for a single agent.
+        NOTE: does NOT increment total_count — caller must do that once per sample.
+        """
         self.counts[agent_id] += 1
-        self.total_count += 1
         n = self.counts[agent_id]
         self.values[agent_id] += (reward - self.values[agent_id]) / n
 
@@ -472,6 +473,7 @@ class UCBWeightedMoE:
     ):
         """
         Distribute reward to all committee members proportional to weight.
+        Increments total_count ONCE per call (one call = one slot of one sample).
 
         Args:
             agent_ids: Committee agent IDs.
@@ -479,8 +481,9 @@ class UCBWeightedMoE:
             reward:    Global reward (1.0 = correct, 0.0 = wrong).
         """
         for aid, w in zip(agent_ids, weights):
-            # Each agent's attributed reward = global reward × its weight
             self.update(aid, reward * w)
+        # One round = one slot assignment decision
+        self.total_count += 1
 
     # ------------------------------------------------------------------
     #  Convenience / analysis
