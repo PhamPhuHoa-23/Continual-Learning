@@ -54,6 +54,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from cont_src.clustering import CLUSTERING_REGISTRY, ClusteringResult
 from cont_src.models.agents.residual_mlp_agent import ResidualMLPAgent
@@ -284,8 +285,15 @@ class ClusterInitialiser:
             f"scoring_mode must be one of {_valid_modes}, got '{cfg.scoring_mode}'"
         scoring_mode: ScoringMode = cfg.scoring_mode  # type: ignore[assignment]
 
-        for k, cluster_slots in enumerate(self._cluster_slots):
+        cluster_bar = tqdm(
+            enumerate(self._cluster_slots),
+            total=len(self._cluster_slots),
+            desc="[ClusterInit] Training VAEs",
+            unit="cluster",
+        )
+        for k, cluster_slots in cluster_bar:
             n = len(cluster_slots)
+            cluster_bar.set_postfix(cluster=k, n_slots=n)
             logger.info(
                 f"[ClusterInit] Spawning cluster {k}/{self._result.n_clusters}  "
                 f"n_slots={n}"

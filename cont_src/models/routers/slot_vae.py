@@ -87,6 +87,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 
 # ── Internal VAE network ─────────────────────────────────────────────────────
@@ -289,7 +290,8 @@ class SlotVAE:
         opt = torch.optim.Adam(self._net.parameters(), lr=lr)
 
         self._net.train()
-        for epoch in range(1, epochs + 1):
+        epoch_bar = tqdm(range(1, epochs + 1), desc="  VAE", leave=False, unit="ep")
+        for epoch in epoch_bar:
             epoch_loss = 0.0
             for (batch,) in loader:
                 out = self._net(batch)
@@ -302,9 +304,8 @@ class SlotVAE:
                 loss.backward()
                 opt.step()
                 epoch_loss += loss.item()
-            if verbose and epoch % 20 == 0:
-                print(
-                    f"    VAE epoch {epoch:3d}/{epochs}  loss={epoch_loss/len(loader):.4f}")
+            avg = epoch_loss / len(loader)
+            epoch_bar.set_postfix(loss=f"{avg:.4f}")
 
         # ── Freeze network ────────────────────────────────────────────────────
         self._net.eval()
