@@ -119,7 +119,7 @@ class AttentionAggregator(BaseAggregator):
 
                 if key_name in self.agent_keys:
                     # w_i^T h_k
-                    key = self.agent_keys[key_name]
+                    key = self.agent_keys[key_name].to(device)
                     logit = torch.dot(key, hidden_states[b, k])
                     attention_logits[b, k] = logit
                 else:
