@@ -121,6 +121,221 @@ def get_tinyimagenet_benchmark(
     return benchmark
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Standalone loader (no Avalanche required)
+#  Interface matches get_continual_cifar100_loaders exactly:
+#    train_loaders, test_loaders, class_order = get_continual_tinyimagenet_loaders(...)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import shutil
+import urllib.request
+import zipfile
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from typing import List, Tuple, Optional
+
+
+_TINYIMAGENET_URL = (
+    "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+)
+_TINYIMAGENET_CLASSES = 200
+
+
+def _download_tinyimagenet(root: str) -> str:
+    """Download and extract Tiny-ImageNet to `root/tiny-imagenet-200/`.
+
+    Returns path to the extracted root directory.
+    """
+    extract_dir = os.path.join(root, "tiny-imagenet-200")
+    if os.path.isdir(extract_dir):
+        return extract_dir   # already there
+
+    os.makedirs(root, exist_ok=True)
+    zip_path = os.path.join(root, "tiny-imagenet-200.zip")
+
+    if not os.path.isfile(zip_path):
+        print(f"[INFO] Downloading Tiny-ImageNet-200 (~250 MB) …")
+        urllib.request.urlretrieve(_TINYIMAGENET_URL, zip_path)
+        print("[INFO] Download complete.")
+
+    print("[INFO] Extracting Tiny-ImageNet-200 …")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(root)
+    print("[INFO] Extraction complete.")
+    return extract_dir
+
+
+def _prepare_val_dir(tiny_root: str) -> None:
+    """Reorganise the val/ directory so ImageFolder can read it.
+
+    Tiny-ImageNet's val/images/ is flat with a val_annotations.txt file
+    that maps filenames → wnids.  This function moves images into
+    per-class sub-directories (idempotent — skips if already done).
+    """
+    val_dir   = os.path.join(tiny_root, "val")
+    ann_file  = os.path.join(val_dir, "val_annotations.txt")
+    img_dir   = os.path.join(val_dir, "images")
+
+    if not os.path.isfile(ann_file):
+        return  # already reorganised or missing
+
+    with open(ann_file) as f:
+        lines = f.readlines()
+
+    for line in lines:
+        parts = line.strip().split("\t")
+        fname, wnid = parts[0], parts[1]
+        src_path = os.path.join(img_dir, fname)
+        dst_dir  = os.path.join(val_dir, wnid)
+        os.makedirs(dst_dir, exist_ok=True)
+        dst_path = os.path.join(dst_dir, fname)
+        if os.path.isfile(src_path) and not os.path.isfile(dst_path):
+            shutil.move(src_path, dst_path)
+
+    # Remove the now-empty images/ dir and annotation file
+    try:
+        shutil.rmtree(img_dir, ignore_errors=True)
+        os.remove(ann_file)
+    except OSError:
+        pass
+
+
+class _TinyImageNetTaskDataset(Dataset):
+    """Wraps an ImageFolder subset filtered to a specific set of original class ids."""
+
+    def __init__(
+        self,
+        base_dataset: ImageFolder,
+        task_classes: List[int],  # original class indices (0–199)
+    ):
+        self.base_dataset = base_dataset
+        self.task_classes_set = set(task_classes)
+
+        # ImageFolder stores .targets as a list of ints matching folder order
+        self.indices = [
+            i for i, t in enumerate(base_dataset.targets)
+            if t in self.task_classes_set
+        ]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        real_idx = self.indices[idx]
+        img, label = self.base_dataset[real_idx]
+        return img, label
+
+
+def get_continual_tinyimagenet_loaders(
+    n_tasks: int = 10,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    seed: int = 42,
+    resolution: int = 64,
+    root: str = "./data",
+    pin_memory: bool = True,
+) -> Tuple[List[DataLoader], List[DataLoader], np.ndarray]:
+    """Return per-task DataLoaders for Split Tiny-ImageNet (200 classes).
+
+    Interface is identical to ``get_continual_cifar100_loaders``:
+        train_loaders, test_loaders, class_order = get_continual_tinyimagenet_loaders(...)
+
+    Args:
+        n_tasks:     Number of sequential tasks (must divide 200 evenly).
+        batch_size:  Mini-batch size.
+        num_workers: DataLoader worker processes.
+        seed:        Random seed for class permutation.
+        resolution:  Spatial resolution to resize images to (default 64).
+        root:        Directory where Tiny-ImageNet will be downloaded.
+        pin_memory:  Pin DataLoader memory.
+
+    Returns:
+        train_loaders: List[DataLoader] — one per task (current-task classes only).
+        test_loaders:  List[DataLoader] — one per task (all classes seen so far).
+        class_order:   np.ndarray of shape (200,) — permuted class indices.
+    """
+    if _TINYIMAGENET_CLASSES % n_tasks != 0:
+        raise ValueError(
+            f"200 classes must be divisible by n_tasks ({n_tasks}). "
+            f"Use n_tasks in {{1,2,4,5,8,10,20,25,40,50,100,200}}."
+        )
+
+    # ── Download / prepare dataset ────────────────────────────────────
+    tiny_root = _download_tinyimagenet(root)
+    _prepare_val_dir(tiny_root)
+
+    train_dir = os.path.join(tiny_root, "train")
+    val_dir   = os.path.join(tiny_root, "val")
+
+    # ── Transforms ───────────────────────────────────────────────────
+    _mean = (0.485, 0.456, 0.406)
+    _std  = (0.229, 0.224, 0.225)
+
+    train_transform = transforms.Compose([
+        transforms.Resize((resolution, resolution)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4,
+                               saturation=0.4, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(_mean, _std),
+    ])
+    test_transform = transforms.Compose([
+        transforms.Resize((resolution, resolution)),
+        transforms.ToTensor(),
+        transforms.Normalize(_mean, _std),
+    ])
+
+    # ── Build base ImageFolder datasets ──────────────────────────────
+    base_train = ImageFolder(train_dir, transform=train_transform)
+    base_val   = ImageFolder(val_dir,   transform=test_transform)
+
+    n_classes = len(base_train.classes)   # should be 200
+
+    # ── Class permutation (reproducible) ─────────────────────────────
+    rng = np.random.default_rng(seed)
+    class_order = rng.permutation(n_classes)
+    classes_per_task = n_classes // n_tasks
+    task_classes_list = [
+        class_order[i * classes_per_task : (i + 1) * classes_per_task].tolist()
+        for i in range(n_tasks)
+    ]
+
+    # ── Build per-task loaders ────────────────────────────────────────
+    train_loaders: List[DataLoader] = []
+    test_loaders:  List[DataLoader] = []
+
+    for task_id in range(n_tasks):
+        current_classes = task_classes_list[task_id]
+        seen_classes    = [c for sub in task_classes_list[: task_id + 1] for c in sub]
+
+        # Training: only current-task classes
+        train_ds = _TinyImageNetTaskDataset(base_train, current_classes)
+        train_loaders.append(DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
+        ))
+
+        # Evaluation: all classes seen so far
+        test_ds = _TinyImageNetTaskDataset(base_val, seen_classes)
+        test_loaders.append(DataLoader(
+            test_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=pin_memory,
+        ))
+
+        logger.info(
+            f"Task {task_id:>2d}: train={len(train_ds):>6d} samples "
+            f"({len(current_classes)} classes) | "
+            f"test={len(test_ds):>6d} samples ({len(seen_classes)} classes)"
+        )
+
+    return train_loaders, test_loaders, class_order
+
+
 if __name__ == "__main__":
     """Demo usage of Tiny-ImageNet benchmark."""
     from torchvision import transforms

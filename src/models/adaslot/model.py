@@ -12,10 +12,11 @@ under a `models` sub-module so that state_dict keys match the checkpoint format:
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple
+import math
 
 from .feature_extractor import SlotAttentionFeatureExtractor
 from .conditioning import RandomConditioning
-from .perceptual_grouping import SlotAttentionGroupingGumbelV1
+from .perceptual_grouping import SlotAttentionGroupingGumbelV1, gumbel_temperature_schedule
 from .decoder import SlotAttentionDecoder, get_slotattention_decoder_backbone
 from .positional_embedding import SoftPositionEmbed
 
@@ -176,11 +177,25 @@ class AdaSlotModel(nn.Module):
             use_implicit_differentiation=False,
             single_gumbel_score_network=single_gumbel_score_network,
             low_bound=low_bound,
+            # FIX #3: anneal Gumbel temperature so decisions harden gradually.
+            # tau starts at 5.0 and decays to 0.1 over ~150 k steps.
+            temporature_function=gumbel_temperature_schedule,
         )
 
         # 4. Object Decoder
+        # Compute number of stride-2 upsample stages needed to reach the target
+        # resolution starting from the fixed 8×8 broadcast grid.
+        # e.g. resolution=128 → n_upsample=4, resolution=64 → n_upsample=3
+        _base_size = 8
+        _n_upsample = int(round(math.log2(resolution[0] / _base_size)))
+        if 2 ** _n_upsample * _base_size != resolution[0]:
+            raise ValueError(
+                f"resolution[0] must be a power-of-2 multiple of {_base_size}. "
+                f"Got {resolution[0]}. Valid values: 16, 32, 64, 128, 256, …"
+            )
+
         decoder_backbone = get_slotattention_decoder_backbone(
-            object_dim=slot_dim, output_dim=4
+            object_dim=slot_dim, output_dim=4, n_upsample=_n_upsample
         )
 
         pos_embed_decoder = SoftPositionEmbed(
@@ -241,8 +256,15 @@ class AdaSlotModel(nn.Module):
         slots_keep_prob = grouping_out["slots_keep_prob"]
         hard_keep_decision = grouping_out["hard_keep_decision"]
 
+        # FIX #2: zero out embeddings of dropped slots before decoding.
+        # This prevents dropped slots from contributing alpha mass in the
+        # softmax-normalised composite, eliminating the gradient conflict
+        # between SparsePenalty (drop slots) and ReconstructionLoss (use all
+        # slots for best reconstruction).
+        slots_for_decode = slots * hard_keep_decision.unsqueeze(-1)  # (B, S, D)
+
         # 4. Decode
-        decoder_out = self.models.object_decoder(slots)
+        decoder_out = self.models.object_decoder(slots_for_decode)
 
         return {
             "reconstruction": decoder_out["reconstruction"],

@@ -51,7 +51,7 @@
 !python src/models/adaslot/train.py \
     --phase all \
     --device cuda \
-    --num_classes 10 \
+    --num_classes 20 \
     --task_p1_steps 2000 \
     --task_p2_steps 2000 \
     --task_p2b_steps 1000 \
@@ -76,7 +76,7 @@ RESUME_TASK = 4   # task cuối đã hoàn thành
 !python src/models/adaslot/train.py \
     --phase all \
     --device cuda \
-    --num_classes 10 \
+    --num_classes 20 \
     --task_p1_steps 2000 \
     --task_p2_steps 2000 \
     --task_p2b_steps 1000 \

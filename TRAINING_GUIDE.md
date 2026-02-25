@@ -2,37 +2,62 @@
 
 ## Overview
 
-The pipeline trains in **4 sequential phases**. Each phase freezes earlier components and builds on them.
+The pipeline trains in **4 sequential phases**. The default mode (`--phase all`) follows the
+**CompSLOT protocol**: for every continual task, all four phases run in order on that task's
+data before moving to the next task. Weights carry forward across tasks with no
+re-initialisation.
 
 ```
-Phase 1    AdaSlot pretraining (unsupervised)       ~500k steps   -> checkpoints/adaslot/adaslot_final.pth
-Phase 2    Agent DINO training (self-supervised)    ~100k steps   -> checkpoints/agents/agents_final.pth
-Phase 2.5  Estimator training (VAE + MLP)           ~20k steps    -> checkpoints/estimators/estimators_final.pth
-Phase 3    Filter -> UCB MoE -> CRP (continual)     1 pass/task   -> checkpoints/ucb_moe_state.npz
+────────────────────────────────────────────────────────────────
+ CompSLOT mode  (--phase all, default)
+────────────────────────────────────────────────────────────────
+ for each task t = 0 … T-1:
+   Phase 1    fine-tune AdaSlot on task t data     (--task_p1_steps, default 2000)
+   Phase 2    fine-tune Agents on task t data      (--task_p2_steps, default 2000)
+   Phase 2.5  fine-tune Estimators on task t data  (--task_p2b_steps, default 1000)
+   Phase 3    update CRP aggregator on task t data (online, 1 pass)
+   → eval on all tasks 0 … t
+   → save checkpoints/task{t}/
+────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────
+ Single-phase mode  (--phase 1 / 2 / 2.5 / 3)
+────────────────────────────────────────────────────────────────
+ Phase 1    AdaSlot pretraining over ALL tasks  (~500k steps)  → checkpoints/adaslot/adaslot_final.pth
+ Phase 2    Agent DINO training over ALL tasks  (~100k steps)  → checkpoints/agents/agents_final.pth
+ Phase 2.5  Estimator training over ALL tasks   (~20k steps)   → checkpoints/estimators/estimators_final.pth
+ Phase 3    CRP aggregator — per-task loop                     → checkpoints/ucb_moe_state.npz
+────────────────────────────────────────────────────────────────
 ```
 
-All phases use the same entry point: `src/models/adaslot/train.py`.
+All phases share the same entry point: `src/models/adaslot/train.py`.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Full pipeline (all 4 phases):
-python src/models/adaslot/train.py --phase all --device cuda --num_classes 20
+# ── CompSLOT: per-task sequential fine-tuning (recommended) ──────────
+python src/models/adaslot/train.py \
+  --phase all \
+  --device cuda \
+  --num_classes 10 \
+  --task_p1_steps 2000 \
+  --task_p2_steps 2000 \
+  --task_p2b_steps 1000
 
-# Individual phases:
+# ── Single-phase runs (original behaviour) ───────────────────────────
 python src/models/adaslot/train.py --phase 1
 python src/models/adaslot/train.py --phase 2   --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth
-python src/models/adaslot/train.py --phase 2.5 --agent_ckpt checkpoints/agents/agents_final.pth
+python src/models/adaslot/train.py --phase 2.5 --agent_ckpt   checkpoints/agents/agents_final.pth
 python src/models/adaslot/train.py --phase 3   --estimator_ckpt checkpoints/estimators/estimators_final.pth
 ```
 
 ---
 
-## Phase 1: AdaSlot Pretraining
+## Phase 1: AdaSlot Pretraining / Fine-Tuning
 
-**What trains:** AdaSlot (CNN encoder + SlotAttention + Gumbel pruning + decoder).
+**What trains:** AdaSlot (CNN encoder + SlotAttention + Gumbel pruning + decoder).  
 **Supervision:** Reconstruction loss (fully unsupervised, no labels).
 
 ### Objective
@@ -49,47 +74,38 @@ sparsity_weight = 10.0   (encourages pruning inactive slots)
 | Setting | Value |
 |---------|-------|
 | Optimiser | Adam |
-| Learning rate | 4e-4 |
+| Learning rate | 4e-4 (`--p1_lr`) |
 | Scheduler | linear warmup (10k steps) then exp decay |
 | Grad clip | max_norm=1.0 |
-| Default steps | 500,000 |
-| Batch size | 64 |
+| Steps — single-phase | 500,000 (`--p1_steps`) |
+| Steps — per-task (CompSLOT) | 2,000 (`--task_p1_steps`) |
 
 ### Key Outputs
 
-- Input: 3-channel image at 128x128
-- Outputs: `slots (B, S, 64)` and `hard_keep_decision (B, num_slots)` in {0,1}
+- Input: 3-channel image at 128×128
+- Outputs: `slots (B, S, 64)` and `hard_keep_decision (B, S)` in {0,1}
 - Slots with `hard_keep_decision == 0` are **dropped** in all downstream phases
 
-### Checkpoint
+### Checkpoints
 
 ```
-checkpoints/adaslot/adaslot_final.pth
-  Keys: model_state_dict, optimizer_state_dict, scheduler_state_dict, loss, step
-```
-
-### CLI
-
-```bash
-python src/models/adaslot/train.py \
-  --phase 1 \
-  --steps 500000 \
-  --batch_size 64 \
-  --lr 4e-4
+Single-phase:   checkpoints/adaslot/adaslot_final.pth
+CompSLOT task t: checkpoints/adaslot/task{t}/adaslot_final.pth
+                 checkpoints/task{t}/adaslot.pth          (combined save)
 ```
 
 ---
 
-## Phase 2: Agent DINO Training
+## Phase 2: Agent DINO Training / Fine-Tuning
 
-**What trains:** 50 ResidualMLPAgent student+teacher pairs via DINO self-supervised loss.
+**What trains:** 50 ResidualMLPAgent student+teacher pairs via DINO self-supervised loss.  
 **AdaSlot is FROZEN.**
 
 ### Objective
 
 ```
-DINO loss between student and teacher outputs on slot tokens.
-Teacher updated via EMA (not gradient): theta_teacher = 0.996 * theta_teacher + 0.004 * theta_student
+DINO loss between student and teacher on slot tokens.
+Teacher EMA: θ_teacher = 0.996 * θ_teacher + 0.004 * θ_student
 ```
 
 ### Architecture
@@ -97,245 +113,195 @@ Teacher updated via EMA (not gradient): theta_teacher = 0.996 * theta_teacher + 
 ```
 slot (B, 64)
   -> Linear(64->256) + LayerNorm
-  -> 3x ResidualBlock(256)
+  -> 3× ResidualBlock(256)
   -> DINO head: Linear(256->256->128->256)
   -> softmax -> hidden label (B, 256)
 ```
-
-### Efficiency Trick
-
-Each step randomly samples **5 out of 50 agents** to update. After 100k steps all agents are
-trained substantially even with partial sampling.
 
 ### Optimiser
 
 | Setting | Value |
 |---------|-------|
 | Optimiser | AdamW |
-| Learning rate | 1e-3 |
+| Learning rate | 1e-3 (`--p2_lr`) |
 | Weight decay | 0.04 |
-| Scheduler | warmup (5k) then exp decay (rate 0.5 per 50k) |
+| Scheduler | warmup (5k) then exp decay |
 | EMA momentum | 0.996 |
-| student_temp | 0.1 |
-| teacher_temp | 0.07 |
-| center_momentum | 0.9 |
-| Default steps | 100,000 |
+| Steps — single-phase | 100,000 (`--p2_steps`) |
+| Steps — per-task (CompSLOT) | 2,000 (`--task_p2_steps`) |
+| Agents per step | 5 / 50 (random sample) |
 
-### Checkpoint
+### Checkpoints
 
 ```
-checkpoints/agents/agents_final.pth
-  Keys: student_agents_state_dict, teacher_agents_state_dict, optimizer_state_dict, step
-```
-
-### CLI
-
-```bash
-python src/models/adaslot/train.py \
-  --phase 2 \
-  --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth \
-  --agent_steps 100000
+Single-phase:    checkpoints/agents/agents_final.pth
+CompSLOT task t: checkpoints/agents/task{t}/agents_final.pth
+                 checkpoints/task{t}/agents.pth
 ```
 
 ---
 
-## Phase 2.5: Estimator Training (NEW)
+## Phase 2.5: Estimator Training / Fine-Tuning
 
-**What trains:** 50 VAEEstimators (one per agent) + 1 shared MLPEstimator.
+**What trains:** 50 VAEEstimators + 1 shared MLPEstimator.  
 **AdaSlot + Agents are FROZEN.**
 
-### Why Estimators?
-
-In Phase 3, for each slot we need to select the most relevant agents from a pool of 50.
-Running all 50 agents per slot is expensive. The estimators learn a **fast proxy score**
-that approximates how well each agent will perform on a given slot, using only a
-forward pass through a tiny VAE/MLP — much cheaper than running the agent.
-
 ### Quality Signal
-
-The supervision target for training is the **normalised confidence** of each agent's output:
 
 ```
 quality_i(slot) = 1 - H(agent_i(slot)) / log(num_prototypes)
 
-H(p) = -sum_k p_k * log(p_k + 1e-8)   (entropy)
-
-Interpretation:
-  peaked softmax -> low entropy -> high quality (~1.0)
-  uniform softmax -> max entropy -> low quality (~0.0)
+peaked softmax -> low entropy -> high quality (~1.0)
+uniform softmax -> max entropy -> low quality (~0.0)
 ```
 
 ### VAEEstimator (50 instances)
 
 ```
-Architecture:
-  Encoder: Linear(64->64) -> ReLU -> Linear(64->32) -> ReLU -> fc_mu(16) + fc_logvar(16)
-  Decoder: Linear(16->32) -> ReLU -> Linear(32->64) -> ReLU -> Linear(64->64)
+Encoder: Linear(64->64) -> ReLU -> Linear(64->32) -> ReLU -> fc_mu(16) + fc_logvar(16)
+Decoder: Linear(16->32) -> ReLU -> Linear(32->64) -> ReLU -> Linear(64->64)
 
-Loss (quality-weighted):
-  L_vae = sum_i quality_i * MSE(recon_i, slot)  +  beta * KL(z || N(0,1))
-  beta = 0.5
-
-Score at inference:
-  score = sigmoid(threshold - MSE(recon, slot))   in [0,1]
-  Low reconstruction error -> agent understands this slot -> high score
+Loss: sum_i quality_i * MSE(recon_i, slot) + 0.5 * KL(z || N(0,1))
+Score at inference: sigmoid(threshold - MSE(recon, slot))
 ```
 
-### MLPEstimator (1 shared instance)
+### MLPEstimator (1 shared)
 
 ```
 Input: concat[slot(64), Embedding(agent_id)(32)] = 96-dim
-MLP:
-  Linear(96->128) -> LayerNorm -> ReLU -> Dropout(0.1)
-  Linear(128->64) -> LayerNorm -> ReLU -> Dropout(0.1)
-  Linear(64->1)   -> Sigmoid
-
-Loss: MSE(predicted_quality, true_quality)
-```
-
-### Training Loop
-
-```python
-# For each step:
-sampled_agents = random.sample(range(50), k=10)   # 10/50 per step
-
-for agent_id in sampled_agents:
-    with torch.no_grad():
-        slot_output = agents[agent_id](active_slots)
-    quality = 1 - entropy(slot_output) / log(256)
-
-    # VAE
-    recon, mu, logvar = vae_estimators[agent_id](active_slots)
-    L_vae = (quality * MSE(recon, active_slots)).mean() + 0.5 * KL
-
-    # MLP
-    pred_quality = mlp_estimator(active_slots, agent_id)
-    L_mlp = MSE(pred_quality, quality)
+MLP:   Linear(96->128) -> LN -> ReLU -> Linear(128->64) -> LN -> ReLU -> Linear(64->1) -> Sigmoid
+Loss:  MSE(predicted_quality, true_quality)
 ```
 
 ### Optimiser
 
 | Setting | Value |
 |---------|-------|
-| Optimiser (VAE) | Adam, lr=1e-3 |
-| Optimiser (MLP) | Adam, lr=1e-3 |
-| Default steps | 20,000 |
+| Optimiser | Adam, lr=1e-3 (`--p2b_lr`) |
+| Steps — single-phase | 20,000 (`--p2b_steps`) |
+| Steps — per-task (CompSLOT) | 1,000 (`--task_p2b_steps`) |
 | Agents per step | 10 / 50 |
 
-### Checkpoint
+### Checkpoints
 
 ```
-checkpoints/estimators/estimators_final.pth
-  Keys: vae_estimators (list of state_dicts), mlp_estimator (state_dict), step
-```
-
-### CLI
-
-```bash
-python src/models/adaslot/train.py \
-  --phase 2.5 \
-  --agent_ckpt checkpoints/agents/agents_final.pth \
-  --p2b_steps 20000 \
-  --p2b_lr 1e-3
+Single-phase:    checkpoints/estimators/estimators_final.pth
+CompSLOT task t: checkpoints/estimators/task{t}/estimators_final.pth
+                 checkpoints/task{t}/estimators.pth
 ```
 
 ---
 
-## Phase 3: Filter -> UCB MoE -> CRP (Continual Learning)
+## Phase 3: Filter → UCB MoE → Cross-Attention CRP (Continual Learning)
 
-**What trains/updates:** CRPExpertAggregator (online per-task) + UCBWeightedMoE (online per-sample).
-**AdaSlot + Agents + Estimators are FROZEN.**
+**What trains/updates:** `CRPExpertAggregator` (online, per-task) + `UCBWeightedMoE` (online, per-sample).  
+**AdaSlot + Agents + Estimators are FROZEN in this phase.**
 
-### Full Pipeline Per Slot
+### Feature Extraction Per Slot
 
 ```
 slot (64)
   -> hybrid_score[50] = 0.5*VAE_score + 0.5*MLP_score
-  -> top-10 filtered_ids          (top-K fast filter)
-  -> weights[10] = UCBWeightedMoE.get_weights(filtered_ids)
-  -> weighted_out = sum_i w_i * agent_i(slot)    ->  (256,)
-```
+  -> top-K filtered_ids                               (--filter_k, default 10)
+  -> weights[K] = UCBWeightedMoE.get_weights(filtered_ids)
+  -> weighted_out = Σ w_i * agent_i(slot)   ->  (256,)
 
-### Feature Assembly
-
-```python
-# For each image:
-outputs = []
-for s in range(num_active_slots):
-    scores = _estimate_agent_scores(slots[s], vae_estimators, mlp_estimator, num_agents=50)
-    _, topk_ids = torch.topk(scores, k=filter_k)           # filter_k=10
-
-    agent_ids, weights = ucb_moe.get_weights(topk_ids.tolist())
-    weighted_out = sum(w * agents[i](slot_s) for i, w in zip(agent_ids, weights))
-    outputs.append(weighted_out)
-
-feature = torch.cat(outputs)   # (S * 256,) = 2816-dim
+Feature = stack(weighted_out[0 .. S-1])   shape: (S, 256)   <- input to cross-attention
 ```
 
 ### UCB Weighted MoE
 
 ```
-UCB(i) = mu_i + c * sqrt(ln t / n_i)
+UCB(i) = μ_i + c * √(ln t / n_i)
+  c = exploration_constant (--ucb_exploration, default √2 = 1.414)
 
-  mu_i = empirical mean reward   (initialised 0)
-  n_i  = rounds agent i participated in
-  t    = total rounds
-  c    = exploration_constant = sqrt(2) = 1.414
-
-Burn-in (t < burn_in=100):
-  weights = [1/K for each filtered agent]   (pure exploration)
-
-Post burn-in:
-  weights = softmax(UCB_scores / temperature)   (sum to 1)
+Burn-in (t < burn_in):   uniform weights
+Post burn-in:            weights = softmax(UCB_scores)
 ```
 
-### CRP Routing
+### CRP Expert Aggregator — MoE Cross-Attention
+
+Each expert holds **learnable query embeddings** (not prototype centroids).
+Routing uses attention entropy as an out-of-distribution signal.
 
 ```
-Score(k) = Similarity(feature, prototype_k)
-         * Alignment(grad_new, grad_memory_k)
-         * Capacity(k)
+LearnableExpert:
+  queries  ∈ ℝ^{n_queries × d}          # expert identity (learnable parameter)
+  key_proj : Linear(agent_dim → d)
+  val_proj : Linear(agent_dim → d)
 
-Capacity(k) = exp(-beta * n_classes_k / ideal_classes_per_expert)
+  forward(H: S×D):
+    K = key_proj(H)                      # S×d
+    V = val_proj(H)                      # S×d
+    A = softmax(queries @ Kᵀ / √d)       # n_queries × S
+    z = mean(A @ V)                      # (d,)
+    entropy = -Σ A·logA                  # OOD signal
 
-If best_score < score_threshold (0.05):
-    With prob alpha / (N + alpha): create new expert
-    Else: assign to best existing expert
+CRPExpertAggregator:
+  class_queries ∈ ℝ^{num_classes × d}   # per-class learnable codes
+
+  Routing (inference):
+    all_z, scores, entropy = forward_all_experts(H)
+    repr = softmax(scores) · all_z       # MoE-gated aggregation
+    logits = repr @ class_queriesᵀ
+
+  CRP trigger (training):
+    if mean(entropy) > threshold AND Bernoulli(α / (N + α)):
+        create new LearnableExpert()
+
+  Loss:
+    CE(logits[seen_classes], y)  — backprop through cross-attention
+    old class_queries frozen at task boundary (freeze_old_classes)
 ```
 
-### Reward Feedback
+### Task Boundary
+
+At the start of each task (CompSLOT mode) the aggregator's old class query vectors are frozen
+so past knowledge is preserved while new classes can still be learned:
 
 ```python
-# After each prediction:
-reward = 1.0 if (pred_label == true_label) else 0.0
+aggregator._agg.freeze_old_classes(set(new_task_class_ids))
+```
+
+### Reward Feedback to UCB
+
+```python
+reward = 1.0 if pred == true_label else 0.0
 ucb_moe.update_batch(filtered_ids, weights, reward)
-# Agent i receives: local_reward = reward * w_i
-# This credits agents proportional to their committee weight
+# agent i receives: local_reward = reward * w_i
 ```
 
-### Continual Multi-Task Loop
+### Continual Task Loop
 
 ```python
-aggregator = CRPExpertAggregator(...)   # single object across all tasks
-ucb_moe    = UCBWeightedMoE(...)        # single object across all tasks
+# CompSLOT mode — simplified pseudo-code
+aggregator = None
+ucb_moe    = UCBWeightedMoE(...)
 
-for task_id in range(n_tasks):
-    # Train on new task
-    for batch in train_loaders[task_id]:
-        feature = _extract_weighted_features(batch, ...)
-        pred, reward = aggregator.predict_and_learn(feature, label)
-        ucb_moe.update_batch(...)
+for task_id, task_loader in enumerate(train_loaders):
+    # ── per-task fine-tuning ──────────────────────────────
+    train_phase1_adaslot(adaslot, task_loader, steps=task_p1_steps)
+    train_phase2_agents(adaslot, agents, task_loader, steps=task_p2_steps)
+    train_phase2b_estimators(adaslot, agents, task_loader, steps=task_p2b_steps)
 
-    # Evaluate cumulatively
+    # ── freeze old classes, then learn new ones ───────────
+    if aggregator:
+        aggregator._agg.freeze_old_classes(class_order[task_id])
+
+    aggregator = train_phase3_crp(
+        adaslot_model=adaslot,
+        student_agents=agents,
+        dataloader=task_loader,
+        aggregator=aggregator,   # None on first task → creates fresh
+        ...
+    )
+
+    # ── cumulative evaluation ─────────────────────────────
     for eval_task in range(task_id + 1):
-        acc = evaluate(aggregator, test_loaders[eval_task], ...)
-        print(f"Task {eval_task} acc: {acc:.4f}")
-
-# Save UCB state
-ucb_moe.save("checkpoints/ucb_moe_state.npz")
+        acc = evaluate(aggregator, test_loaders[eval_task])
 ```
 
-### Task Scheduling (CIFAR-100)
+### Task Scheduling (CIFAR-100 default)
 
 | `--num_classes` | Tasks (n_tasks) | Classes per task |
 |-----------------|-----------------|------------------|
@@ -344,70 +310,76 @@ ucb_moe.save("checkpoints/ucb_moe_state.npz")
 | 50 | 2 | 50 |
 | 100 | 1 | 100 |
 
-### Why `test_loaders[0..task_id]` is cumulative?
-
-Each `test_loaders[i]` contains all classes from tasks 0 through i. This tests:
-- **Plasticity**: accuracy on the current task
-- **Stability**: accuracy on old tasks (catastrophic forgetting check)
-
-### CLI
-
-```bash
-python src/models/adaslot/train.py \
-  --phase 3 \
-  --estimator_ckpt checkpoints/estimators/estimators_final.pth \
-  --filter_k 10 \
-  --ucb_exploration 1.414 \
-  --ucb_burn_in 100 \
-  --num_classes 20
-```
-
 ---
 
-## Full Pipeline Command
+## Full Pipeline Commands
+
+### CompSLOT (per-task sequential — recommended)
 
 ```bash
 python src/models/adaslot/train.py \
   --phase all \
   --device cuda \
-  --num_classes 20 \
-  --steps 500000 \
-  --agent_steps 100000 \
-  --p2b_steps 20000 \
+  --num_classes 10 \
+  --task_p1_steps 2000 \
+  --task_p2_steps 2000 \
+  --task_p2b_steps 1000 \
+  --p1_lr 4e-4 \
+  --p2_lr 1e-3 \
   --p2b_lr 1e-3 \
   --filter_k 10 \
   --ucb_exploration 1.414 \
   --ucb_burn_in 100 \
-  --batch_size 64
+  --batch_size 8
+```
+
+### Original (all tasks combined, then phase 3 loop)
+
+```bash
+python src/models/adaslot/train.py --phase 1 --p1_steps 500000 --device cuda
+python src/models/adaslot/train.py --phase 2 --p2_steps 100000 \
+    --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth
+python src/models/adaslot/train.py --phase 2.5 --p2b_steps 20000 \
+    --agent_ckpt checkpoints/agents/agents_final.pth
+python src/models/adaslot/train.py --phase 3 \
+    --estimator_ckpt checkpoints/estimators/estimators_final.pth \
+    --filter_k 10 --num_classes 10
 ```
 
 ---
 
 ## Complete Parameter Reference
 
-| Parameter | Default | Phase | Description |
-|-----------|---------|-------|-------------|
-| `--phase` | `all` | — | Which phase(s) to run |
-| `--device` | `cuda` | — | Compute device |
-| `--batch_size` | `64` | 1/2/2.5/3 | Batch size |
-| `--steps` | `500000` | 1 | AdaSlot training steps |
-| `--lr` | `4e-4` | 1 | AdaSlot learning rate |
-| `--num_slots` | `11` | 1 | Max slot count |
-| `--slot_dim` | `64` | 1 | Slot embedding dimension |
-| `--adaslot_ckpt` | — | 2/2.5/3 | AdaSlot checkpoint to load |
-| `--num_agents` | `50` | 2/2.5/3 | Agent pool size |
-| `--num_prototypes` | `256` | 2/2.5/3 | DINO output dimension |
-| `--agent_steps` | `100000` | 2 | Agent DINO training steps |
-| `--agent_ckpt` | — | 2.5/3 | Agent pool checkpoint to load |
-| `--p2b_steps` | `20000` | 2.5 | Estimator training steps |
+| Parameter | Default | Mode | Description |
+|-----------|---------|------|-------------|
+| `--phase` | `all` | — | `all`=CompSLOT, `1/2/2.5/3`=single-phase |
+| `--device` | auto | — | `cuda` / `mps` / `cpu` |
+| `--batch_size` | `8` | all | Batch size |
+| `--num_slots` | `11` | all | Max slot count |
+| `--slot_dim` | `64` | all | Slot embedding dimension |
+| `--num_agents` | `50` | all | Agent pool size |
+| `--num_prototypes` | `256` | all | DINO output dimension |
+| `--num_classes` | `10` | 3/all | Classes per continual task |
+| `--resolution` | `128` | all | Input image resolution |
+| `--pretrained` | `CLEVR10` | all | Pretrained AdaSlot weights |
+| `--adaslot_ckpt` | — | 2/2.5/3 | Path to AdaSlot checkpoint |
+| `--agent_ckpt` | — | 2.5/3 | Path to agent checkpoint |
+| `--estimator_ckpt` | — | 3 | Path to estimator checkpoint |
+| **Single-phase steps** | | | |
+| `--p1_steps` | `500000` | `--phase 1` | AdaSlot training steps |
+| `--p2_steps` | `100000` | `--phase 2` | Agent DINO training steps |
+| `--p2b_steps` | `20000` | `--phase 2.5` | Estimator training steps |
+| `--p1_lr` | `4e-4` | 1 | AdaSlot learning rate |
+| `--p2_lr` | `1e-3` | 2 | Agent learning rate |
 | `--p2b_lr` | `1e-3` | 2.5 | Estimator learning rate |
-| `--estimator_ckpt` | — | 3 | Estimator checkpoint to load |
-| `--filter_k` | `10` | 3 | Top-K agents after fast filtering |
-| `--ucb_exploration` | `1.414` | 3 | UCB exploration constant c |
-| `--ucb_burn_in` | `100` | 3 | Burn-in rounds (uniform weights) |
-| `--num_classes` | `20` | 3 | Classes per continual task |
-| `--alpha` | `1.0` | 3 | CRP concentration parameter |
-| `--max_experts` | `30` | 3 | Max CRP experts |
+| **Per-task steps (CompSLOT)** | | | |
+| `--task_p1_steps` | `2000` | `--phase all` | Phase 1 fine-tune steps per task |
+| `--task_p2_steps` | `2000` | `--phase all` | Phase 2 fine-tune steps per task |
+| `--task_p2b_steps` | `1000` | `--phase all` | Phase 2.5 fine-tune steps per task |
+| **Phase 3 / Aggregator** | | | |
+| `--filter_k` | `10` | 3/all | Top-K agents after fast filtering |
+| `--ucb_exploration` | `1.414` | 3/all | UCB exploration constant c |
+| `--ucb_burn_in` | `100` | 3/all | Burn-in rounds (uniform weights) |
 
 ---
 
@@ -415,61 +387,76 @@ python src/models/adaslot/train.py \
 
 ```
 IMAGE
-  |
-  v
-[Phase 1] AdaSlot (unsupervised, frozen after)
-  | slots (S, 64)
-  v
-[Phase 2] Agent Pool (DINO SSL, frozen after)
-  | hidden labels (50 agents x 256)
-  v
-[Phase 2.5] Estimators (quality-signal supervised, frozen after)
-  | quality scores (50,)
-  v
-[Phase 3] UCB Weighted MoE (online bandit update)
-  | weighted feature (S x 256 = 2816)
-  v
-[Phase 3] CRP Expert Aggregator (online continual learning)
-  |
-  v
-PREDICTION
+  │
+  ▼
+[Phase 1] AdaSlot — fine-tuned on each task (CompSLOT) or pretrained once
+  │ slots (S, 64) — inactive slots pruned by Gumbel gate
+  ▼
+[Phase 2] Agent Pool — fine-tuned on each task (CompSLOT) or trained once
+  │ hidden labels  (50 agents × 256)
+  ▼
+[Phase 2.5] Estimators — fine-tuned on each task (CompSLOT) or trained once
+  │ quality scores (50,)
+  ▼
+[Phase 3] UCB Weighted MoE — online bandit, persists across tasks
+  │ weighted feature (S, 256)
+  ▼
+[Phase 3] CRP Expert Aggregator — learnable cross-attention experts
+  │   LearnableExpert: queries ∈ ℝ^{n_q × d}  ×  cross-attention over (S, 256)
+  │   class_queries  ∈ ℝ^{C × d}   (old classes frozen at task boundary)
+  │   routing: attention entropy → CRP new-expert trigger
+  ▼
+PREDICTION  (logits = repr @ class_queriesᵀ)
 ```
 
 ---
 
 ## Estimated Training Times (GPU)
 
-| Phase | Steps | Approx. Time |
-|-------|-------|-------------|
-| Phase 1 | 500k | 4-6 hours |
-| Phase 2 | 100k | 1-2 hours |
-| Phase 2.5 | 20k | 20-30 minutes |
-| Phase 3 | 1 epoch/task | 10-30 minutes total |
-| **Total** | — | **~7-10 hours** |
+| Mode | Phase | Steps/task | Approx. time |
+|------|-------|------------|-------------|
+| Single-phase | Phase 1 | 500k total | 4–6 h |
+| Single-phase | Phase 2 | 100k total | 1–2 h |
+| Single-phase | Phase 2.5 | 20k total | 20–30 min |
+| Single-phase | Phase 3 | 1 epoch/task | 10–30 min |
+| **Single-phase total** | | | **~7–10 h** |
+| CompSLOT | Phase 1 ft | 2k/task | ~2 min/task |
+| CompSLOT | Phase 2 ft | 2k/task | ~2 min/task |
+| CompSLOT | Phase 2.5 ft | 1k/task | ~1 min/task |
+| CompSLOT | Phase 3 | 1 epoch/task | ~5 min/task |
+| **CompSLOT total (10 tasks)** | | | **~1–1.5 h** |
 
-Times assume NVIDIA V100/A100, batch_size=64, CIFAR-100 at 128x128.
+Times assume NVIDIA V100/A100, batch_size=8, CIFAR-100 at 128×128.
 
 ---
 
 ## Checkpoint Loading Examples
 
 ```python
+import torch
 from src.models.adaslot.train import (
     train_phase1_adaslot,
     train_phase2_agents,
     train_phase2b_estimators,
-    train_phase3_crp
+    train_phase3_crp,
 )
-from src.slot_multi_agent import UCBWeightedMoE
 
-# Load trained estimators for Phase 3
-ckpt = torch.load("checkpoints/estimators/estimators_final.pth")
-for i, vae in enumerate(vae_estimators):
-    vae.load_state_dict(ckpt["vae_estimators"][i])
-mlp_estimator.load_state_dict(ckpt["mlp_estimator"])
+# Resume CompSLOT from task checkpoint
+task_id = 3
+ckpt_dir = f"checkpoints/task{task_id}"
 
-# Create UCB MoE
+adaslot.load_state_dict(
+    torch.load(f"{ckpt_dir}/adaslot.pth")["model"])
+student_agents.load_state_dict(
+    torch.load(f"{ckpt_dir}/agents.pth")["student_agents"])
+
+est = torch.load(f"{ckpt_dir}/estimators.pth")
+vae_estimators.load_state_dict(est["vae_estimators"])
+mlp_estimator.load_state_dict(est["mlp_estimator"])
+
+# Load UCB state
+from src.slot_multi_agent.bandit_selector import UCBWeightedMoE
 ucb_moe = UCBWeightedMoE(num_agents=50, exploration_constant=1.414, burn_in=100)
-# Or load saved state:
 ucb_moe.load("checkpoints/ucb_moe_state.npz")
 ```
+

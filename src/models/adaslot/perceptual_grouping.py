@@ -5,6 +5,18 @@ Mirrors: ocl.perceptual_grouping.SlotAttentionGumbelV1 and SlotAttentionGrouping
 Checkpoint key prefix: models.perceptual_grouping.slot_attention.*
 """
 
+
+def gumbel_temperature_schedule(step: int) -> float:
+    """Anneal Gumbel-Softmax temperature from 5.0 → 0.1 over ~100 k steps.
+
+    High tau (early training) → softer decisions, smoother gradients.
+    Low tau (late training)   → harder decisions, matches discrete inference.
+
+    Formula: tau = max(0.1, 5.0 × 0.5^(step / 30_000))
+    Milestones: step 0 → 5.0 | step 30k → 2.5 | step 90k → ~0.6 | step 150k → ~0.2
+    """
+    return max(0.1, 5.0 * (0.5 ** (step / 30_000)))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

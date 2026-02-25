@@ -20,26 +20,35 @@ def build_grid_of_positions(resolution: Tuple[int, int]) -> torch.Tensor:
 
 
 def get_slotattention_decoder_backbone(
-    object_dim: int, output_dim: int = 4
+    object_dim: int, output_dim: int = 4, n_upsample: int = 4
 ) -> nn.Sequential:
     """
     CNN decoder backbone from the original Slot Attention paper.
 
-    Architecture: 4x ConvTranspose2d(stride=2) + 1x ConvTranspose2d(stride=1) + final Conv.
+    Broadcasts slots from an 8×8 base grid up to ``8 * 2**n_upsample`` pixels.
+    Default n_upsample=4 → 128×128 output (matches original paper + pretrained ckpt).
+    Use n_upsample=3 for 64×64, n_upsample=5 for 256×256, etc.
+
+    Architecture: n_upsample × ConvTranspose2d(stride=2)
+                  + 1 × ConvTranspose2d(stride=1)  (refinement)
+                  + 1 × final Conv
     """
-    return nn.Sequential(
-        nn.ConvTranspose2d(object_dim, 64, 5, stride=2, padding=2, output_padding=1),
-        nn.ReLU(inplace=True),
-        nn.ConvTranspose2d(64, 64, 5, stride=2, padding=2, output_padding=1),
-        nn.ReLU(inplace=True),
-        nn.ConvTranspose2d(64, 64, 5, stride=2, padding=2, output_padding=1),
-        nn.ReLU(inplace=True),
-        nn.ConvTranspose2d(64, 64, 5, stride=2, padding=2, output_padding=1),
-        nn.ReLU(inplace=True),
+    import math
+    layers: list = []
+    in_ch = object_dim
+    for _ in range(n_upsample):
+        layers += [
+            nn.ConvTranspose2d(in_ch, 64, 5, stride=2, padding=2, output_padding=1),
+            nn.ReLU(inplace=True),
+        ]
+        in_ch = 64
+    # Refinement (stride=1)
+    layers += [
         nn.ConvTranspose2d(64, 64, 5, stride=1, padding=2, output_padding=0),
         nn.ReLU(inplace=True),
         nn.ConvTranspose2d(64, output_dim, 3, stride=1, padding=1, output_padding=0),
-    )
+    ]
+    return nn.Sequential(*layers)
 
 
 def get_activation_fn(name: Union[str, Callable]):

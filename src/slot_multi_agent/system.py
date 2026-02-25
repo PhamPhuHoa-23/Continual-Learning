@@ -112,10 +112,13 @@ class SlotMultiAgentSystem(nn.Module):
                 for i in range(num_agents)
             ]).to(device)
         elif estimator_type == 'mlp':
-            # Shared MLP estimator (conditioned on agent_id)
-            self.estimators = [
-                MLPEstimator(num_agents=num_agents, slot_dim=slot_dim).to(device)
-            ] * num_agents
+            # FIX #2: separate MLPEstimator instances in an nn.ModuleList
+            # (using [x] * N creates N aliases to the same object and is not
+            # registered in state_dict)
+            self.estimators = nn.ModuleList([
+                MLPEstimator(num_agents=num_agents, slot_dim=slot_dim)
+                for _ in range(num_agents)
+            ]).to(device)
         else:
             raise ValueError(f"Unknown estimator_type: {estimator_type}")
         

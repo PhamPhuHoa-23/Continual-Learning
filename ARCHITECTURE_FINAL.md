@@ -157,29 +157,55 @@ UCB state saved to `checkpoints/ucb_moe_state.npz`.
 
 ---
 
-### 5. CRP Expert Aggregator
+### 5. CRP Expert Aggregator — MoE Cross-Attention
 
 **Source:** `src/slot_multi_agent/aggregator.py`
 
-**Input dimension (pipeline mode):** `S x proto_dim = 11 x 256 = 2816`
+**Design:** Each expert holds a set of **learnable query embeddings** (not prototype
+centroids). Expert routing uses attention entropy as an OOD signal; a high-entropy
+response means no expert "owns" this input → CRP spawns a new expert. Classification
+uses per-class learnable query vectors that attend to the aggregated representation.
 
 ```
-Score(k) = Similarity(x, proto_k)
-         * Alignment(grad_new, grad_memory_k)
-         * Capacity(k) = exp(-beta * n_classes_k / ideal)
+LearnableExpert:
+    queries  ∈ ℝ^{n_queries × d}             # expert identity (learnable)
+    key_proj : Linear(agent_dim → d)
+    val_proj : Linear(agent_dim → d)
 
-New expert: if best_score < threshold  AND  Bernoulli(alpha / (N + alpha))
-GPM: new gradients projected orthogonal to past task subspaces
+    forward(H: B×S×D):
+        K = key_proj(H)                       # B×S×d
+        V = val_proj(H)                       # B×S×d
+        A = softmax(queries @ K^T / √d)       # n_q × S
+        z = mean(A @ V)                       # (d,) aggregated repr
+        H_e = -(A * log A+ε).sum()            # entropy (OOD signal)
+
+CRPExpertAggregator:
+    class_queries ∈ ℝ^{num_classes × d}       # per-class learnable codes
+
+    routing (inference):
+        all_z, all_scores, all_H = forward_all_experts(H)
+        repr = MoE_aggregate(all_z, all_scores)   # softmax-gated sum
+        logits = repr @ class_queries^T
+
+    CRP trigger (training):
+        if mean(entropy) > threshold AND Bernoulli(α / (N + α)):
+            create new LearnableExpert()
+
+    loss:
+        CE(logits[seen_classes], y)  — backprop through cross-attention
+        old class_queries frozen at task boundary (freeze_old_classes)
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `num_slots` | `S` | Number of slots (=sequence length for cross-attention) |
+| `agent_dim` | `proto_dim` | Agent output dimension (=key/value input dim) |
+| `embed_dim` | 256 | Cross-attention hidden size |
+| `n_queries` | 8 | Learnable queries per expert |
 | `alpha` | 1.0 | CRP concentration |
 | `max_experts` | 30 | Hard expert cap |
-| `score_threshold` | 0.05 | Min score to reuse expert |
-| `projection_rank` | 10 | GPM subspace rank |
-| `capacity_beta` | 1.5 | Load-balance penalty |
-| `prototype_momentum` | 0.95 | EMA for prototype update |
+| `entropy_threshold` | 3.0 | nats — above this triggers CRP check |
+| `num_classes` | — | Total class capacity |
 
 ---
 

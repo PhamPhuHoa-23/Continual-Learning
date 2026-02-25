@@ -64,7 +64,12 @@ from torchvision import datasets, transforms
 # ───────────────────────────────────────────────────────
 
 class ReconstructionLoss(nn.Module):
-    """MSE-sum reconstruction loss (from original Slot Attention paper)."""
+    """MSE reconstruction loss — mean over all elements, mean over batch.
+
+    FIX #1: changed from ``reduction='sum' / B`` (which scaled with H×W×C)
+    to ``reduction='mean'`` so the loss magnitude is resolution-independent
+    and SparsePenalty remains numerically comparable across image sizes.
+    """
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -72,9 +77,9 @@ class ReconstructionLoss(nn.Module):
             pred: (B, 3, H, W) reconstructed image
             target: (B, 3, H, W) original image
         Returns:
-            Scalar MSE-sum loss (sum over pixels, mean over batch).
+            Scalar MSE loss (mean over all pixels and batch).
         """
-        return F.mse_loss(pred, target, reduction='sum') / pred.shape[0]
+        return F.mse_loss(pred, target, reduction='mean')
 
 
 class SparsePenalty(nn.Module):
@@ -151,6 +156,10 @@ def train_phase1_adaslot(
     log_every: int = 100,
     device: str = "cuda",
     resume_ckpt: Optional[str] = None,
+    # FIX #5: accept pre-built optimizer/scheduler so Adam momentum buffers
+    # survive across tasks in CompSLOT mode.
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler=None,
 ):
     """
     Phase 1: Train AdaSlot to decompose images into object-centric slots.
@@ -167,8 +176,11 @@ def train_phase1_adaslot(
     for p in model.parameters():
         p.requires_grad_(True)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000)
+    # FIX #5: only create optimizer/scheduler when not provided by caller
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if scheduler is None:
+        scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000)
 
     recon_loss_fn = ReconstructionLoss()
     sparse_loss_fn = SparsePenalty(linear_weight=sparse_linear_weight)
@@ -178,6 +190,9 @@ def train_phase1_adaslot(
         ckpt = torch.load(resume_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        # FIX #4: restore scheduler state so LR curve continues correctly
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
         start_step = ckpt.get('step', 0)
         print(f"  Resumed from step {start_step}")
 
@@ -231,6 +246,7 @@ def train_phase1_adaslot(
                 'step': step + 1,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),   # FIX #4
             }, ckpt_path)
             print(f"  [SAVED] {ckpt_path}")
 
@@ -238,7 +254,8 @@ def train_phase1_adaslot(
     final_path = os.path.join(save_dir, "adaslot_final.pth")
     torch.save({'step': num_steps, 'model': model.state_dict()}, final_path)
     print(f"  [DONE] Phase 1 complete. Final checkpoint: {final_path}")
-    return final_path
+    # FIX #5: return optimizer and scheduler so CompSLOT loop can reuse them
+    return final_path, optimizer, scheduler
 
 
 # ───────────────────────────────────────────────────────
@@ -291,11 +308,17 @@ def train_phase2_agents(
         p.requires_grad_(False)
 
     num_prototypes = student_agents[0].num_prototypes
-    dino_loss_fn = DINOLoss(
-        num_prototypes=num_prototypes,
-        student_temp=student_temp,
-        teacher_temp=teacher_temp,
-    ).to(device)
+    num_agents_total = len(student_agents)
+    # FIX #4: per-agent DINO loss so each agent maintains its own center,
+    # preventing one agent's prototype collapse from corrupting others.
+    dino_loss_fns = nn.ModuleList([
+        DINOLoss(
+            num_prototypes=num_prototypes,
+            student_temp=student_temp,
+            teacher_temp=teacher_temp,
+        )
+        for _ in range(num_agents_total)
+    ]).to(device)
 
     optimizer = torch.optim.AdamW(student_agents.parameters(), lr=lr, weight_decay=0.04)
     scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=50000, warmup_steps=5000)
@@ -349,8 +372,8 @@ def train_phase2_agents(
             with torch.no_grad():
                 teacher_logits = teacher(active_slots, return_logits=True)
 
-            # DINO loss
-            loss = dino_loss_fn(student_logits, teacher_logits)
+            # DINO loss — use this agent's own loss function (separate center)
+            loss = dino_loss_fns[agent_idx.item()](student_logits, teacher_logits)
             total_loss = total_loss + loss
             num_losses += 1
 
@@ -384,7 +407,7 @@ def train_phase2_agents(
                 'step': step + 1,
                 'student_agents': student_agents.state_dict(),
                 'teacher_agents': teacher_agents.state_dict(),
-                'dino_center': dino_loss_fn.center,
+                'dino_loss_fns': dino_loss_fns.state_dict(),
             }, ckpt_path)
             print(f"  [SAVED] {ckpt_path}")
 
@@ -843,83 +866,83 @@ def train_phase3_crp(
     for epoch in range(epochs):
         if epochs > 1:
             print(f"  [Epoch {epoch + 1}/{epochs}]")
-        
-        for batch_idx, batch in enumerate(dataloader):
+
+        for batch_idx, batch in enumerate(dataloader):  # FIX #1: entire processing inside loop
             images = (batch[0].to(device) if isinstance(batch, (list, tuple))
-                  else batch['image'].to(device))
-        targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
+                      else batch['image'].to(device))
+            targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
 
-        with torch.no_grad():
-            # 1. Slots
-            adaslot_out = adaslot_model(images)
-            slots = adaslot_out['slots']              # (B, S, D)
+            with torch.no_grad():
+                # 1. Slots
+                adaslot_out = adaslot_model(images)
+                slots = adaslot_out['slots']              # (B, S, D)
 
-            B, S, D = slots.shape
+                B, S, D = slots.shape
 
-            # Compute scores for ALL slots in the batch at once to save time
-            if use_estimator_pipeline:
-                flat_slots = slots.reshape(B * S, D)
-                flat_scores = _estimate_agent_scores(
-                    flat_slots, vae_estimators, mlp_estimator, num_agents
+                # Compute scores for ALL slots in the batch at once to save time
+                if use_estimator_pipeline:
+                    flat_slots = slots.reshape(B * S, D)
+                    flat_scores = _estimate_agent_scores(
+                        flat_slots, vae_estimators, mlp_estimator, num_agents
+                    )
+                    batch_scores = flat_scores.reshape(B, S, num_agents)
+                else:
+                    batch_scores = None
+
+                # 2. Feature extraction (full pipeline or legacy)
+                features_t, all_committee_info = _extract_weighted_features_batch(
+                    slots=slots,
+                    batch_scores=batch_scores,
+                    student_agents=student_agents,
+                    ucb_moe=ucb_moe,
+                    filter_k=filter_k if use_estimator_pipeline else k,
+                    num_agents=num_agents,
+                    use_estimator_pipeline=use_estimator_pipeline,
                 )
-                batch_scores = flat_scores.reshape(B, S, num_agents)
+
+            # 3. Aggregator: predict, then learn
+            try:
+                if hasattr(aggregator, 'predict_batch'):
+                    preds = aggregator.predict_batch(features_t)
+                    correct = sum(
+                        1 for p, t in zip(preds, targets.cpu().numpy()) if p == t
+                    )
+                else:
+                    preds = aggregator.predict(features_t.numpy())
+                    correct = (preds == targets.cpu().numpy()).sum()
+                total_correct += correct
+
+                # ── UCB reward update ──
+                if use_estimator_pipeline and preds is not None:
+                    for b_idx, (p, t) in enumerate(
+                        zip(preds, targets.cpu().numpy())
+                    ):
+                        reward = 1.0 if p == t else 0.0
+                        for fids, ws in all_committee_info[b_idx]:
+                            ucb_moe.update_batch(fids, ws, reward)
+
+            except Exception:
+                pass
+
+            total_samples += B
+
+            if hasattr(aggregator, 'learn_batch'):
+                aggregator.learn_batch(features_t, targets.cpu())
             else:
-                batch_scores = None
+                aggregator.partial_fit(features_t.numpy(), targets.cpu().numpy())
 
-            # 2. Feature extraction (full pipeline or legacy)
-            features_t, all_committee_info = _extract_weighted_features_batch(
-                slots=slots,
-                batch_scores=batch_scores,
-                student_agents=student_agents,
-                ucb_moe=ucb_moe,
-                filter_k=filter_k if use_estimator_pipeline else k,
-                num_agents=num_agents,
-                use_estimator_pipeline=use_estimator_pipeline,
-            )
-
-        # 3. Aggregator: predict, then learn
-        try:
-            if hasattr(aggregator, 'predict_batch'):
-                preds = aggregator.predict_batch(features_t)
-                correct = sum(
-                    1 for p, t in zip(preds, targets.cpu().numpy()) if p == t
+            if (batch_idx + 1) % log_every == 0:
+                acc = total_correct / max(total_samples, 1) * 100
+                elapsed = time.time() - t0
+                extra = ""
+                if use_estimator_pipeline:
+                    extra = f" | ucb_rounds={ucb_moe.total_count}"
+                print(
+                    f"    Batch {batch_idx + 1:>5d} | "
+                    f"samples={total_samples} | "
+                    f"acc={acc:.2f}%{extra} | "
+                    f"{elapsed:.0f}s"
                 )
-            else:
-                preds = aggregator.predict(features_t.numpy())
-                correct = (preds == targets.cpu().numpy()).sum()
-            total_correct += correct
-
-            # ── UCB reward update ──
-            if use_estimator_pipeline and preds is not None:
-                for b_idx, (p, t) in enumerate(
-                    zip(preds, targets.cpu().numpy())
-                ):
-                    reward = 1.0 if p == t else 0.0
-                    for fids, ws in all_committee_info[b_idx]:
-                        ucb_moe.update_batch(fids, ws, reward)
-
-        except Exception:
-            pass
-
-        total_samples += B
-
-        if hasattr(aggregator, 'learn_batch'):
-            aggregator.learn_batch(features_t, targets.cpu())
-        else:
-            aggregator.partial_fit(features_t.numpy(), targets.cpu().numpy())
-
-        if (batch_idx + 1) % log_every == 0:
-            acc = total_correct / max(total_samples, 1) * 100
-            elapsed = time.time() - t0
-            extra = ""
-            if use_estimator_pipeline:
-                extra = f" | ucb_rounds={ucb_moe.total_count}"
-            print(
-                f"    Batch {batch_idx + 1:>5d} | "
-                f"samples={total_samples} | "
-                f"acc={acc:.2f}%{extra} | "
-                f"{elapsed:.0f}s"
-            )
 
     final_acc = total_correct / max(total_samples, 1) * 100
     print(f"  [DONE] Phase 3 complete. Final accuracy: {final_acc:.2f}%")
@@ -970,7 +993,8 @@ def main():
     parser.add_argument("--slot_dim", type=int, default=64)
     parser.add_argument("--num_agents", type=int, default=50)
     parser.add_argument("--num_prototypes", type=int, default=256)
-    parser.add_argument("--num_classes", type=int, default=10)
+    parser.add_argument("--num_classes", type=int, default=20,
+                        help="Classes per task (TinyImageNet: must divide 200; default: 20 → 10 tasks)")
     parser.add_argument("--batch_size", type=int, default=8)
     if torch.cuda.is_available():
         default_device = "cuda"
@@ -1079,23 +1103,21 @@ def main():
         test_loaders  = [dataloader]
         class_order   = [list(range(args.num_classes))]
     else:
-        print("[INFO] No data_dir specified — using CIFAR-100 continual benchmark.")
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "continual_cifar100",
-            "src/data/continual_cifar100.py"
-        )
-        data_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(data_module)
-        get_loaders = data_module.get_continual_cifar100_loaders
-        _n_tasks = (int(100 / args.num_classes)
-                    if args.num_classes > 0 else 5)
-        train_loaders, test_loaders, class_order = get_loaders(
+        print("[INFO] No data_dir specified — using Split Tiny-ImageNet (200 classes).")
+        from src.data.continual_tinyimagenet import get_continual_tinyimagenet_loaders
+        _classes_per_task = args.num_classes if args.num_classes > 0 else 20
+        if 200 % _classes_per_task != 0:
+            raise ValueError(
+                f"--num_classes {_classes_per_task} must divide 200 evenly for TinyImageNet."
+            )
+        _n_tasks = 200 // _classes_per_task
+        train_loaders, test_loaders, class_order = get_continual_tinyimagenet_loaders(
             n_tasks=_n_tasks,
             batch_size=args.batch_size,
             num_workers=0,
             seed=42,
             resolution=args.resolution,
+            root="./data",
         )
         # Combined loader used only for single-phase runs (--phase 1/2/2.5)
         from torch.utils.data import ConcatDataset
@@ -1269,6 +1291,15 @@ def main():
     acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
     aggregator = None   # aggregator accumulates knowledge across all tasks
 
+    # FIX #5: create Phase-1 optimizer & scheduler once so Adam second-moment
+    # buffers persist across task boundaries (avoids momentum reset each task).
+    _p1_optimizer = torch.optim.Adam(
+        adaslot.parameters(), lr=args.p1_lr
+    )
+    _p1_scheduler = build_scheduler(
+        _p1_optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000
+    )
+
     for task_id, task_loader in enumerate(train_loaders):
         task_classes = (class_order[task_id]
                         if isinstance(class_order, list)
@@ -1281,7 +1312,7 @@ def main():
         if args.task_p1_steps > 0:
             print(f"\n  ▶ Phase 1 — AdaSlot fine-tune "
                   f"({args.task_p1_steps} steps)")
-            train_phase1_adaslot(
+            _, _p1_optimizer, _p1_scheduler = train_phase1_adaslot(
                 model=adaslot,
                 dataloader=task_loader,
                 num_steps=args.task_p1_steps,
@@ -1289,6 +1320,8 @@ def main():
                 save_dir=f"checkpoints/adaslot/task{task_id}",
                 save_every=max(args.task_p1_steps, args.task_p1_steps + 1),
                 device=args.device,
+                optimizer=_p1_optimizer,
+                scheduler=_p1_scheduler,
             )
         else:
             print("  ▶ Phase 1 skipped (task_p1_steps=0)")
@@ -1334,7 +1367,7 @@ def main():
         if aggregator is not None and hasattr(aggregator, '_agg'):
             aggregator._agg.freeze_old_classes(set(task_classes))
 
-        total_classes = args.num_classes if args.data_dir else 100
+        total_classes = args.num_classes if args.data_dir else 200  # TinyImageNet = 200
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
@@ -1480,7 +1513,7 @@ def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
             print(f"  Classes: {_task_cls[task_id]}")
         print(f"{'=' * 60}")
 
-        total_classes = args.num_classes if args.data_dir else 100
+        total_classes = args.num_classes if args.data_dir else 200  # TinyImageNet = 200
         aggregator = train_phase3_crp(
             adaslot_model=adaslot,
             student_agents=student_agents,
