@@ -178,6 +178,14 @@ PB_FREEZE_ROUTERS = True
 PB_LOG_EVERY      = 20
 
 # ===========================================================================
+# CONTINUAL LEARNING — novelty detection for agent spawning
+# ===========================================================================
+# Bottom MIN_ORPHAN_FRACTION of max-VAE-scores treated as "novel" slots.
+# If >= MIN_ORPHAN_FRACTION of task-t slots are novel, cluster them and spawn
+# new agents.  Old agents are NEVER fine-tuned (prevents catastrophic forgetting).
+MIN_ORPHAN_FRACTION = 0.15
+
+# ===========================================================================
 # SLDA
 # ===========================================================================
 SLDA_SHRINKAGE = 1e-4
@@ -632,20 +640,39 @@ R[0][0] = test_m0["accuracy"]
 
 task_results = [{"task": 0,
                  "val_acc":  val_m0["accuracy"],
-                 "test_acc": test_m0["accuracy"]}]
+                 "test_acc": test_m0["accuracy"],
+                 "n_agents": M}]
 
 print("Forgetting matrix initialised (R[0][0] set).")
 
 # %% [markdown]
 # ## 15. Continual Learning — Tasks 1+
 #
-# For each new task t:
-# 1. **Phase B** fine-tune existing agents on task t data
-# 2. **SLDA** incremental update on task t data
-# 3. **Evaluate all seen tasks 0..t** -> fill a column of the forgetting matrix
-# 4. Print per-task accuracy and running BWT
+# Design principle: **existing agents are never fine-tuned** (prevents
+# catastrophic forgetting). For each new task we instead:
+# 1. Extract slots → score against existing VAEs → identify **novel** slots
+# 2. **Spawn new VAEs + agents** for novel clusters (Phase A → Phase B)
+# 3. SLDA incremental update with ALL agents (old + new)
+# 4. Evaluate all seen tasks → fill forgetting matrix column t
 
 # %%
+def _find_novel_slots(vaes, slots_np, orphan_fraction=MIN_ORPHAN_FRACTION):
+    """
+    Return indices of slots in the bottom `orphan_fraction` percentile of
+    max-VAE-log-likelihood — i.e., slots not well explained by any existing VAE.
+    """
+    if not vaes:
+        return np.arange(len(slots_np))
+    slots_t = torch.from_numpy(slots_np).float().to(DEVICE)
+    scores = []
+    for vae in vaes:
+        s = vae.score(slots_t)
+        scores.append(s.cpu().numpy() if isinstance(s, torch.Tensor) else np.asarray(s))
+    max_score = np.max(np.stack(scores, axis=1), axis=1)   # (N,)
+    cutoff    = np.quantile(max_score, orphan_fraction)
+    return np.where(max_score < cutoff)[0]
+
+
 for t in range(1, N_TASKS):
     print(f"\n{'='*60}")
     print(f"  TASK {t}  |  classes "
@@ -653,61 +680,120 @@ for t in range(1, N_TASKS):
     print(f"{'='*60}")
 
     t_train, t_val, t_test = get_task_loaders(t)
+    old_M = M   # agent count before this task
 
     # -----------------------------------------------------------------------
-    # Phase B: fine-tune agents on task t
+    # 1. Extract slots → find novel patterns
     # -----------------------------------------------------------------------
-    for ag in agents:
+    print(f"  Task {t} — extracting slots ...")
+    slots_np_t = extract_slots(slot_model, t_train, cfg_clust, device=DEVICE)
+    novel_idx  = _find_novel_slots(vaes, slots_np_t)
+    novel_frac = len(novel_idx) / max(len(slots_np_t), 1)
+    print(f"  Novel slots : {len(novel_idx)}/{len(slots_np_t)} "
+          f"({novel_frac*100:.1f}%)")
+
+    # -----------------------------------------------------------------------
+    # 2. Spawn new agents for novel clusters (if enough novel slots)
+    # -----------------------------------------------------------------------
+    new_vaes, new_agents = [], []
+    if novel_frac >= MIN_ORPHAN_FRACTION:
+        novel_slots = slots_np_t[novel_idx]
+        initialiser_t = ClusterInitialiser(cfg_clust)
+        new_vaes, new_agents, _ = initialiser_t.run(
+            novel_slots,
+            agent_input_dim=D_H,
+            agent_output_dim=D_H,
+        )
+        print(f"  Spawned {len(new_agents)} new agent(s)")
+    else:
+        print(f"  No novel clusters — existing {M} agents cover this task")
+
+    # Register new agents with aggregator under their GLOBAL IDs
+    if hasattr(aggregator, "register_agent"):
+        for i in range(len(new_agents)):
+            aggregator.register_agent(old_M + i)
+
+    vaes.extend(new_vaes)
+    agents.extend(new_agents)
+    M = len(agents)
+
+    # -----------------------------------------------------------------------
+    # 3. Train NEW agents only — old agents stay frozen
+    # -----------------------------------------------------------------------
+    for ag in agents[:old_M]:       # old — keep frozen
+        for p in ag.parameters():
+            p.requires_grad_(False)
+    for ag in agents[old_M:]:       # new — enable grad
         for p in ag.parameters():
             p.requires_grad_(True)
 
-    trainer_pb_t = AgentPhaseBTrainer(
-        config=cfg_pb,
-        slot_model=slot_model,
-        vaes=vaes,
-        agents=agents,
-        aggregator=aggregator,
-    )
-    print(f"  Task {t} - Phase B ...")
-    trainer_pb_t.train(t_train)
+    if new_agents:
+        # Phase A — ALL vaes so routing indices are global
+        trainer_pa_t = AgentPhaseATrainer(
+            config=cfg_pa,
+            slot_model=slot_model,
+            vaes=vaes,
+            agents=agents,
+        )
+        print(f"  Task {t} — Phase A (new agents) ...")
+        trainer_pa_t.train(t_train)
 
+        # Phase B — only new agents have requires_grad=True
+        trainer_pb_t = AgentPhaseBTrainer(
+            config=cfg_pb,
+            slot_model=slot_model,
+            vaes=vaes,
+            agents=agents,
+            aggregator=aggregator,
+        )
+        print(f"  Task {t} — Phase B ...")
+        trainer_pb_t.train(t_train)
+
+    # Freeze everything
     for ag in agents:
         for p in ag.parameters():
             p.requires_grad_(False)
 
     # -----------------------------------------------------------------------
-    # SLDA: incremental update on task t
+    # 4. Update SLDATrainer's agent/vae list to include new additions
     # -----------------------------------------------------------------------
-    print(f"  Task {t} - SLDA update ...")
+    trainer_slda.agents = [a.to(DEVICE).eval() for a in agents]
+    trainer_slda.vaes   = vaes
+
+    # -----------------------------------------------------------------------
+    # 5. SLDA incremental update on task t
+    # -----------------------------------------------------------------------
+    print(f"  Task {t} — SLDA update ({M} total agents) ...")
     trainer_slda.fit(t_train)
 
     # -----------------------------------------------------------------------
-    # Evaluate ALL seen tasks  ->  fill column t of the forgetting matrix
+    # 6. Evaluate ALL seen tasks → fill column t of the forgetting matrix
     # -----------------------------------------------------------------------
-    print(f"  Task {t} - evaluating all seen tasks ...")
+    print(f"  Task {t} — evaluating all seen tasks ...")
     for i in range(t + 1):
         _, _, i_test = get_task_loaders(i)
-        m      = trainer_slda.evaluate(i_test)
-        R[i][t] = m["accuracy"]
-        print(f"    R[task={i}][after_task={t}] = {m['accuracy']*100:.2f}%")
+        m_eval   = trainer_slda.evaluate(i_test)
+        R[i][t]  = m_eval["accuracy"]
+        print(f"    R[task={i}][after_task={t}] = {m_eval['accuracy']*100:.2f}%")
 
     t_val_m = trainer_slda.evaluate(t_val)
     task_results.append({
         "task":     t,
         "val_acc":  t_val_m["accuracy"],
         "test_acc": R[t][t],
+        "n_agents": M,
     })
 
-    # Running BWT (average backward transfer over tasks learned before t)
     bwt_terms = [
         R[i][t] - R[i][i]
         for i in range(t)
         if R[i][t] is not None and R[i][i] is not None
     ]
-    running_bwt  = sum(bwt_terms) / len(bwt_terms) if bwt_terms else float("nan")
-    avg_acc_now  = sum(R[i][t] for i in range(t + 1) if R[i][t] is not None) / (t + 1)
+    running_bwt = sum(bwt_terms) / len(bwt_terms) if bwt_terms else float("nan")
+    avg_acc_now = sum(R[i][t] for i in range(t + 1) if R[i][t] is not None) / (t + 1)
 
     print(f"\n  After task {t}:")
+    print(f"    Total agents              : {M}  (+{M - old_M} new)")
     print(f"    Avg test acc (tasks 0-{t}) : {avg_acc_now * 100:.2f}%")
     print(f"    Running BWT               : {running_bwt * 100:+.2f}%")
     print(f"    SLDA total samples        : {slda._n_total}")
@@ -895,13 +981,14 @@ print(f"  Dataset       : {DATASET}")
 print(f"  Tasks trained : {last_t + 1} / {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
 print(f"  N agents      : {M}")
 print()
-print(f"  {'Task':>5}  {'val %':>8}  {'test %':>8}  {'forgetting':>12}")
-print(f"  {'-'*45}")
+print(f"  {'Task':>5}  {'val %':>8}  {'test %':>8}  {'forgetting':>12}  {'agents':>7}")
+print(f"  {'-'*53}")
 for i, r in enumerate(task_results):
     fg = forgetting[i] * 100 if not np.isnan(forgetting[i]) else float("nan")
+    n_ag = r.get("n_agents", M)
     print(f"  {r['task']:>5}  {r['val_acc']*100:>8.2f}  "
-          f"{r['test_acc']*100:>8.2f}  {fg:>+11.2f}%")
-print(f"  {'-'*45}")
+          f"{r['test_acc']*100:>8.2f}  {fg:>+11.2f}%  {n_ag:>7}")
+print(f"  {'-'*53}")
 print(f"  Avg final test acc : {float(np.nanmean(acc_final))*100:.2f}%")
 print(f"  BWT                : {bwt*100:+.2f}%")
 print(f"  SLDA samples seen  : {slda._n_total}")
