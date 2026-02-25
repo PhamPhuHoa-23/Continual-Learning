@@ -145,6 +145,10 @@ class AgentPhaseATrainer(BaseTrainer):
         B, K, D = slots.shape
         n_agents = len(self.vaes)
 
+        if n_agents == 0:
+            # No VAEs available — assign all slots to a single dummy agent 0
+            return torch.zeros(B, K, dtype=torch.long, device=slots.device)
+
         if n_agents == 1 or self.config.routing_mode == "single":
             return torch.zeros(B, K, dtype=torch.long, device=slots.device)
 

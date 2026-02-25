@@ -207,6 +207,21 @@ class ClusterInitialiser:
         slots_t   = torch.tensor(slots, dtype=torch.float32)
         result    = clusterer.fit_predict(slots_t)
 
+        # ── Fallback: density-based methods may find 0 clusters (all noise) ──
+        # Fall back to KMeans with cfg.n_clusters so the pipeline never stalls.
+        if result.n_clusters == 0:
+            fallback_k = max(cfg.n_clusters, 2)
+            logger.warning(
+                f"[ClusterInit] '{cfg.method}' found 0 clusters (all noise). "
+                f"Falling back to kmeans with n_clusters={fallback_k}."
+            )
+            fb_clusterer = CLUSTERING_REGISTRY.build(
+                "kmeans",
+                n_clusters=fallback_k,
+                random_state=cfg.random_state,
+            )
+            result = fb_clusterer.fit_predict(slots_t)
+
         self._result = result
 
         # Partition slots per cluster (noise = -1 is dropped)

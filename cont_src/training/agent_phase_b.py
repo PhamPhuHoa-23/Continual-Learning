@@ -247,6 +247,8 @@ class AgentPhaseBTrainer(BaseTrainer):
         weights : (B, K, n_agents)   — soft assignment weights
         """
         n = len(self.vaes)
+        if n == 0:
+            return torch.ones(*slots.shape[:2], 1, device=slots.device)
         if n == 1:
             return torch.ones(*slots.shape[:2], 1, device=slots.device)
 
