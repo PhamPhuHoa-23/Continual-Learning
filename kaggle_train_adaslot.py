@@ -125,9 +125,8 @@ if not _os.path.exists(CKPT_PATH):
 # ===========================================================================
 # MODEL
 # ===========================================================================
-IMG_SIZE   = 64   # 32->64 (2x upscale): decoder la 4x stride-2 ConvTranspose → compat voi ckpt
-                   # 128 qua lon cho CIFAR-32: 4x upscale, 49152 pixels, feature extractor chay cham
-                   # 64:  2x upscale, 12288 pixels, recon loss ~4x nho hon, train ~4x nhanh hon
+IMG_SIZE   = 128  # decoder hardcodes initial_conv_size=(8,8) → ConvTranspose 16x → always 128x128
+                   # CANNOT change to 64: images would be 64x64 but recon always 128x128 → MSE crash
 NUM_SLOTS  = 11
 SLOT_DIM   = 64
 D_H        = 64     # agent hidden dim / aggregator output dim
