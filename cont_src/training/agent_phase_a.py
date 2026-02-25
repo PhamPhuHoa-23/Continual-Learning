@@ -121,11 +121,14 @@ class AgentPhaseATrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _extract_slots(self, images: torch.Tensor) -> torch.Tensor:
-        """Forward backbone, return slots (B, K, D)."""
+    def _extract_slots(self, images: torch.Tensor):
+        """Forward backbone, return (slots (B,K,D), n_active_slots float)."""
         self.slot_model.eval()
         out = self.slot_model(images)
-        return out["slots"]
+        slots = out["slots"]
+        mask  = out.get("hard_keep_decision", out.get("mask"))
+        n_active = (mask > 0.5).float().sum(dim=-1).mean().item() if mask is not None else float(slots.shape[1])
+        return slots, n_active
 
     def _route(self, slots: torch.Tensor) -> torch.Tensor:
         """
@@ -162,7 +165,7 @@ class AgentPhaseATrainer(BaseTrainer):
         images = images.to(self.device)
 
         # 1. Extract slots (no grad needed for backbone)
-        slots = self._extract_slots(images)          # (B, K, D)
+        slots, n_active_slots = self._extract_slots(images)   # (B, K, D), float
 
         # 2. Route: hard argmax
         with torch.no_grad():
@@ -195,9 +198,10 @@ class AgentPhaseATrainer(BaseTrainer):
             active_agents += 1
 
         metrics = {
-            "loss_total": total_loss,
-            "l_agent_mean": total_loss.detach().item() / max(active_agents, 1),
-            "active_agents": float(active_agents),
+            "loss_total":     total_loss,
+            "l_agent_mean":   total_loss.detach().item() / max(active_agents, 1),
+            "active_agents":  float(active_agents),
+            "n_active_slots": n_active_slots,
             **per_agent_losses,
         }
         return metrics

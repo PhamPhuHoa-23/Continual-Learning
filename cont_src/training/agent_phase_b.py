@@ -222,9 +222,14 @@ class AgentPhaseBTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _extract_slots(self, images: torch.Tensor) -> torch.Tensor:
+    def _extract_slots(self, images: torch.Tensor):
+        """Return (slots (B,K,D), n_active_slots float)."""
         self.slot_model.eval()
-        return self.slot_model(images)["slots"]   # (B, K, D)
+        out   = self.slot_model(images)
+        slots = out["slots"]
+        mask  = out.get("hard_keep_decision", out.get("mask"))
+        n_active = (mask > 0.5).float().sum(dim=-1).mean().item() if mask is not None else float(slots.shape[1])
+        return slots, n_active
 
     def _soft_route(
         self, slots: torch.Tensor, temperature: float
@@ -316,7 +321,7 @@ class AgentPhaseBTrainer(BaseTrainer):
         temp = _compute_temperature(self.global_step, self._total_steps, self.config)
 
         # 1. Extract slots (frozen backbone)
-        slots = self._extract_slots(images)              # (B, K, D)
+        slots, n_active_slots = self._extract_slots(images)   # (B, K, D), float
 
         # 2. Soft routing weights
         weights = self._soft_route(slots, temp)          # (B, K, n_agents)
@@ -344,11 +349,12 @@ class AgentPhaseBTrainer(BaseTrainer):
         )
 
         return {
-            "loss_total": loss_total,
-            "l_agent":    l_agent.detach(),
-            "l_prim":     l_prim.detach()   if isinstance(l_prim,   torch.Tensor) else l_prim,
-            "l_supcon":   l_supcon.detach() if isinstance(l_supcon, torch.Tensor) else l_supcon,
-            "temperature": temp,
+            "loss_total":     loss_total,
+            "l_agent":        l_agent.detach(),
+            "l_prim":         l_prim.detach()   if isinstance(l_prim,   torch.Tensor) else l_prim,
+            "l_supcon":       l_supcon.detach() if isinstance(l_supcon, torch.Tensor) else l_supcon,
+            "temperature":    temp,
+            "n_active_slots": n_active_slots,
         }
 
     # ------------------------------------------------------------------
