@@ -30,8 +30,6 @@ Date: 2026-02-12
 """
 
 from typing import Optional
-from avalanche.benchmarks.classic import SplitTinyImageNet
-from avalanche.benchmarks import CLScenario
 import logging
 
 # Setup logging
@@ -45,11 +43,11 @@ def get_tinyimagenet_benchmark(
     train_transform=None,
     eval_transform=None,
     dataset_root: str = "./data"
-) -> CLScenario:
+):
     """
     Create Tiny-ImageNet continual learning benchmark using Avalanche.
+    Requires `avalanche-lib` to be installed.
     
-    Tiny-ImageNet advantages over CIFAR-100:
     - Larger images (64x64 vs 32x32)
     - More classes (200 vs 100)
     - More challenging
@@ -95,6 +93,7 @@ def get_tinyimagenet_benchmark(
     logger.info(f"  - Dataset root: {dataset_root}")
     
     # Create SplitTinyImageNet benchmark
+    from avalanche.benchmarks.classic import SplitTinyImageNet  # lazy import
     benchmark = SplitTinyImageNet(
         n_experiences=n_experiences,
         return_task_id=False,  # Class-incremental learning
