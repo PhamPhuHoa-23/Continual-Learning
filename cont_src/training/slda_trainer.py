@@ -318,18 +318,21 @@ class SLDATrainer:
         slots = out["slots"]                         # (B, K, D)
 
         # 2. Route (hard argmax)
+        # vae.score() expects (N, D_s) not (B, K, D) — flatten then reshape back
+        B, K, D = slots.shape
         if self.vaes:
+            slots_flat = slots.reshape(B * K, D)
             scores = torch.stack(
-                [vae.score(slots) for vae in self.vaes], dim=-1
-            )  # (B, K, n_agents)
-            assignments = scores.argmax(dim=-1)      # (B, K)
+                [vae.score(slots_flat) for vae in self.vaes], dim=-1
+            )  # (B*K, n_agents)
+            scores = scores.reshape(B, K, len(self.vaes))  # (B, K, n_agents)
+            assignments = scores.argmax(dim=-1)             # (B, K)
         else:
             assignments = torch.zeros(
                 slots.shape[:2], dtype=torch.long, device=self.device
             )
 
         # 3. Per-agent hidden (mix hard)
-        B, K, D = slots.shape
         n_agents = len(self.agents)
         D_h = None
 

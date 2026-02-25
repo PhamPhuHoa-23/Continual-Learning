@@ -152,11 +152,13 @@ class AgentPhaseATrainer(BaseTrainer):
         if n_agents == 1 or self.config.routing_mode == "single":
             return torch.zeros(B, K, dtype=torch.long, device=slots.device)
 
-        # Score each slot against every VAE: → (B, K, n_agents)
+        # vae.score() expects (N, D_s) not (B, K, D) — flatten then reshape back
+        slots_flat = slots.reshape(B * K, D)   # (B*K, D)
         scores = torch.stack(
-            [vae.score(slots) for vae in self.vaes],
+            [vae.score(slots_flat) for vae in self.vaes],
             dim=-1,
-        )  # (B, K, n_agents)
+        )  # (B*K, n_agents)
+        scores = scores.reshape(B, K, n_agents)  # (B, K, n_agents)
 
         if self.config.routing_mode == "hard":
             return scores.argmax(dim=-1)                   # (B, K)

@@ -252,8 +252,13 @@ class AgentPhaseBTrainer(BaseTrainer):
         if n == 1:
             return torch.ones(*slots.shape[:2], 1, device=slots.device)
 
-        # (B, K, n_agents)
-        scores = torch.stack([vae.score(slots) for vae in self.vaes], dim=-1)
+        # vae.score() expects (N, D_s) not (B, K, D) — flatten then reshape back
+        B, K, D = slots.shape
+        slots_flat = slots.reshape(B * K, D)              # (B*K, D)
+        scores = torch.stack(
+            [vae.score(slots_flat) for vae in self.vaes], dim=-1
+        )  # (B*K, n_agents)
+        scores = scores.reshape(B, K, n)                  # (B, K, n_agents)
         return F.softmax(scores / temperature, dim=-1)
 
     def _compute_hidden(
