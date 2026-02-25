@@ -196,7 +196,7 @@ DATA_ROOT = Path(f"/kaggle/working/{_DS_META[DATASET]['data_subdir']}")
 N_CLASSES = _DS_META[DATASET]["n_classes"]
 
 print("=" * 55)
-print(f"  Dataset    : {DATASET}  ({N_CLASSES} classes)")
+print(f"  Dataset    : {DATASET}  ({N_CLASSES} classes, {N_TASKS} tasks)")
 print(f"  Device     : {DEVICE}")
 if torch.cuda.is_available():
     print(f"  GPU        : {torch.cuda.get_device_name(0)}")
@@ -278,7 +278,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.notebook import tqdm
 import torchvision.transforms as T
-from torchvision.datasets import CIFAR100
 from torch.utils.data import DataLoader, random_split
 
 from src.models.adaslot.model import AdaSlotModel
@@ -297,57 +296,68 @@ print("Imports OK!")
 
 
 # %% [markdown]
-# ## 8. Data Loaders
+# ## 8. Data — Avalanche Benchmark
+#
+# `SplitCIFAR100` / `SplitTinyImageNet` tu dong chia class theo task.
+# Resize 32→128 xu ly thang trong transform — khong can ResizeLoader nua.
 
 # %%
-def _make_tf(train):
-    base = [T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)]
-    if train:
-        base = [T.RandomHorizontalFlip(), T.ColorJitter(0.2,0.2,0.2)] + base
-    return T.Compose(base)
+from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet
 
-def _get_loaders():
-    if DATASET == "cifar100":
-        tr = CIFAR100(DATA_ROOT, train=True,  download=False, transform=_make_tf(True))
-        te = CIFAR100(DATA_ROOT, train=False, download=False, transform=_make_tf(False))
-    elif DATASET == "tiny_imagenet":
-        from torchvision.datasets import ImageFolder
-        _candidates_tr = [DATA_ROOT/"tiny-imagenet-200"/"train", DATA_ROOT/"train"]
-        _candidates_te = [DATA_ROOT/"tiny-imagenet-200"/"val"/"images",
-                          DATA_ROOT/"tiny-imagenet-200"/"val", DATA_ROOT/"val"]
-        _tr_dir = next(p for p in _candidates_tr if p.exists())
-        _te_dir = next(p for p in _candidates_te if p.exists())
-        tr = ImageFolder(str(_tr_dir), transform=_make_tf(True))
-        te = ImageFolder(str(_te_dir), transform=_make_tf(False))
-    n_val   = int(len(tr) * VAL_SPLIT)
-    n_train = len(tr) - n_val
-    train_ds, val_ds = random_split(tr, [n_train, n_val],
-                                    generator=torch.Generator().manual_seed(42))
-    kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
-              pin_memory=True, drop_last=True)
-    return (DataLoader(train_ds, shuffle=True,  **kw),
-            DataLoader(val_ds,   shuffle=False, **kw),
-            DataLoader(te,       shuffle=False, **kw))
+def _make_tf(train, size=IMG_SIZE):
+    aug = [T.RandomHorizontalFlip(), T.ColorJitter(0.2, 0.2, 0.2)] if train else []
+    return T.Compose(aug + [
+        T.Resize((size, size)),          # 32x32 -> 128x128 trong transform
+        T.ToTensor(),
+        T.Normalize((0.5,)*3, (0.5,)*3),
+    ])
 
-train_loader, val_loader, test_loader = _get_loaders()
-print(f"Train: {len(train_loader)} batches  Val: {len(val_loader)}  Test: {len(test_loader)}")
+# Avalanche AvalancheDataset tra ve (x, y, task_id) — boc lai de bo task_id
+class _AvDS(torch.utils.data.Dataset):
+    def __init__(self, av_ds): self._ds = av_ds
+    def __len__(self): return len(self._ds)
+    def __getitem__(self, i):
+        x, y, *_ = self._ds[i]
+        return x, y
 
-# Resize wrapper: CIFAR-100 is 32x32, AdaSlot needs 128x128
-class ResizeLoader:
-    def __init__(self, loader, size=IMG_SIZE):
-        self.loader, self.size = loader, size
-    def __len__(self):
-        return len(self.loader)
-    def __iter__(self):
-        for imgs, labels in self.loader:
-            imgs = F.interpolate(imgs.to(DEVICE), (self.size, self.size),
-                                 mode="bilinear", align_corners=False)
-            yield imgs, labels.to(DEVICE)
+if DATASET == "cifar100":
+    benchmark = SplitCIFAR100(
+        n_experiences   = N_TASKS,
+        seed            = 42,
+        return_task_id  = False,
+        dataset_root    = str(DATA_ROOT),
+        train_transform = _make_tf(True),
+        eval_transform  = _make_tf(False),
+    )
+elif DATASET == "tiny_imagenet":
+    benchmark = SplitTinyImageNet(
+        n_experiences   = N_TASKS,
+        seed            = 42,
+        return_task_id  = False,
+        dataset_root    = str(DATA_ROOT),
+        train_transform = _make_tf(True),
+        eval_transform  = _make_tf(False),
+    )
 
-train_rz = ResizeLoader(train_loader)
-val_rz   = ResizeLoader(val_loader)
-test_rz  = ResizeLoader(test_loader)
-print("ResizeLoaders ready")
+CLASSES_PER_TASK = N_CLASSES // N_TASKS
+
+def get_task_loaders(task_id):
+    """Tra ve (train_loader, val_loader, test_loader) cho task task_id."""
+    tr_full = _AvDS(benchmark.train_stream[task_id].dataset)
+    te_ds   = _AvDS(benchmark.test_stream[task_id].dataset)
+    n_val   = int(len(tr_full) * VAL_SPLIT)
+    n_tr    = len(tr_full) - n_val
+    tr_ds, val_ds = random_split(tr_full, [n_tr, n_val],
+                                  generator=torch.Generator().manual_seed(42))
+    kw = dict(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+    return (DataLoader(tr_ds,  shuffle=True,  **kw),
+            DataLoader(val_ds, shuffle=False, **kw),
+            DataLoader(te_ds,  shuffle=False, **kw))
+
+# Task 0 loaders
+train_loader, val_loader, test_loader = get_task_loaders(0)
+print(f"Task 0  |  classes 0-{CLASSES_PER_TASK-1}  |  Train: {len(train_loader)} batches  Val: {len(val_loader)}  Test: {len(test_loader)}")
+print(f"Total tasks: {N_TASKS}  |  Classes per task: {CLASSES_PER_TASK}")
 
 
 # %% [markdown]
@@ -420,7 +430,7 @@ trainer_p0 = AdaSlotTrainer(
 )
 
 print("Phase 0: AdaSlot fine-tune...")
-metrics_p0 = trainer_p0.train(train_rz)
+metrics_p0 = trainer_p0.train(train_loader)
 print(f"Phase 0 done: {metrics_p0}")
 
 # Save history for plotting
@@ -441,8 +451,7 @@ import matplotlib.pyplot as plt
 def save_recon_grid(model, loader, path, n=8):
     model.eval()
     imgs, _ = next(iter(loader))
-    imgs = F.interpolate(imgs[:n].to(DEVICE), (IMG_SIZE, IMG_SIZE),
-                         mode="bilinear", align_corners=False)
+    imgs = imgs[:n].to(DEVICE)   # already IMG_SIZE x IMG_SIZE from transform
     out   = model(imgs)
     recon = out["recon"]
     active = out["mask"].sum(dim=1).float()
@@ -480,7 +489,7 @@ cfg_clust = ClusterInitConfig(
 )
 
 print(f"Extracting slots with method='{CLUSTER_METHOD}'...")
-slots_np = extract_slots(slot_model, train_rz, cfg_clust, device=DEVICE)
+slots_np = extract_slots(slot_model, train_loader, cfg_clust, device=DEVICE)
 print(f"Slots shape: {slots_np.shape}")
 
 initialiser = ClusterInitialiser(cfg_clust)
@@ -515,7 +524,7 @@ trainer_pa = AgentPhaseATrainer(
 )
 
 print("Phase A: agent warm-up...")
-metrics_pa = trainer_pa.train(train_rz)
+metrics_pa = trainer_pa.train(train_loader)
 print(f"Phase A done: {metrics_pa}")
 
 
@@ -548,7 +557,7 @@ trainer_pb = AgentPhaseBTrainer(
 )
 
 print("Phase B: full agent training...")
-metrics_pb = trainer_pb.train(train_rz)
+metrics_pb = trainer_pb.train(train_loader)
 print(f"Phase B done: {metrics_pb}")
 
 # Freeze agents
@@ -589,7 +598,7 @@ trainer_slda = SLDATrainer(
 )
 
 print("SLDA: fitting...")
-trainer_slda.fit(train_rz)
+trainer_slda.fit(train_loader)
 print(f"SLDA fitted on {slda._n_total} samples")
 
 
@@ -597,13 +606,65 @@ print(f"SLDA fitted on {slda._n_total} samples")
 # ## 15. Evaluation
 
 # %%
-val_metrics  = trainer_slda.evaluate(val_rz)
-test_metrics = trainer_slda.evaluate(test_rz)
+val_metrics  = trainer_slda.evaluate(val_loader)
+test_metrics = trainer_slda.evaluate(test_loader)
 
 print("=" * 45)
-print(f"  Val  accuracy : {val_metrics['accuracy']*100:.2f}%")
-print(f"  Test accuracy : {test_metrics['accuracy']*100:.2f}%")
+print(f"  Task 0 val  : {val_metrics['accuracy']*100:.2f}%")
+print(f"  Task 0 test : {test_metrics['accuracy']*100:.2f}%")
 print("=" * 45)
+
+task_results = [{"task": 0, "val_acc": val_metrics["accuracy"], "test_acc": test_metrics["accuracy"]}]
+
+
+# %% [markdown]
+# ## 15b. Continual Learning — Tasks 1+
+#
+# Voi moi task tiep theo: backbone + agents tu task 0 duoc giu lai.
+# Chi can Phase B fine-tune + cap nhat SLDA mot lan.
+# (Spawn agent moi = extract_slots -> cluster -> PhaseA tren task t — TODO neu can)
+
+# %%
+for t in range(1, N_TASKS):
+    print(f"\n{'='*55}")
+    print(f"  TASK {t}  |  classes {t*CLASSES_PER_TASK}–{(t+1)*CLASSES_PER_TASK-1}")
+    print(f"{'='*55}")
+
+    t_train, t_val, t_test = get_task_loaders(t)
+
+    # Unfreeze agents cho Phase B
+    for ag in agents:
+        for p in ag.parameters(): p.requires_grad_(True)
+
+    # Phase B: fine-tune agents tren task t
+    trainer_pb_t = AgentPhaseBTrainer(
+        config     = cfg_pb,
+        slot_model = slot_model,
+        vaes       = vaes,
+        agents     = agents,
+        aggregator = aggregator,
+    )
+    print(f"Task {t} — Phase B...")
+    trainer_pb_t.train(t_train)
+
+    # Re-freeze
+    for ag in agents:
+        for p in ag.parameters(): p.requires_grad_(False)
+
+    # SLDA: cap nhat phan phoi tren task t
+    print(f"Task {t} — SLDA update...")
+    trainer_slda.fit(t_train)
+
+    # Eval
+    t_val_m  = trainer_slda.evaluate(t_val)
+    t_test_m = trainer_slda.evaluate(t_test)
+    print(f"  Task {t}  val={t_val_m['accuracy']*100:.2f}%  test={t_test_m['accuracy']*100:.2f}%")
+    task_results.append({"task": t, "val_acc": t_val_m["accuracy"], "test_acc": t_test_m["accuracy"]})
+
+if N_TASKS > 1:
+    avg_acc = sum(r["test_acc"] for r in task_results) / len(task_results)
+    print(f"\nAverage test accuracy across {N_TASKS} tasks: {avg_acc*100:.2f}%")
+    print(f"SLDA total samples seen: {slda._n_total}")
 
 
 # %% [markdown]
@@ -617,10 +678,12 @@ torch.save({
     "agents":     [a.state_dict() for a in agents],
     "slda":       slda.state_dict(),
     "vaes":       [v.state_dict() for v in vaes],
+    "task_results": task_results,
     "val_acc":    val_metrics["accuracy"],
     "test_acc":   test_metrics["accuracy"],
     "config": {
-        "dataset": DATASET, "n_classes": N_CLASSES,
+        "dataset": DATASET, "n_classes": N_CLASSES, "n_tasks": N_TASKS,
+        "classes_per_task": CLASSES_PER_TASK,
         "cluster_method": CLUSTER_METHOD, "n_agents": M,
         "p0_epochs": P0_EPOCHS, "pa_epochs": PA_EPOCHS, "pb_epochs": PB_EPOCHS,
     },
@@ -657,9 +720,13 @@ else:
 ckpts = sorted(OUTPUT_DIR.rglob("*.pt"))
 print("=" * 55)
 print(f"  Dataset       : {DATASET}")
+print(f"  N tasks       : {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
 print(f"  N agents      : {M}")
-print(f"  Val  accuracy : {val_metrics['accuracy']*100:.2f}%")
-print(f"  Test accuracy : {test_metrics['accuracy']*100:.2f}%")
+for r in task_results:
+    print(f"  Task {r['task']}  val={r['val_acc']*100:.2f}%  test={r['test_acc']*100:.2f}%")
+if len(task_results) > 1:
+    avg = sum(r['test_acc'] for r in task_results) / len(task_results)
+    print(f"  Avg test acc  : {avg*100:.2f}%")
 print(f"  Output dir    : {OUTPUT_DIR}")
 print(f"  Checkpoints   : {len(ckpts)}")
 for c in ckpts:
