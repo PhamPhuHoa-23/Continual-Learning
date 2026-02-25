@@ -62,7 +62,7 @@ if not REPO_PATH.exists():
 # fetch + reset --hard: dam bao file tren Kaggle LUON khop voi origin
 # (git pull co the fail silent neu detached HEAD / merge conflict)
 run(f"git -C {REPO_PATH} fetch origin {GIT_BRANCH}")
-run(f"git -C {REPO_PATH} checkout {GIT_BRANCH}")
+run(f"git -C {REPO_PATH} checkout --force {GIT_BRANCH}")
 run(f"git -C {REPO_PATH} reset --hard origin/{GIT_BRANCH}")
 run(f"git -C {REPO_PATH} log --oneline -3")
 

@@ -224,7 +224,10 @@ class KMeansInitialiser:
         vaes:   List[SlotVAE]             = []
         agents: List[ResidualMLPAgent]    = []
 
-        scoring_mode = ScoringMode(cfg.scoring_mode)
+        _valid_modes = {"generative", "mahal_z", "mahal_slot"}
+        assert cfg.scoring_mode in _valid_modes, \
+            f"scoring_mode must be one of {_valid_modes}, got '{cfg.scoring_mode}'"
+        scoring_mode: ScoringMode = cfg.scoring_mode  # type: ignore[assignment]
 
         for k, cluster_slots in enumerate(self._cluster_slots):
             logger.info(
