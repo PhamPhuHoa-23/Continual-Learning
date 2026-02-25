@@ -728,28 +728,20 @@ for t in range(1, N_TASKS):
             p.requires_grad_(True)
 
     if new_agents:
-        # Phase A — pass ONLY new_vaes/new_agents so hard routing forces
-        # all slots to be assigned to trainable (new) agents.  Passing all
-        # vaes would let old (higher-scoring, frozen) VAEs win every slot,
-        # leaving total_loss with no grad_fn.
-        trainer_pa_t = AgentPhaseATrainer(
-            config=cfg_pa,
-            slot_model=slot_model,
-            vaes=new_vaes,
-            agents=new_agents,
-        )
-        print(f"  Task {t} — Phase A (new agents) ...")
-        trainer_pa_t.train(t_train)
-
-        # Phase B — only new agents have requires_grad=True
+        # Phase B only (no Phase A warm-up for CL tasks).
+        # Pass ONLY new_vaes/new_agents so soft routing forces new agents to
+        # receive gradients — old VAEs would otherwise win every slot
+        # assignment leaving new agent parameters with no grad_fn.
+        # Full loss (L_agent + L_prim + L_SupCon) trains the new agents
+        # properly from the start.
         trainer_pb_t = AgentPhaseBTrainer(
             config=cfg_pb,
             slot_model=slot_model,
-            vaes=vaes,
-            agents=agents,
+            vaes=new_vaes,
+            agents=new_agents,
             aggregator=aggregator,
         )
-        print(f"  Task {t} — Phase B ...")
+        print(f"  Task {t} — Phase B (new agents, full loss) ...")
         trainer_pb_t.train(t_train)
 
     # Freeze everything
