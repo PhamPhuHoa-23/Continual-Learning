@@ -1,0 +1,70 @@
+# AdaSlot Phase 2: Continual Learning
+# 
+# Goal: Learn tasks sequentially while preserving learned primitives
+# Focus: Task-specific classification with primitive adaptation
+
+seed: 42
+output_dir: "checkpoints/adaslot_phase2"
+
+# Model Configuration (same as Phase 1)
+model:
+  name: "adaslot_module"
+  feature_dim: 128            # Feature dimension from encoder
+  slot_dim: 64
+  num_slots: 7
+  num_iterations: 3
+  
+  temperature_init: 0.5       # Start from lower temperature (already pretrained)
+  temperature_min: 0.3
+  temperature_decay: 0.00001  # Slower decay
+  
+  min_slots: 1
+  
+  decoder_hidden_dims: [256, 256]
+  position_encoding: true
+
+# Data Configuration
+data:
+  dataset: "cifar100"
+  root: "./data"
+  n_experiences: 10
+
+# Phase 2 Specific Config
+phase2:
+  epochs_per_task: 20         # Train 20 epochs per task
+  tasks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # All 10 tasks sequentially
+  
+  # Regularization for continual learning
+  ewc_lambda: 0.0             # Elastic Weight Consolidation (0 = disabled)
+  replay_buffer_size: 0       # Experience replay (0 = disabled)
+
+# Training Configuration
+training:
+  batch_size: 64
+  num_workers: 4
+  
+  optimizer:
+    type: "adamw"
+    lr: 0.0001                # Lower LR for fine-tuning
+    weight_decay: 0.0001
+  
+  scheduler:
+    type: "cosine"
+
+# Loss Configuration
+losses:
+  # Classification is primary
+  classification:
+    type: "cross_entropy"
+    weight: 1.0
+  
+  # Keep primitive loss for concept preservation
+  primitive:
+    type: "primitive"
+    weight: 30.0              # Balanced: ~25% of total loss (from weight tuning)
+    temperature: 10.0
+  
+  # Optional: reconstruction for slot quality
+  reconstruction:
+    type: "mse"
+    weight: 0.5               # Lower weight

@@ -1,30 +1,51 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.14.0
-#   kernelspec:
-#     display_name: Python 3
-#     language: python
-#     name: python3
-# ---
+# Helper: regenerate kaggle_train_adaslot.py as a full-pipeline Jupytext notebook
+import textwrap
 
+LINES = []
 
-# %% [markdown]
-# # Continual Learning — Full Pipeline (Kaggle)
-#
-# **Phase 0** AdaSlot fine-tune → **Cluster Init** → **Phase A** Agent warm-up → **Phase B** Full training → **SLDA** fit → **Eval**
-#
-# Train inline — khong goi subprocess, config het o cell 4.
+def md(*lines):
+    LINES.append("")
+    LINES.append("# %% [markdown]")
+    for l in lines:
+        LINES.append(f"# {l}" if l else "#")
+    LINES.append("")
 
+def code(src):
+    LINES.append("# %%")
+    LINES.append(textwrap.dedent(src).strip())
+    LINES.append("")
 
-# %% [markdown]
-# ## 1. Paths
+# ── header ──────────────────────────────────────────────────────────────────
+LINES += [
+    "# ---",
+    "# jupyter:",
+    "#   jupytext:",
+    "#     text_representation:",
+    "#       extension: .py",
+    "#       format_name: percent",
+    "#       format_version: '1.3'",
+    "#       jupytext_version: 1.14.0",
+    "#   kernelspec:",
+    "#     display_name: Python 3",
+    "#     language: python",
+    "#     name: python3",
+    "# ---",
+    "",
+]
 
-# %%
+# ── title ────────────────────────────────────────────────────────────────────
+md(
+    "# Continual Learning — Full Pipeline (Kaggle)",
+    "",
+    "**Phase 0** AdaSlot fine-tune → **Cluster Init** → **Phase A** Agent warm-up"
+    " → **Phase B** Full training → **SLDA** fit → **Eval**",
+    "",
+    "Train inline — khong goi subprocess, config het o cell 4.",
+)
+
+# ── 1. paths ─────────────────────────────────────────────────────────────────
+md("## 1. Paths")
+code("""
 import os, sys
 from pathlib import Path
 
@@ -34,12 +55,11 @@ REPO_PATH      = KAGGLE_WORKING / REPO_NAME
 
 print(f"Repo path : {REPO_PATH}")
 print(f"CWD       : {os.getcwd()}")
+""")
 
-
-# %% [markdown]
-# ## 2. Clone & Checkout
-
-# %%
+# ── 2. clone ─────────────────────────────────────────────────────────────────
+md("## 2. Clone & Checkout")
+code("""
 import subprocess
 
 GIT_TOKEN  = "YOUR_GITHUB_PAT_HERE"   # Settings > Developer settings > Personal access tokens
@@ -68,33 +88,33 @@ run(f"git -C {REPO_PATH} log --oneline -3")
 os.chdir(REPO_PATH)
 sys.path.insert(0, str(REPO_PATH))
 print(f"CWD: {os.getcwd()}")
+""")
 
-
-# %% [markdown]
-# ## 3. Install Dependencies
-
-# %%
+# ── 3. install ───────────────────────────────────────────────────────────────
+md("## 3. Install Dependencies")
+code("""
 !pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 !pip install -q tqdm numpy matplotlib scikit-learn hdbscan umap-learn
 !pip install -q -e .
 !pip install -q avalanche-lib
 print("Done!")
+""")
 
-
-# %% [markdown]
-# ## 4. CONFIG — chinh tat ca o day
-#
-# | Section | Mo ta |
-# |---|---|
-# | DATASET | `cifar100` hoac `tiny_imagenet` |
-# | CHECKPOINT | Path toi CLEVR10.ckpt |
-# | PHASE 0 | AdaSlot fine-tune |
-# | CLUSTER | Chon method + hyperparams |
-# | PHASE A | Agent warm-up |
-# | PHASE B | Full agent training |
-# | SLDA | Closed-form classifier |
-
-# %%
+# ── 4. CONFIG ────────────────────────────────────────────────────────────────
+md(
+    "## 4. CONFIG — chinh tat ca o day",
+    "",
+    "| Section | Mo ta |",
+    "|---|---|",
+    "| DATASET | `cifar100` hoac `tiny_imagenet` |",
+    "| CHECKPOINT | Path toi CLEVR10.ckpt |",
+    "| PHASE 0 | AdaSlot fine-tune |",
+    "| CLUSTER | Chon method + hyperparams |",
+    "| PHASE A | Agent warm-up |",
+    "| PHASE B | Full agent training |",
+    "| SLDA | Closed-form classifier |",
+)
+code("""
 import torch
 
 # ===========================================================================
@@ -198,12 +218,11 @@ if torch.cuda.is_available():
 print(f"  Checkpoint : {CKPT_PATH}")
 print(f"  Output     : {OUTPUT_DIR}")
 print("=" * 55)
+""")
 
-
-# %% [markdown]
-# ## 5. Download Dataset
-
-# %%
+# ── 5. download data ─────────────────────────────────────────────────────────
+md("## 5. Download Dataset")
+code("""
 import torchvision.datasets as _D
 
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -219,19 +238,20 @@ elif DATASET == "tiny_imagenet":
     _dest = DATA_ROOT / "tiny-imagenet-200.zip"
     if not _dest.exists():
         urllib.request.urlretrieve(_url, _dest,
-            reporthook=lambda b,bs,t: print(f"  {b*bs/1e6:.0f}/{t/1e6:.0f} MB", end="\r")
+            reporthook=lambda b,bs,t: print(f"  {b*bs/1e6:.0f}/{t/1e6:.0f} MB", end="\\r")
                          if b % 200 == 0 else None)
     with zipfile.ZipFile(_dest) as z:
         z.extractall(DATA_ROOT)
     print("Tiny-ImageNet ready")
+""")
 
-
-# %% [markdown]
-# ## 6. Import (lan 1 — co the loi do Avalanche, binh thuong)
-#
-# > Neu cell nay loi, cu chay tiep cell 7 de re-import sach.
-
-# %%
+# ── 6. first import ──────────────────────────────────────────────────────────
+md(
+    "## 6. Import (lan 1 — co the loi do Avalanche, binh thuong)",
+    "",
+    "> Neu cell nay loi, cu chay tiep cell 7 de re-import sach.",
+)
+code("""
 try:
     import json, random, logging
     import numpy as np
@@ -257,12 +277,11 @@ try:
 except Exception as e:
     print(f"Import lan 1 loi: {e}")
     print("-> Chay cell tiep theo de re-import")
+""")
 
-
-# %% [markdown]
-# ## 7. Import (lan 2 — sach)
-
-# %%
+# ── 7. second import ─────────────────────────────────────────────────────────
+md("## 7. Import (lan 2 — sach)")
+code("""
 import json, random, logging
 import numpy as np
 import torch.nn as nn
@@ -285,12 +304,11 @@ from cont_src.training import (
 from cont_src.training.cluster_init import extract_slots
 
 print("Imports OK!")
+""")
 
-
-# %% [markdown]
-# ## 8. Data Loaders
-
-# %%
+# ── 8. data loaders ──────────────────────────────────────────────────────────
+md("## 8. Data Loaders")
+code("""
 def _make_tf(train):
     base = [T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)]
     if train:
@@ -339,12 +357,11 @@ train_rz = ResizeLoader(train_loader)
 val_rz   = ResizeLoader(val_loader)
 test_rz  = ResizeLoader(test_loader)
 print("ResizeLoaders ready")
+""")
 
-
-# %% [markdown]
-# ## 9. Build Model
-
-# %%
+# ── 9. build model ───────────────────────────────────────────────────────────
+md("## 9. Build Model")
+code("""
 # Wrapper: maps AdaSlotModel output keys to trainer convention
 class SlotModelWrapper(nn.Module):
     def __init__(self, backbone, prim_sel=None):
@@ -385,14 +402,15 @@ aggregator = AttentionAggregator(hidden_dim=D_H).to(DEVICE)
 
 n_total = sum(p.numel() for p in slot_model.parameters())
 print(f"Total trainable params: {n_total:,}")
+""")
 
-
-# %% [markdown]
-# ## 10. Phase 0 — AdaSlot Fine-tune
-#
-# Train backbone + PrimitiveSelector on reconstruction + sparsity + primitive loss.
-
-# %%
+# ── 10. phase 0 ──────────────────────────────────────────────────────────────
+md(
+    "## 10. Phase 0 — AdaSlot Fine-tune",
+    "",
+    f"Train backbone + PrimitiveSelector on reconstruction + sparsity + primitive loss.",
+)
+code("""
 cfg_p0 = AdaSlotTrainerConfig(
     lr               = P0_LR,
     max_steps        = P0_STEPS,
@@ -418,12 +436,11 @@ print(f"Phase 0 done: {metrics_p0}")
 with open(OUTPUT_DIR / "history_p0.json", "w") as f:
     json.dump({k: ([v] if not isinstance(v, list) else v)
                for k, v in metrics_p0.items()}, f)
+""")
 
-
-# %% [markdown]
-# ### Recon visualisation after Phase 0
-
-# %%
+# ── 10b. recon viz ───────────────────────────────────────────────────────────
+md("### Recon visualisation after Phase 0")
+code("""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -443,7 +460,7 @@ def save_recon_grid(model, loader, path, n=8):
     fig, axes = plt.subplots(2, n, figsize=(2*n, 4))
     for i in range(n):
         axes[0,i].imshow(orig_np[i]);  axes[0,i].axis("off"); axes[0,i].set_title("orig",  fontsize=7)
-        axes[1,i].imshow(recon_np[i]); axes[1,i].axis("off"); axes[1,i].set_title(f"recon\n({int(active[i])}s)", fontsize=7)
+        axes[1,i].imshow(recon_np[i]); axes[1,i].axis("off"); axes[1,i].set_title(f"recon\\n({int(active[i])}s)", fontsize=7)
     fig.suptitle(f"AdaSlot recon — {DATASET}", fontsize=9)
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight"); plt.show(); plt.close()
@@ -451,14 +468,15 @@ def save_recon_grid(model, loader, path, n=8):
 
 save_recon_grid(slot_model, val_loader, OUTPUT_DIR / "recon_phase0.png")
 print("Saved recon grid")
+""")
 
-
-# %% [markdown]
-# ## 11. Cluster Init
-#
-# Extract slot embeddings -> cluster -> spawn 1 SlotVAE + 1 Agent per cluster.
-
-# %%
+# ── 11. cluster init ─────────────────────────────────────────────────────────
+md(
+    "## 11. Cluster Init",
+    "",
+    "Extract slot embeddings -> cluster -> spawn 1 SlotVAE + 1 Agent per cluster.",
+)
+code("""
 cfg_clust = ClusterInitConfig(
     method                    = CLUSTER_METHOD,
     method_kwargs             = CLUSTER_KWARGS,
@@ -481,12 +499,11 @@ vaes, agents, cluster_result = initialiser.run(
 )
 M = len(agents)
 print(f"Spawned {M} agents  ({CLUSTER_METHOD})")
+""")
 
-
-# %% [markdown]
-# ## 12. Phase A — Agent Warm-up (hard routing, L_agent only)
-
-# %%
+# ── 12. phase A ──────────────────────────────────────────────────────────────
+md("## 12. Phase A — Agent Warm-up (hard routing, L_agent only)")
+code("""
 cfg_pa = PhaseAConfig(
     lr               = PA_LR,
     max_steps        = PA_STEPS,
@@ -507,12 +524,11 @@ trainer_pa = AgentPhaseATrainer(
 print("Phase A: agent warm-up...")
 metrics_pa = trainer_pa.train(train_rz)
 print(f"Phase A done: {metrics_pa}")
+""")
 
-
-# %% [markdown]
-# ## 13. Phase B — Full Training (soft routing + L_prim + L_SupCon)
-
-# %%
+# ── 13. phase B ──────────────────────────────────────────────────────────────
+md("## 13. Phase B — Full Training (soft routing + L_prim + L_SupCon)")
+code("""
 cfg_pb = PhaseBConfig(
     lr                = PB_LR,
     max_steps         = PB_STEPS,
@@ -549,12 +565,11 @@ for ag in agents:
         for p in ag.parameters():
             p.requires_grad_(False)
 print("Agents frozen")
+""")
 
-
-# %% [markdown]
-# ## 14. SLDA — Incremental Fit (closed-form, 1 pass)
-
-# %%
+# ── 14. SLDA ─────────────────────────────────────────────────────────────────
+md("## 14. SLDA — Incremental Fit (closed-form, 1 pass)")
+code("""
 slda = StreamLDA(
     n_classes   = N_CLASSES,
     feature_dim = D_H,
@@ -581,12 +596,11 @@ trainer_slda = SLDATrainer(
 print("SLDA: fitting...")
 trainer_slda.fit(train_rz)
 print(f"SLDA fitted on {slda._n_total} samples")
+""")
 
-
-# %% [markdown]
-# ## 15. Evaluation
-
-# %%
+# ── 15. eval ─────────────────────────────────────────────────────────────────
+md("## 15. Evaluation")
+code("""
 val_metrics  = trainer_slda.evaluate(val_rz)
 test_metrics = trainer_slda.evaluate(test_rz)
 
@@ -594,12 +608,11 @@ print("=" * 45)
 print(f"  Val  accuracy : {val_metrics['accuracy']*100:.2f}%")
 print(f"  Test accuracy : {test_metrics['accuracy']*100:.2f}%")
 print("=" * 45)
+""")
 
-
-# %% [markdown]
-# ## 16. Save Checkpoint
-
-# %%
+# ── 16. save ─────────────────────────────────────────────────────────────────
+md("## 16. Save Checkpoint")
+code("""
 ckpt_out = OUTPUT_DIR / "pipeline_final.pt"
 torch.save({
     "slot_model": slot_model.state_dict(),
@@ -616,12 +629,11 @@ torch.save({
     },
 }, ckpt_out)
 print(f"Checkpoint saved: {ckpt_out}")
+""")
 
-
-# %% [markdown]
-# ## 17. Training Curves
-
-# %%
+# ── 17. curves ───────────────────────────────────────────────────────────────
+md("## 17. Training Curves")
+code("""
 hist_path = OUTPUT_DIR / "history_p0.json"
 if hist_path.exists():
     with open(hist_path) as f:
@@ -638,12 +650,11 @@ if hist_path.exists():
     print("Curves saved")
 else:
     print(f"No history file at {hist_path}")
+""")
 
-
-# %% [markdown]
-# ## 18. Summary
-
-# %%
+# ── 18. summary ──────────────────────────────────────────────────────────────
+md("## 18. Summary")
+code("""
 ckpts = sorted(OUTPUT_DIR.rglob("*.pt"))
 print("=" * 55)
 print(f"  Dataset       : {DATASET}")
@@ -656,3 +667,11 @@ for c in ckpts:
     print(f"    {c.name}  ({c.stat().st_size/1e6:.1f} MB)")
 print("=" * 55)
 print("Done! Download checkpoints tu tab Output tren Kaggle.")
+""")
+
+# ── write ────────────────────────────────────────────────────────────────────
+out = "\n".join(LINES)
+with open("kaggle_train_adaslot.py", "w", encoding="utf-8") as f:
+    f.write(out)
+
+print(f"Written kaggle_train_adaslot.py  ({len(LINES)} lines)")

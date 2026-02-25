@@ -241,8 +241,9 @@ class AdaSlotModel(nn.Module):
         slots_keep_prob = grouping_out["slots_keep_prob"]
         hard_keep_decision = grouping_out["hard_keep_decision"]
 
-        # 4. Decode
-        decoder_out = self.models.object_decoder(slots)
+        # 4. Decode (pass hard_keep_decision for Gumbel masking)
+        decoder_out = self.models.object_decoder(
+            slots, left_mask=hard_keep_decision)
 
         return {
             "reconstruction": decoder_out["reconstruction"],

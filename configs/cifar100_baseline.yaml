@@ -1,0 +1,132 @@
+# Example Configuration: CIFAR-100 Baseline
+
+experiment_name: "cifar100_baseline"
+output_dir: "outputs/cifar100_baseline"
+log_dir: "logs/cifar100_baseline"
+
+# Backbone configuration
+backbone:
+  type: "vit"
+  pretrained: true
+  freeze: true
+  pretrained_source: "imagenet21k"
+  output_dim: 768
+
+# Slot Attention configuration
+slot_attention:
+  num_slots: 7
+  slot_dim: 64
+  num_iterations: 3
+  hidden_dim: 128
+  freeze_after_task1: true
+
+# Agent configuration
+agent:
+  type: "mlp"
+  input_dim: 64  # Must match slot_dim
+  hidden_dim: 256
+  output_dim: 256  # d_h in paper
+  num_layers: 3
+  activation: "relu"
+  dropout: 0.0
+  use_layer_norm: true
+  freeze_after_training: true
+
+# Router configuration
+router:
+  type: "vae"
+  latent_dim: 32
+  hidden_dims: [128, 64]
+  freeze_network: true  # Freeze VAE network after training
+  update_stats: true    # But update latent statistics
+  threshold_match: -10.0
+  threshold_novel: -50.0
+
+# Aggregator configuration
+aggregator:
+  type: "attention"
+  hidden_dim: 256  # Must match agent.output_dim
+  use_per_agent_keys: true
+  freeze_keys_with_agents: true
+
+# Classifier configuration
+classifier:
+  type: "slda"
+  shrinkage: 0.0001
+  incremental: true
+
+# Loss configuration
+loss:
+  # Which losses to use
+  use_reconstruction: false  # Only for Task 1 slot attention
+  use_primitive: true
+  use_supcon: true
+  use_agent_recon: false
+  use_local_geometry: false
+  
+  # Loss weights
+  weight_reconstruction: 1.0
+  weight_primitive: 10.0  # α in paper
+  weight_supcon: 1.0      # β in paper
+  weight_agent_recon: 1.0 # γ in paper
+  weight_local_geometry: 0.5  # δ in paper
+  
+  # Loss parameters
+  primitive_temperature: 10.0  # τ_p in paper
+  supcon_temperature: 0.07
+  local_k_neighbors: 5
+
+# Clustering configuration (for agent spawning)
+clustering:
+  algorithm: "kmeans"
+  buffer_size_min: 100
+  cluster_size_min: 20
+  similarity_threshold: 0.7
+  n_clusters_task1: 10  # Initial number of agents
+
+# Data configuration
+data:
+  dataset: "cifar100"
+  data_root: "./data"
+  n_tasks: 10
+  n_classes_per_task: 10
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  shuffle_classes: true
+  seed: 42
+  use_augmentation: true
+  augmentation_strength: "medium"
+
+# Training configuration
+training:
+  # Task 1 (warm-up phase)
+  task1_epochs_slot_attention: 100
+  task1_epochs_agents: 50
+  task1_lr: 0.0003
+  
+  # Incremental tasks
+  incremental_epochs: 30
+  incremental_lr: 0.0001
+  
+  # Optimization
+  optimizer: "adam"
+  weight_decay: 0.00001
+  gradient_clip_norm: 10.0
+  
+  # Learning rate scheduler
+  use_scheduler: true
+  scheduler_type: "cosine"
+  warmup_epochs: 5
+  
+  # Checkpointing
+  save_interval: 10
+  keep_best_only: false
+  
+  # Device
+  device: "cuda"
+  mixed_precision: false
+  
+  # Reproducibility
+  seed: 42
+  deterministic: true

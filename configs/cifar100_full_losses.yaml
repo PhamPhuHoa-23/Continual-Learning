@@ -1,0 +1,74 @@
+# Example Configuration: CIFAR-100 with All Losses
+
+experiment_name: "cifar100_full_losses"
+output_dir: "outputs/cifar100_full"
+log_dir: "logs/cifar100_full"
+
+# Use same backbone/slot attention/agent as baseline
+backbone:
+  type: "vit"
+  pretrained: true
+  freeze: true
+
+slot_attention:
+  num_slots: 7
+  slot_dim: 64
+  freeze_after_task1: true
+
+agent:
+  type: "mlp_with_decoder"  # With decoder for L_agent
+  input_dim: 64
+  hidden_dim: 256
+  output_dim: 256
+  num_layers: 3
+  activation: "relu"
+  use_layer_norm: true
+
+router:
+  type: "vae"
+  latent_dim: 32
+  freeze_network: true
+  update_stats: true
+
+aggregator:
+  type: "attention"
+  hidden_dim: 256
+  use_per_agent_keys: true
+
+classifier:
+  type: "slda"
+
+# Enable ALL losses
+loss:
+  use_reconstruction: true
+  use_primitive: true
+  use_supcon: true
+  use_agent_recon: true      # Enabled
+  use_local_geometry: true   # Enabled (requires buffer)
+  
+  # Weights from paper
+  weight_primitive: 10.0
+  weight_supcon: 1.0
+  weight_agent_recon: 1.0
+  weight_local_geometry: 0.5
+  
+  primitive_temperature: 10.0
+  supcon_temperature: 0.07
+  local_k_neighbors: 5
+
+clustering:
+  n_clusters_task1: 10
+
+data:
+  dataset: "cifar100"
+  n_tasks: 10
+  n_classes_per_task: 10
+  batch_size: 64
+
+training:
+  task1_epochs_slot_attention: 100
+  task1_epochs_agents: 50
+  incremental_epochs: 30
+  task1_lr: 0.0003
+  incremental_lr: 0.0001
+  seed: 42

@@ -1,0 +1,65 @@
+# Tiny-ImageNet Configuration
+
+experiment_name: "tiny_imagenet_baseline"
+output_dir: "outputs/tiny_imagenet"
+log_dir: "logs/tiny_imagenet"
+
+# Larger model for Tiny-ImageNet
+backbone:
+  type: "vit"
+  pretrained: true
+  freeze: true
+
+slot_attention:
+  num_slots: 10  # More slots for complex images
+  slot_dim: 128  # Larger slot dimension
+  freeze_after_task1: true
+
+agent:
+  type: "mlp"
+  input_dim: 128  # Match slot_dim
+  hidden_dim: 512  # Larger hidden
+  output_dim: 512
+  num_layers: 4    # Deeper network
+  activation: "gelu"
+  dropout: 0.1
+  use_layer_norm: true
+
+router:
+  type: "vae"
+  latent_dim: 64   # Larger latent space
+  hidden_dims: [256, 128]
+  freeze_network: true
+  update_stats: true
+
+aggregator:
+  type: "attention"
+  hidden_dim: 512
+
+classifier:
+  type: "slda"
+
+loss:
+  use_primitive: true
+  use_supcon: true
+  weight_primitive: 10.0
+  primitive_temperature: 10.0
+
+clustering:
+  n_clusters_task1: 20  # More initial agents
+
+data:
+  dataset: "tiny_imagenet"
+  data_root: "./data"
+  n_tasks: 20
+  n_classes_per_task: 10
+  batch_size: 32  # Smaller batch for larger images
+  num_workers: 4
+
+training:
+  task1_epochs_slot_attention: 150
+  task1_epochs_agents: 100
+  incremental_epochs: 50
+  task1_lr: 0.0003
+  incremental_lr: 0.0001
+  seed: 42

@@ -1,0 +1,123 @@
+# AdaSlot Multi-Phase Training: Complete Pipeline
+# 
+# Train all 3 phases sequentially:
+#   Phase 1: Pretrain with reconstruction + primitive loss (50 epochs)
+#   Phase 2: Continual learning on 10 tasks (20 epochs/task)
+#   Phase 3: Fine-tuning/consolidation (10 epochs)
+#
+# Usage: python train_adaslot_multiphase.py --config configs/adaslot_multiphase_full.yaml --phase all
+
+seed: 42
+output_dir: "checkpoints/adaslot_multiphase"
+
+# Model Configuration
+model:
+  name: "adaslot_module"
+  feature_dim: 128            # Feature dimension from encoder
+  slot_dim: 64                # Dimension of each slot
+  num_slots: 7                # Number of slots to initialize
+  num_iterations: 3           # Slot attention iterations
+  
+  # Temperature annealing for Gumbel-Softmax
+  temperature_init: 1.0
+  temperature_min: 0.5
+  temperature_decay: 0.00003  # τ(t) = max(0.5, 1.0 * exp(-0.00003*t))
+  
+  # Slot selection
+  min_slots: 1                # Minimum slots to keep
+  
+  # Decoder
+  decoder_hidden_dims: [256, 256]
+  position_encoding: true
+
+# Data Configuration
+data:
+  dataset: "cifar100"
+  root: "./data"
+  n_experiences: 10           # 10 tasks, 10 classes each
+  train_transform: "standard"
+  eval_transform: "standard"
+
+# ============================================================================
+# PHASE 1: Pretraining
+# ============================================================================
+phase1:
+  epochs: 50                  # Pretrain for 50 epochs
+  tasks: null                 # Use all tasks (null = all data)
+  save_interval: 10           # Save checkpoint every 10 epochs
+
+# ============================================================================
+# PHASE 2: Continual Learning
+# ============================================================================
+phase2:
+  epochs_per_task: 20         # Train 20 epochs per task
+  tasks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # All 10 tasks sequentially
+  
+  # Continual learning strategies (optional)
+  ewc_lambda: 0.0             # Elastic Weight Consolidation (0 = disabled)
+  replay_buffer_size: 0       # Experience replay (0 = disabled)
+
+# ============================================================================
+# PHASE 3: Fine-tuning / Consolidation
+# ============================================================================
+phase3:
+  epochs: 10                  # Joint training for 10 epochs
+  tasks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # All tasks
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  batch_size: 64
+  num_workers: 4
+  
+  optimizer:
+    type: "adamw"
+    lr: 0.0003                # Base learning rate (adjusted per phase)
+    weight_decay: 0.0001
+  
+  scheduler:
+    type: "cosine"
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+losses:
+  # Reconstruction Loss (Phase 1 primary, Phase 2 optional)
+  reconstruction:
+    type: "mse"
+    weight: 1.0
+  
+  # Primitive Loss (Phase 1 & 2)
+  primitive:
+    type: "primitive"
+    weight: 30.0              # Balanced: ~25% of total loss (from weight tuning)
+    temperature: 10.0         # τ_p = 10
+  
+  # Sparsity Loss (Phase 1)
+  sparsity:
+    type: "l1"
+    weight: 0.1               # Encourage dropping unnecessary slots
+  
+  # Classification Loss (Phase 2 & 3)
+  # (Added automatically in Phase 2/3)
+
+# ============================================================================
+# Notes
+# ============================================================================
+# 
+# Phase-specific loss weights are adjusted automatically:
+#   - Phase 1: reconstruction (1.0) + primitive (10.0) + sparsity (0.1)
+#   - Phase 2: classification (1.0) + primitive (5.0) + reconstruction (0.5)
+#   - Phase 3: classification (1.0) only
+#
+# Learning rates are scaled per phase:
+#   - Phase 1: 3e-4 (base)
+#   - Phase 2: 1e-4 (0.33x)
+#   - Phase 3: 3e-5 (0.1x)
+#
+# Total training time (approximate):
+#   - Phase 1: 50 epochs on all data (~4-6 hours on GPU)
+#   - Phase 2: 20 epochs × 10 tasks (~6-8 hours on GPU)
+#   - Phase 3: 10 epochs on all data (~1-2 hours on GPU)
+#   - Total: ~12-16 hours

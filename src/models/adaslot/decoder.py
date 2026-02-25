@@ -28,7 +28,8 @@ def get_slotattention_decoder_backbone(
     Architecture: 4x ConvTranspose2d(stride=2) + 1x ConvTranspose2d(stride=1) + final Conv.
     """
     return nn.Sequential(
-        nn.ConvTranspose2d(object_dim, 64, 5, stride=2, padding=2, output_padding=1),
+        nn.ConvTranspose2d(object_dim, 64, 5, stride=2,
+                           padding=2, output_padding=1),
         nn.ReLU(inplace=True),
         nn.ConvTranspose2d(64, 64, 5, stride=2, padding=2, output_padding=1),
         nn.ReLU(inplace=True),
@@ -38,7 +39,8 @@ def get_slotattention_decoder_backbone(
         nn.ReLU(inplace=True),
         nn.ConvTranspose2d(64, 64, 5, stride=1, padding=2, output_padding=0),
         nn.ReLU(inplace=True),
-        nn.ConvTranspose2d(64, output_dim, 3, stride=1, padding=1, output_padding=0),
+        nn.ConvTranspose2d(64, output_dim, 3, stride=1,
+                           padding=1, output_padding=0),
     )
 
 
@@ -60,11 +62,12 @@ def get_activation_fn(name: Union[str, Callable]):
 
 class SlotAttentionDecoder(nn.Module):
     """
-    Decoder used in the original Slot Attention paper.
+    Decoder used in the original Slot Attention paper (with Gumbel mask support).
 
     Broadcasts each slot to an 8x8 spatial grid, optionally adds positional
     embedding, then applies a deconvolution network. Splits output into
     RGB (3ch) and alpha (1ch), normalizes alpha via softmax across slots.
+    Optionally applies a hard_keep_decision mask (Gumbel selection).
     """
 
     def __init__(
@@ -72,30 +75,38 @@ class SlotAttentionDecoder(nn.Module):
         decoder: nn.Module,
         final_activation: Union[str, Callable] = "identity",
         positional_embedding: Optional[nn.Module] = None,
+        mask_type: str = "mask_normalized",
     ):
         super().__init__()
         self.initial_conv_size = (8, 8)
         self.decoder = decoder
         self.final_activation = get_activation_fn(final_activation)
         self.positional_embedding = positional_embedding
+        self.mask_type = mask_type
         if positional_embedding:
             self.register_buffer(
                 "grid", build_grid_of_positions(self.initial_conv_size)
             )
 
-    def forward(self, object_features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        object_features: torch.Tensor,
+        left_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Decode slot features into image reconstructions.
 
         Args:
             object_features: (B, num_slots, slot_dim) slot representations.
+            left_mask: (B, num_slots) binary Gumbel keep decisions (optional).
 
         Returns:
             Dict with 'reconstruction', 'object_reconstructions', 'masks'.
         """
         assert object_features.dim() >= 3
         initial_shape = object_features.shape[:-1]  # (B, num_slots)
-        object_features = object_features.flatten(0, -2)  # (B*num_slots, slot_dim)
+        object_features = object_features.flatten(
+            0, -2)  # (B*num_slots, slot_dim)
 
         # Broadcast to spatial grid
         object_features = (
@@ -111,12 +122,33 @@ class SlotAttentionDecoder(nn.Module):
 
         # Apply deconvolution
         output = self.decoder(object_features)
-        output = output.unflatten(0, initial_shape)
+        output = output.unflatten(0, initial_shape)  # (B, num_slots, C, H, W)
 
         # Split RGB and alpha
+        # (B, K, 3, H, W), (B, K, 1, H, W)
         rgb, alpha = output.split([3, 1], dim=-3)
         rgb = self.final_activation(rgb)
-        alpha = alpha.softmax(dim=-4)  # Normalize across slots
+
+        # Apply Gumbel keep mask
+        if left_mask is not None and self.mask_type != "none":
+            if self.mask_type == "logit":
+                VANISH = 1e5
+                drop_mask = 1 - left_mask
+                alpha = alpha - VANISH * \
+                    drop_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                alpha = alpha.softmax(dim=-4)
+            elif self.mask_type == "mask":
+                alpha = alpha.softmax(dim=-4)
+                alpha = alpha * \
+                    left_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            elif self.mask_type == "mask_normalized":
+                MINOR = 1e-5
+                alpha = alpha.softmax(dim=-4)
+                alpha = alpha * \
+                    left_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                alpha = alpha / (alpha.sum(dim=-4, keepdim=True) + MINOR)
+        else:
+            alpha = alpha.softmax(dim=-4)
 
         return {
             "reconstruction": (rgb * alpha).sum(-4),
