@@ -147,6 +147,13 @@ class AdaSlotTrainer(BaseTrainer):
         if labels is not None:
             labels = labels.to(self.device)
 
+        # AdaSlot decoder always outputs 128×128 (initial_conv_size=(8,8) hardcoded).
+        # Resize input to match, regardless of dataloader IMG_SIZE.
+        if images.shape[-1] != 128 or images.shape[-2] != 128:
+            images = F.interpolate(
+                images, size=(128, 128), mode="bilinear", align_corners=False
+            )
+
         slot_model = self.model_components["slot_model"]
         slot_model.train()
 
