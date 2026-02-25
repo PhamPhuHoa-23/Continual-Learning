@@ -79,15 +79,28 @@ def _primitive_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> t
 
 def _supcon_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> torch.Tensor:
     """Khosla et al. SupCon loss on L2-normalised features."""
+    B = hidden.shape[0]
+    if B < 2:
+        return hidden.new_zeros(()).squeeze()
+
     h  = F.normalize(hidden, p=2, dim=-1)          # (B, D)
-    B  = h.shape[0]
     sim = torch.mm(h, h.t()) / tau                  # (B, B)
 
     # Mask out diagonal (self)
     diag_mask = torch.eye(B, dtype=torch.bool, device=h.device)
     sim = sim.masked_fill(diag_mask, float("-inf"))
 
-    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    # Rows where every element is -inf (shouldn't happen for B>=2, but be safe)
+    row_max = sim.max(dim=1).values
+    valid_rows = torch.isfinite(row_max)            # (B,)
+    if not valid_rows.any():
+        return hidden.new_zeros(()).squeeze()
+
+    log_prob = torch.zeros_like(sim)
+    log_prob[valid_rows] = (
+        sim[valid_rows]
+        - torch.logsumexp(sim[valid_rows], dim=1, keepdim=True)
+    )
 
     # Positive pairs (same class, excluding self)
     pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~diag_mask
@@ -95,7 +108,7 @@ def _supcon_loss(hidden: torch.Tensor, labels: torch.Tensor, tau: float) -> torc
     n_pos = pos_mask.sum(dim=1).clamp(min=1)
 
     loss = -(pos_mask * log_prob).sum(dim=1) / n_pos
-    return loss.mean()
+    return loss[valid_rows].mean()
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +368,10 @@ class AgentPhaseBTrainer(BaseTrainer):
         # hard assignments for aggregator keys
         assignments = weights.argmax(dim=-1)             # (B, K)
         H = self._aggregate(hidden_slots, assignments=assignments)   # (B, D_h)
+
+        # Sanitize H: NaN/Inf from upstream explosions would poison label losses
+        if not torch.isfinite(H).all():
+            H = torch.nan_to_num(H, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # 5. Label losses
         l_prim   = torch.tensor(0.0, device=self.device)
