@@ -284,7 +284,6 @@ class ClusterInitialiser:
             vae     = SlotVAE(
                 slot_dim    = slot_dim,
                 latent_dim  = cfg.vae_latent_dim,
-                scoring_mode= scoring_mode,
             )
             slots_t = torch.tensor(cluster_slots, dtype=torch.float32).to(self.device)
             vae.train_vae(slots_t, epochs=cfg.vae_epochs, beta=cfg.vae_beta)
