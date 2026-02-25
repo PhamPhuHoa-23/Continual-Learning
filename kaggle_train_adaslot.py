@@ -128,11 +128,11 @@ D_H        = 64     # agent hidden dim / aggregator output dim
 P0_EPOCHS    = 2            # so epoch (1 epoch ≈ 700 buoc voi CIFAR-100 bs=64)
 P0_LR        = 4e-4
 P0_W_RECON   = 1.0          # recon loss weight
-P0_W_SPARSE  = 0.5          # sparsity penalty weight
-                             # NOTE: 10.0 la qua cao voi CIFAR-100 natural images
-                             # (CLEVR10 checkpoint duoc train cho scene don gian 3-10 objects)
-                             # 0.5 giu ~5-8 active slots thay vi collapse xuong <2
-P0_W_PRIM    = 1.0          # primitive loss weight (giam tu 5.0 tranh compete voi recon early)
+P0_W_SPARSE  = 0.0          # sparsity penalty weight — TAT HOAN TOAN cho Phase 0
+                             # CLEVR10 gate da duoc train tren CLEVR (nen no drop slot CIFAR-100 ngay)
+                             # Dung sparsity o day se gay slot collapse do domain shift
+                             # Backbone se tu adapt keepall slots khi chi co recon + prim loss
+P0_W_PRIM    = 1.0          # primitive loss weight
 P0_LOG_EVERY = 50
 
 # ===========================================================================
