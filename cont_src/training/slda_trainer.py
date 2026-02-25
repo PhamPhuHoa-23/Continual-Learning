@@ -221,6 +221,11 @@ class SLDATrainer:
             for p in mod.parameters():
                 p.requires_grad_(False)
 
+        # Register agents with aggregator (required by AttentionAggregator)
+        if hasattr(self.aggregator, "register_agent"):
+            for i in range(len(self.agents)):
+                self.aggregator.register_agent(i)
+
         logger.info(
             f"[SLDATrainer] feature_dim={config.feature_dim}  "
             f"n_classes={config.n_classes}  shrinkage={config.shrinkage}"
@@ -357,13 +362,14 @@ class SLDATrainer:
         chosen = H_stack.gather(2, assign_exp).squeeze(2)  # (B, K, D_h)
 
         # 4. Aggregate
-        H = self._agg(chosen)                        # (B, D_h)
+        H = self._agg(chosen, assignments)              # (B, D_h)
         return H
 
-    def _agg(self, hidden_slots: torch.Tensor) -> torch.Tensor:
+    def _agg(self, hidden_slots: torch.Tensor, assignments: torch.Tensor) -> torch.Tensor:
         """Aggregate (B, K, D_h) → (B, D_h)."""
         try:
-            return self.aggregator(hidden_slots)
+            result = self.aggregator(hidden_slots, assignments)
+            return result["aggregated"] if isinstance(result, dict) else result
         except Exception:
             return hidden_slots.mean(dim=1)
 

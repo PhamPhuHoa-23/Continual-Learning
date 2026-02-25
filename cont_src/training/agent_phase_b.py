@@ -210,6 +210,10 @@ class AgentPhaseBTrainer(BaseTrainer):
             else f"{self.config.max_epochs} epochs"
         )
         logger.info(f"[AgentPhaseBTrainer] Phase B full training — {dur}")
+        # Register agent IDs with AttentionAggregator (creates per-agent keys)
+        if self.aggregator is not None and hasattr(self.aggregator, "register_agent"):
+            for i in range(len(self.agents)):
+                self.aggregator.register_agent(i)
 
     def on_after_step(self, step: int, metrics: Dict) -> None:
         """Log current temperature every log interval."""
@@ -306,15 +310,26 @@ class AgentPhaseBTrainer(BaseTrainer):
         l_agent_avg = l_agent_total / max(len(self.agents), 1)
         return hidden_slots, l_agent_avg
 
-    def _aggregate(self, hidden_slots: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _aggregate(
+        self,
+        hidden_slots: torch.Tensor,
+        assignments: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Aggregate (B, K, D_h) → (B, D_h).
         Uses self.aggregator if available, otherwise mean pooling.
         """
         if self.aggregator is not None:
-            if mask is not None:
-                return self.aggregator(hidden_slots, mask)
-            return self.aggregator(hidden_slots)
+            if assignments is not None:
+                result = self.aggregator(hidden_slots, assignments)
+                # AttentionAggregator returns a dict with key 'aggregated'
+                if isinstance(result, dict):
+                    return result.get("aggregated",
+                           result.get("pooled",
+                           result.get("output", hidden_slots.mean(dim=1))))
+                return result
+            return hidden_slots.mean(dim=1)
         return hidden_slots.mean(dim=1)                # (B, D_h)
 
     def train_step(self, batch: Any) -> Dict[str, float]:
@@ -337,7 +352,9 @@ class AgentPhaseBTrainer(BaseTrainer):
         hidden_slots, l_agent = self._compute_hidden(slots, weights)   # (B, K, D_h), scalar
 
         # 4. Aggregate into one vector per sample
-        H = self._aggregate(hidden_slots)                # (B, D_h)
+        # hard assignments for aggregator keys
+        assignments = weights.argmax(dim=-1)             # (B, K)
+        H = self._aggregate(hidden_slots, assignments=assignments)   # (B, D_h)
 
         # 5. Label losses
         l_prim   = torch.tensor(0.0, device=self.device)
