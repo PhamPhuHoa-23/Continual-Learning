@@ -132,8 +132,10 @@ D_H        = 64     # agent hidden dim / aggregator output dim
 # ===========================================================================
 # PHASE 0 — AdaSlot fine-tune
 # ===========================================================================
-P0_EPOCHS    = 2            # so epoch (1 epoch ≈ 700 buoc voi CIFAR-100 bs=64)
-P0_LR        = 4e-4
+P0_EPOCHS    = 5            # so epoch — can nhieu hon vi backbone CLEVR10 adapt sang CIFAR-100
+                             # domain shift lon: gate reset + recon ca 2 train cung luc
+                             # 5 epochs ≈ 3500 buoc, recon typically giam 10x so voi ban dau
+P0_LR        = 1e-3          # tang LR: 4e-4 qua nho cho domain shift (Adam se adapt)
 P0_W_RECON   = 1.0          # recon loss weight
 P0_W_SPARSE  = 10.0         # sparsity penalty weight (match original AdaSlot: linear_weight=10 + mse_sum)
                              # Gate duoc reset lai (CLEVR10 saturated o slots_keep_prob=1.0)
