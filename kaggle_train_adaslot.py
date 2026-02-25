@@ -69,6 +69,13 @@ os.chdir(REPO_PATH)
 sys.path.insert(0, str(REPO_PATH))
 print(f"CWD: {os.getcwd()}")
 
+# Xoa __pycache__ de Python khong load bytecode cu sau git pull
+import shutil as _sh
+for _p in REPO_PATH.rglob("__pycache__"):
+    _sh.rmtree(_p, ignore_errors=True)
+import importlib as _il; _il.invalidate_caches()
+print("__pycache__ cleared")
+
 
 # %% [markdown]
 # ## 3. Install Dependencies
