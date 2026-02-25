@@ -183,7 +183,15 @@ def train_phase1_adaslot(
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     if scheduler is None:
-        scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000)
+        # Scale warmup/decay proportionally to num_steps so the LR curve
+        # looks the same regardless of whether you train 60k or 500k steps.
+        #   warmup : 2% of total steps  (min 1 000)
+        #   decay  : 20% of total steps (min 5 000)
+        _warmup = max(1000, int(0.02 * num_steps))
+        _decay  = max(5000, int(0.20 * num_steps))
+        scheduler = build_scheduler(optimizer, decay_rate=0.5,
+                                    decay_steps=_decay, warmup_steps=_warmup)
+        print(f"  Scheduler: warmup={_warmup} steps, decay_steps={_decay}")
 
     recon_loss_fn = ReconstructionLoss()
     sparse_loss_fn = SparsePenalty(linear_weight=sparse_linear_weight)
@@ -325,7 +333,11 @@ def train_phase2_agents(
     ]).to(device)
 
     optimizer = torch.optim.AdamW(student_agents.parameters(), lr=lr, weight_decay=0.04)
-    scheduler = build_scheduler(optimizer, decay_rate=0.5, decay_steps=50000, warmup_steps=5000)
+    _warmup = max(1000, int(0.05 * num_steps))
+    _decay  = max(5000, int(0.50 * num_steps))
+    scheduler = build_scheduler(optimizer, decay_rate=0.5,
+                                decay_steps=_decay, warmup_steps=_warmup)
+    print(f"  Scheduler: warmup={_warmup} steps, decay_steps={_decay}")
 
     os.makedirs(save_dir, exist_ok=True)
     data_iter = iter(dataloader)
@@ -1307,8 +1319,11 @@ def main():
     _p1_optimizer = torch.optim.Adam(
         adaslot.parameters(), lr=args.p1_lr
     )
+    _p1_warmup = max(100, int(0.02 * args.task_p1_steps))
+    _p1_decay  = max(500, int(0.20 * args.task_p1_steps))
     _p1_scheduler = build_scheduler(
-        _p1_optimizer, decay_rate=0.5, decay_steps=100000, warmup_steps=10000
+        _p1_optimizer, decay_rate=0.5,
+        decay_steps=_p1_decay, warmup_steps=_p1_warmup,
     )
 
     for task_id, task_loader in enumerate(train_loaders):
