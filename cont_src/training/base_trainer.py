@@ -279,13 +279,43 @@ class BaseTrainer(ABC):
                 self.global_step += 1
 
                 # ---- update progress bar postfix ----
+                def _fmt_v(v):
+                    if hasattr(v, "item"):
+                        v = v.item()
+                    return f"{float(v):.4f}"
+
                 loss_val = metrics.get("loss_total", 0)
                 if hasattr(loss_val, "item"):
                     loss_val = loss_val.item()
-                postfix = {"loss": f"{loss_val:.4f}", "step": self.global_step}
+
+                postfix: Dict[str, str] = {"loss": f"{loss_val:.4f}"}
+
+                # individual sub-losses (l_recon, l_sparse, l_prim, l_agent,
+                # l_agent_mean, l_supcon, …) — skip raw/redundant keys
+                _SKIP = {"loss_total", "n_active_slots", "active_agents",
+                         "temperature", "l_recon_raw"}
+                for _k, _v in metrics.items():
+                    if _k in _SKIP:
+                        continue
+                    if _k.startswith("l_"):
+                        _suffix = _k[2:]  # strip leading "l_"
+                        # skip per-agent numerics: l_agent_0, l_agent_1, …
+                        if _suffix.startswith("agent_") and _suffix[6:].isdigit():
+                            continue
+                        postfix[_suffix] = _fmt_v(_v)
+
+                # compact extras
                 n_slots = metrics.get("n_active_slots")
                 if n_slots is not None:
-                    postfix["slots"] = f"{n_slots:.1f}"
+                    postfix["slots"] = f"{float(n_slots):.1f}"
+                n_agts = metrics.get("active_agents")
+                if n_agts is not None:
+                    postfix["agts"] = str(int(n_agts))
+                temp = metrics.get("temperature")
+                if temp is not None:
+                    postfix["temp"] = f"{float(temp):.3f}"
+
+                postfix["step"] = str(self.global_step)
                 batch_iter.set_postfix(postfix)
 
                 # ---- logging ----
@@ -304,9 +334,16 @@ class BaseTrainer(ABC):
             epoch_metrics = self._accumulator.mean()
             self.on_epoch_end(epoch, epoch_metrics)
             if not use_steps and not isinstance(outer_iter, range):
-                outer_iter.set_postfix(
-                    {k: f"{v:.4f}" for k, v in epoch_metrics.items()
-                     if isinstance(v, (int, float))})
+                # show per-epoch averages — skip per-agent numeric keys
+                ep_postfix = {}
+                for _k, _v in epoch_metrics.items():
+                    if not isinstance(_v, (int, float)):
+                        continue
+                    # skip l_agent_0, l_agent_1, …
+                    if _k.startswith("l_agent_") and _k[8:].isdigit():
+                        continue
+                    ep_postfix[_k] = f"{_v:.4f}"
+                outer_iter.set_postfix(ep_postfix)
 
         final_metrics = all_metrics.mean()
         self.on_train_end(final_metrics)
