@@ -732,6 +732,7 @@ def train_phase3_crp(
     mlp_estimator=None,
     ucb_moe=None,
     filter_k: int = 10,
+    epochs: int = 1,
 ):
     """
     Phase 3: Incrementally fit the CRP aggregator on agent hidden labels.
@@ -765,6 +766,7 @@ def train_phase3_crp(
         mlp_estimator: Trained MLP estimator (from Phase 2.5).
         ucb_moe: UCBWeightedMoE instance (persisted across tasks).
         filter_k: Number of agents to keep after fast filtering.
+        epochs: Number of epochs to train the aggregator for this task.
 
     Returns:
         aggregator: Updated aggregator (BatchCRPAggregator).
@@ -838,8 +840,12 @@ def train_phase3_crp(
     total_samples = 0
     t0 = time.time()
 
-    for batch_idx, batch in enumerate(dataloader):
-        images = (batch[0].to(device) if isinstance(batch, (list, tuple))
+    for epoch in range(epochs):
+        if epochs > 1:
+            print(f"  [Epoch {epoch + 1}/{epochs}]")
+        
+        for batch_idx, batch in enumerate(dataloader):
+            images = (batch[0].to(device) if isinstance(batch, (list, tuple))
                   else batch['image'].to(device))
         targets = batch[1] if isinstance(batch, (list, tuple)) else batch['label']
 
@@ -909,7 +915,7 @@ def train_phase3_crp(
             if use_estimator_pipeline:
                 extra = f" | ucb_rounds={ucb_moe.total_count}"
             print(
-                f"  Batch {batch_idx + 1:>5d} | "
+                f"    Batch {batch_idx + 1:>5d} | "
                 f"samples={total_samples} | "
                 f"acc={acc:.2f}%{extra} | "
                 f"{elapsed:.0f}s"
@@ -994,6 +1000,8 @@ def main():
                         help="Phase 2 fine-tuning steps per task (CompSLOT mode)")
     parser.add_argument("--task_p2b_steps", type=int, default=1000,
                         help="Phase 2.5 fine-tuning steps per task (CompSLOT mode)")
+    parser.add_argument("--task_p3_epochs", type=int, default=1,
+                        help="Phase 3 epochs per task (CompSLOT mode)")
 
     parser.add_argument("--filter_k", type=int, default=10,
                         help="Number of agents to keep after fast filtering")
@@ -1339,6 +1347,7 @@ def main():
             mlp_estimator=mlp_estimator,
             ucb_moe=ucb_moe,
             filter_k=args.filter_k,
+            epochs=args.task_p3_epochs,
         )
 
         # ── Evaluate on every task seen so far ───────────────────────
@@ -1484,6 +1493,7 @@ def _run_phase3_only(args, adaslot, train_loaders, test_loaders,
             mlp_estimator=mlp_estimator,
             ucb_moe=ucb_moe,
             filter_k=args.filter_k,
+            epochs=args.task_p3_epochs,
         )
 
         print(f"  [EVAL] Per-task accuracy after task {task_id}:")

@@ -61,7 +61,8 @@
     --filter_k 10 \
     --ucb_exploration 1.414 \
     --ucb_burn_in 100 \
-    --batch_size 8
+    --batch_size 8 \
+    --task_p3_epochs 5
 
 # %% [markdown]
 # ## 3. (Tuỳ chọn) Tiếp tục từ checkpoint task đã lưu
@@ -79,6 +80,7 @@ RESUME_TASK = 4   # task cuối đã hoàn thành
     --task_p1_steps 2000 \
     --task_p2_steps 2000 \
     --task_p2b_steps 1000 \
+    --task_p3_epochs 5 \
     --adaslot_ckpt   checkpoints/task{RESUME_TASK}/adaslot.pth \
     --agent_ckpt     checkpoints/task{RESUME_TASK}/agents.pth \
     --estimator_ckpt checkpoints/task{RESUME_TASK}/estimators.pth
