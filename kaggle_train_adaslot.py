@@ -728,12 +728,15 @@ for t in range(1, N_TASKS):
             p.requires_grad_(True)
 
     if new_agents:
-        # Phase A — ALL vaes so routing indices are global
+        # Phase A — pass ONLY new_vaes/new_agents so hard routing forces
+        # all slots to be assigned to trainable (new) agents.  Passing all
+        # vaes would let old (higher-scoring, frozen) VAEs win every slot,
+        # leaving total_loss with no grad_fn.
         trainer_pa_t = AgentPhaseATrainer(
             config=cfg_pa,
             slot_model=slot_model,
-            vaes=vaes,
-            agents=agents,
+            vaes=new_vaes,
+            agents=new_agents,
         )
         print(f"  Task {t} — Phase A (new agents) ...")
         trainer_pa_t.train(t_train)

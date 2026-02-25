@@ -372,6 +372,12 @@ class BaseTrainer(ABC):
                     "is non-finite — skipping backward/step to protect weights."
                 )
                 metrics["loss_total"] = float("nan")
+            elif not loss.requires_grad:
+                # All contributing parameters were frozen — nothing to update.
+                logger.debug(
+                    f"[{self.__class__.__name__}] loss has no grad_fn "
+                    "(all active agents frozen?) — skipping backward."
+                )
             else:
                 loss.backward()
 
