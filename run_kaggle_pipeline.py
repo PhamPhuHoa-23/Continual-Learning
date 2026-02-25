@@ -235,6 +235,51 @@ def get_loaders(data_root: str, batch_size: int, val_fraction: float, num_worker
     )
 
 
+def make_task_loaders(
+    data_root: str,
+    n_tasks: int,
+    n_classes: int,
+    batch_size: int,
+    num_workers: int,
+    dataset: str = "cifar100",
+):
+    """
+    Split dataset into n_tasks by class, return list of (train_loader, test_loader).
+    Classes are sorted and split evenly: task i owns classes [i*cpt, (i+1)*cpt).
+    """
+    from torch.utils.data import Subset
+
+    classes_per_task = n_classes // n_tasks
+
+    if dataset == "cifar100":
+        train_full = CIFAR100(data_root, train=True,  download=True, transform=make_transform(True))
+        test_full  = CIFAR100(data_root, train=False, download=True, transform=make_transform(False))
+    elif dataset == "tiny_imagenet":
+        train_full = _tiny_imagenet_split(data_root, train=True,  transform=make_transform(True))
+        test_full  = _tiny_imagenet_split(data_root, train=False, transform=make_transform(False))
+    else:
+        raise ValueError(f"Unknown dataset: {dataset!r}")
+
+    def _indices_for_classes(ds, class_ids):
+        class_set = set(class_ids)
+        targets = ds.targets if hasattr(ds, "targets") else [s[1] for s in ds.samples]
+        return [i for i, t in enumerate(targets) if t in class_set]
+
+    task_loaders = []
+    kw = dict(batch_size=batch_size, num_workers=num_workers,
+              pin_memory=True, drop_last=False)
+    for t in range(n_tasks):
+        cls = list(range(t * classes_per_task, (t + 1) * classes_per_task))
+        tr_idx = _indices_for_classes(train_full, cls)
+        te_idx = _indices_for_classes(test_full,  cls)
+        tr_loader = DataLoader(Subset(train_full, tr_idx), shuffle=True,  **kw)
+        te_loader = DataLoader(Subset(test_full,  te_idx), shuffle=False, **kw)
+        task_loaders.append((tr_loader, te_loader))
+        log.info(f"  Task {t+1}: classes {cls[0]}-{cls[-1]}  "
+                 f"train={len(tr_idx)}  test={len(te_idx)}")
+    return task_loaders
+
+
 # ─── resize-on-the-fly so we don't store 128×128 on disk ─────────────────────
 
 class ResizeLoader:
@@ -283,6 +328,66 @@ def build_model(checkpoint: str, device: torch.device) -> AdaSlotWrapper:
 # ═══════════════════════════════════════════════════════════════════════════
 #  Visualisation helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _plot_cl_results(cl: dict, out_path: Path):
+    """Plot accuracy matrix + avg-acc curve + BWT bar and save to file."""
+    import json
+    n   = cl["n_tasks"]
+    R   = cl["R"]
+    avg = cl["avg_acc"]
+    bwt = cl["bwt"]
+
+    fig = plt.figure(figsize=(14, 4))
+    gs  = fig.add_gridspec(1, 3, wspace=0.35)
+
+    # 1. Accuracy matrix heatmap
+    ax0 = fig.add_subplot(gs[0])
+    mat = np.full((n, n), np.nan)
+    for i in range(n):
+        for j in range(n):
+            if R[i][j] is not None:
+                mat[i, j] = R[i][j] * 100
+    im = ax0.imshow(mat, vmin=0, vmax=100, cmap="YlGn", aspect="auto")
+    plt.colorbar(im, ax=ax0, label="Acc (%)")
+    for i in range(n):
+        for j in range(n):
+            if not np.isnan(mat[i, j]):
+                ax0.text(j, i, f"{mat[i,j]:.0f}", ha="center", va="center",
+                         fontsize=7, color="black")
+    ax0.set_xlabel("Evaluated on task")
+    ax0.set_ylabel("After learning task")
+    ax0.set_title("Accuracy matrix R[i,j]")
+    ax0.set_xticks(range(n)); ax0.set_xticklabels([str(k+1) for k in range(n)])
+    ax0.set_yticks(range(n)); ax0.set_yticklabels([str(k+1) for k in range(n)])
+
+    # 2. Avg accuracy over tasks
+    ax1 = fig.add_subplot(gs[1])
+    ax1.plot(range(1, n+1), [a*100 for a in avg], marker="o", color="steelblue")
+    ax1.set_xlabel("Tasks seen"); ax1.set_ylabel("Avg accuracy (%)")
+    ax1.set_title("Average accuracy"); ax1.grid(alpha=.3)
+    ax1.set_xticks(range(1, n+1))
+
+    # 3. Per-task forgetting = R[j][j] - R[n-1][j]
+    ax2 = fig.add_subplot(gs[2])
+    forget = []
+    for j in range(n - 1):
+        if R[n-1][j] is not None and R[j][j] is not None:
+            forget.append((R[j][j] - R[n-1][j]) * 100)
+        else:
+            forget.append(0.0)
+    colors = ["tomato" if f > 0 else "steelblue" for f in forget]
+    ax2.bar(range(1, n), forget, color=colors)
+    ax2.axhline(0, color="k", lw=0.8)
+    ax2.set_xlabel("Task"); ax2.set_ylabel("Forgetting (pp)")
+    ax2.set_title(f"Per-task forgetting  (BWT={bwt*100:.1f}%)")
+    ax2.set_xticks(range(1, n))
+    ax2.grid(axis="y", alpha=.3)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close()
+    log.info(f"CL curves saved → {out_path}")
+
 
 @torch.no_grad()
 def save_recon_grid(model: AdaSlotWrapper, loader, out_path: Path, n: int = 8,
@@ -337,6 +442,8 @@ def parse_args():
     p.add_argument("--stepsB",        type=int,   default=STEPS_B,   help="Phase B steps")
     p.add_argument("--cluster_method",default=CLUSTER_METHOD)
     p.add_argument("--n_clusters",    type=int,   default=N_CLUSTERS)
+    p.add_argument("--n_tasks",        type=int,   default=0,
+                   help="Split classes into N tasks for CL evaluation (0 = disabled)")
     p.add_argument("--skip_phase0",   action="store_true", help="Skip AdaSlot fine-tune")
     p.add_argument("--skip_viz",      action="store_true", help="Skip visualisations")
     return p.parse_args()
@@ -544,7 +651,70 @@ def main():
     trainerC.fit(train_rz)
     log.info(f"SLDA fitted on {slda._n_total} samples")
 
-    # ── Evaluation ────────────────────────────────────────────────────────
+    # ── Continual Learning evaluation (optional) ──────────────────────────
+    if args.n_tasks > 0:
+        log.info("\n" + "="*60)
+        log.info(f"CONTINUAL LEARNING EVAL — {args.n_tasks} tasks")
+        log.info("="*60)
+
+        task_loaders = make_task_loaders(
+            args.data_root, args.n_tasks, args.n_classes,
+            args.batch_size, NUM_WORKERS, dataset=args.dataset,
+        )
+
+        # Fresh SLDA for CL experiment
+        cl_slda = StreamLDA(n_classes=args.n_classes, feature_dim=D_H, shrinkage=1e-4)
+        cl_slda_cfg = SLDAConfig(
+            feature_dim=D_H, n_classes=args.n_classes, shrinkage=1e-4,
+            max_batches=0, device=str(device),
+        )
+        cl_trainer = SLDATrainer(
+            config=cl_slda_cfg, slot_model=model, agents=agents,
+            aggregator=aggregator, slda=cl_slda, vaes=vaes,
+        )
+
+        # R[i][j] = accuracy on task j after learning tasks 0..i
+        R = [[None] * args.n_tasks for _ in range(args.n_tasks)]
+        avg_accs, bwts = [], []
+
+        for i, (tr_loader, _) in enumerate(task_loaders):
+            log.info(f"  → Fitting SLDA on task {i+1}/{args.n_tasks}")
+            cl_trainer.fit(ResizeLoader(tr_loader, IMG_SIZE, device))
+
+            accs_this_round = []
+            for j, (_, te_loader) in enumerate(task_loaders[:i+1]):
+                m = cl_trainer.evaluate(ResizeLoader(te_loader, IMG_SIZE, device))
+                R[i][j] = m["accuracy"]
+                accs_this_round.append(m["accuracy"])
+                log.info(f"     Task {j+1} acc: {m['accuracy']*100:.1f}%")
+
+            avg_accs.append(float(np.mean(accs_this_round)))
+            log.info(f"  Avg acc after task {i+1}: {avg_accs[-1]*100:.1f}%")
+
+        # BWT = average forgetting on previously seen tasks
+        bwt_vals = []
+        for j in range(args.n_tasks - 1):
+            if R[args.n_tasks - 1][j] is not None and R[j][j] is not None:
+                bwt_vals.append(R[args.n_tasks - 1][j] - R[j][j])
+        bwt = float(np.mean(bwt_vals)) if bwt_vals else 0.0
+        log.info(f"  BWT (backward transfer / forgetting): {bwt*100:.2f}%")
+
+        # Save results
+        import json as _json
+        cl_payload = {
+            "n_tasks":    args.n_tasks,
+            "R":          [[v for v in row] for row in R],
+            "avg_acc":    avg_accs,
+            "bwt":        bwt,
+        }
+        cl_path = out_dir / "cl_results.json"
+        with open(cl_path, "w") as _f:
+            _json.dump(cl_payload, _f, indent=2)
+        log.info(f"CL results saved → {cl_path}")
+
+        # Plot
+        _plot_cl_results(cl_payload, out_dir / "cl_curves.png")
+
     log.info("\n" + "="*60)
     log.info("EVALUATION")
     log.info("="*60)
