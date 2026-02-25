@@ -58,11 +58,12 @@ clone_url = f"https://{GIT_USER}:{GIT_TOKEN}@github.com/{GIT_USER}/{GIT_REPO}.gi
 if not REPO_PATH.exists():
     print("Cloning...")
     run(f"git clone {clone_url} {REPO_PATH}")
-else:
-    print("Pulling latest...")
-    run(f"git -C {REPO_PATH} pull origin {GIT_BRANCH}")
 
+# fetch + reset --hard: dam bao file tren Kaggle LUON khop voi origin
+# (git pull co the fail silent neu detached HEAD / merge conflict)
+run(f"git -C {REPO_PATH} fetch origin {GIT_BRANCH}")
 run(f"git -C {REPO_PATH} checkout {GIT_BRANCH}")
+run(f"git -C {REPO_PATH} reset --hard origin/{GIT_BRANCH}")
 run(f"git -C {REPO_PATH} log --oneline -3")
 
 os.chdir(REPO_PATH)
@@ -124,7 +125,9 @@ if not _os.path.exists(CKPT_PATH):
 # ===========================================================================
 # MODEL
 # ===========================================================================
-IMG_SIZE   = 128
+IMG_SIZE   = 64   # 32->64 (2x upscale): decoder la 4x stride-2 ConvTranspose → compat voi ckpt
+                   # 128 qua lon cho CIFAR-32: 4x upscale, 49152 pixels, feature extractor chay cham
+                   # 64:  2x upscale, 12288 pixels, recon loss ~4x nho hon, train ~4x nhanh hon
 NUM_SLOTS  = 11
 SLOT_DIM   = 64
 D_H        = 64     # agent hidden dim / aggregator output dim
