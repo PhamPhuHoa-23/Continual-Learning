@@ -5,7 +5,17 @@ All logic has moved to ``cluster_init.py`` which supports every algorithm
 in ``CLUSTERING_REGISTRY``.  This file just re-exports everything so that
 old ``from cont_src.training.kmeans_init import ...`` still works.
 """
+from __future__ import annotations
 from cont_src.training.cluster_init import (   # noqa: F401
+from cont_src.training.configs import KMeansInitConfig
+from cont_src.models.routers.slot_vae import SlotVAE, ScoringMode
+from cont_src.models.agents.residual_mlp_agent import ResidualMLPAgent
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch
+import numpy as np
+from typing import List, Optional, Tuple
+import logging
     ClusterInitialiser,
     ClusterInitialiser as KMeansInitialiser,
     extract_slots,
@@ -49,19 +59,6 @@ Usage
     vaes, agents, labels = init.run(slots)
 """
 
-from __future__ import annotations
-
-import logging
-from typing import List, Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from cont_src.models.agents.residual_mlp_agent import ResidualMLPAgent
-from cont_src.models.routers.slot_vae import SlotVAE, ScoringMode
-from cont_src.training.configs import KMeansInitConfig
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +124,8 @@ def extract_slots(
         raise RuntimeError("No slots extracted — check dataloader and model.")
 
     result = np.concatenate(all_slots, axis=0)   # (N, D)
-    logger.info(f"[KMeansInit] Extracted {result.shape[0]} slot embeddings (dim={result.shape[1]})")
+    logger.info(
+        f"[KMeansInit] Extracted {result.shape[0]} slot embeddings (dim={result.shape[1]})")
     return result
 
 
@@ -177,7 +175,7 @@ class KMeansInitialiser:
             max_iter=cfg.max_iter,
             random_state=cfg.random_state,
         )
-        self._labels  = km.fit_predict(slots)
+        self._labels = km.fit_predict(slots)
         self._centres = km.cluster_centers_           # (K, D)
 
         # partition slots by cluster for VAE training
@@ -218,16 +216,17 @@ class KMeansInitialiser:
 
         cfg = self.config
         slot_dim = self._centres.shape[1]
-        in_dim  = agent_input_dim  if agent_input_dim  is not None else slot_dim
+        in_dim = agent_input_dim if agent_input_dim is not None else slot_dim
         out_dim = agent_output_dim if agent_output_dim is not None else in_dim
 
-        vaes:   List[SlotVAE]             = []
-        agents: List[ResidualMLPAgent]    = []
+        vaes:   List[SlotVAE] = []
+        agents: List[ResidualMLPAgent] = []
 
         _valid_modes = {"generative", "mahal_z", "mahal_slot"}
         assert cfg.scoring_mode in _valid_modes, \
             f"scoring_mode must be one of {_valid_modes}, got '{cfg.scoring_mode}'"
-        scoring_mode: ScoringMode = cfg.scoring_mode  # type: ignore[assignment]
+        # type: ignore[assignment]
+        scoring_mode: ScoringMode = cfg.scoring_mode
 
         for k, cluster_slots in enumerate(self._cluster_slots):
             logger.info(
@@ -240,7 +239,8 @@ class KMeansInitialiser:
                 slot_dim=slot_dim,
                 latent_dim=cfg.vae_latent_dim,
             )
-            slots_t = torch.tensor(cluster_slots, dtype=torch.float32).to(self.device)
+            slots_t = torch.tensor(
+                cluster_slots, dtype=torch.float32).to(self.device)
             vae.train_vae(slots_t, epochs=cfg.vae_epochs, beta=cfg.vae_beta)
             vae.update_stats(slots_t)          # initialise Welford stats
             vaes.append(vae)

@@ -114,8 +114,8 @@ def extract_slots(
             images = batch
 
         images = images.to(device)
-        out    = slot_model(images)
-        slots  = out["slots"]          # (B, K, D)
+        out = slot_model(images)
+        slots = out["slots"]          # (B, K, D)
 
         # Only keep active slots (hard_keep_decision > 0.5) when available
         mask = out.get("hard_keep_decision", out.get("mask"))  # (B, K) or None
@@ -191,7 +191,8 @@ class ClusterInitialiser:
         kwargs = dict(cfg.method_kwargs)   # shallow copy
         if "n_clusters" not in kwargs and cfg.n_clusters > 0:
             # Only inject for algorithms that accept n_clusters
-            _fixed_count = {"kmeans", "minibatch_kmeans", "agglomerative", "bayesian_gmm"}
+            _fixed_count = {"kmeans", "minibatch_kmeans",
+                            "agglomerative", "bayesian_gmm"}
             if cfg.method in _fixed_count:
                 kwargs["n_clusters"] = cfg.n_clusters
 
@@ -205,8 +206,8 @@ class ClusterInitialiser:
         )
 
         clusterer = CLUSTERING_REGISTRY.build(cfg.method, **kwargs)
-        slots_t   = torch.tensor(slots, dtype=torch.float32)
-        result    = clusterer.fit_predict(slots_t)
+        slots_t = torch.tensor(slots, dtype=torch.float32)
+        result = clusterer.fit_predict(slots_t)
 
         # ── Fallback: density-based methods may find 0 clusters (all noise) ──
         # Fall back to KMeans with cfg.n_clusters so the pipeline never stalls.
@@ -271,19 +272,20 @@ class ClusterInitialiser:
         if self._cluster_slots is None:
             raise RuntimeError("Call fit() before spawn().")
 
-        cfg      = self.config
+        cfg = self.config
         slot_dim = self._result.centers.shape[1] if self._result.centers is not None else (
             self._cluster_slots[0].shape[1] if self._cluster_slots else 64
         )
-        in_dim  = agent_input_dim  if agent_input_dim  is not None else slot_dim
+        in_dim = agent_input_dim if agent_input_dim is not None else slot_dim
         out_dim = agent_output_dim if agent_output_dim is not None else in_dim
 
-        vaes:   List[SlotVAE]          = []
+        vaes:   List[SlotVAE] = []
         agents: List[ResidualMLPAgent] = []
         _valid_modes = {"generative", "mahal_z", "mahal_slot"}
         assert cfg.scoring_mode in _valid_modes, \
             f"scoring_mode must be one of {_valid_modes}, got '{cfg.scoring_mode}'"
-        scoring_mode: ScoringMode = cfg.scoring_mode  # type: ignore[assignment]
+        # type: ignore[assignment]
+        scoring_mode: ScoringMode = cfg.scoring_mode
 
         cluster_bar = tqdm(
             enumerate(self._cluster_slots),
@@ -300,25 +302,27 @@ class ClusterInitialiser:
             )
 
             if n == 0:
-                logger.warning(f"[ClusterInit] Cluster {k} is empty — skipping.")
+                logger.warning(
+                    f"[ClusterInit] Cluster {k} is empty — skipping.")
                 continue
 
             # ---- SlotVAE ----
-            vae     = SlotVAE(
-                slot_dim    = slot_dim,
-                latent_dim  = cfg.vae_latent_dim,
+            vae = SlotVAE(
+                slot_dim=slot_dim,
+                latent_dim=cfg.vae_latent_dim,
             )
-            slots_t = torch.tensor(cluster_slots, dtype=torch.float32).to(self.device)
+            slots_t = torch.tensor(
+                cluster_slots, dtype=torch.float32).to(self.device)
             vae.train_vae(slots_t, epochs=cfg.vae_epochs, beta=cfg.vae_beta)
             vae.update_stats(slots_t)
             vaes.append(vae)
 
             # ---- Agent ----
             agent = ResidualMLPAgent(
-                input_dim  = in_dim,
-                output_dim = out_dim,
-                num_blocks = agent_num_blocks,
-                use_decoder= True,
+                input_dim=in_dim,
+                output_dim=out_dim,
+                num_blocks=agent_num_blocks,
+                use_decoder=True,
             ).to(self.device)
             agents.append(agent)
 

@@ -290,7 +290,8 @@ class SlotVAE:
         opt = torch.optim.Adam(self._net.parameters(), lr=lr)
 
         self._net.train()
-        epoch_bar = tqdm(range(1, epochs + 1), desc="  VAE", leave=False, unit="ep")
+        epoch_bar = tqdm(range(1, epochs + 1), desc="  VAE",
+                         leave=False, unit="ep")
         for epoch in epoch_bar:
             epoch_loss = 0.0
             for (batch,) in loader:

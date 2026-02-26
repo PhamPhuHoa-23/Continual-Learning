@@ -76,8 +76,8 @@ class AgentPhaseATrainer(BaseTrainer):
         self.config: PhaseAConfig  # type narrowing
 
         self.slot_model = slot_model
-        self.vaes       = vaes
-        self.agents     = agents
+        self.vaes = vaes
+        self.agents = agents
 
         # Freeze backbone
         self.freeze("slot_model")
@@ -97,7 +97,8 @@ class AgentPhaseATrainer(BaseTrainer):
             params += [p for p in agent.parameters() if p.requires_grad]
 
         if not params:
-            logger.warning("[AgentPhaseATrainer] No trainable agent parameters.")
+            logger.warning(
+                "[AgentPhaseATrainer] No trainable agent parameters.")
             self.optimizer = None
             return
 
@@ -126,8 +127,9 @@ class AgentPhaseATrainer(BaseTrainer):
         self.slot_model.eval()
         out = self.slot_model(images)
         slots = out["slots"]
-        mask  = out.get("hard_keep_decision", out.get("mask"))
-        n_active = (mask > 0.5).float().sum(dim=-1).mean().item() if mask is not None else float(slots.shape[1])
+        mask = out.get("hard_keep_decision", out.get("mask"))
+        n_active = (mask > 0.5).float().sum(
+            dim=-1).mean().item() if mask is not None else float(slots.shape[1])
         return slots, n_active
 
     def _route(self, slots: torch.Tensor) -> torch.Tensor:
@@ -171,7 +173,8 @@ class AgentPhaseATrainer(BaseTrainer):
         images = images.to(self.device)
 
         # 1. Extract slots (no grad needed for backbone)
-        slots, n_active_slots = self._extract_slots(images)   # (B, K, D), float
+        slots, n_active_slots = self._extract_slots(
+            images)   # (B, K, D), float
 
         # 2. Route: hard argmax
         with torch.no_grad():

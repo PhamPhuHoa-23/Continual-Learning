@@ -44,12 +44,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from cont_src.training.configs       import PipelineConfig
+from cont_src.training.configs import PipelineConfig
 from cont_src.training.adaslot_trainer import AdaSlotTrainer
-from cont_src.training.cluster_init  import ClusterInitialiser, extract_slots
+from cont_src.training.cluster_init import ClusterInitialiser, extract_slots
 from cont_src.training.agent_phase_a import AgentPhaseATrainer
 from cont_src.training.agent_phase_b import AgentPhaseBTrainer
-from cont_src.training.slda_trainer  import SLDATrainer, StreamLDA
+from cont_src.training.slda_trainer import SLDATrainer, StreamLDA
 
 logger = logging.getLogger(__name__)
 
@@ -84,18 +84,18 @@ class ContinualPipeline:
         aggregator: nn.Module,
         primitive_predictor: Optional[nn.Module] = None,
     ):
-        self.config               = config
-        self.slot_model           = slot_model
-        self.aggregator           = aggregator
-        self.primitive_predictor  = primitive_predictor
+        self.config = config
+        self.slot_model = slot_model
+        self.aggregator = aggregator
+        self.primitive_predictor = primitive_predictor
 
         # Shared mutable state updated across tasks
-        self.vaes:   List[Any]       = []    # List[SlotVAE]
+        self.vaes:   List[Any] = []    # List[SlotVAE]
         self.agents: List[nn.Module] = []    # List[ResidualMLPAgent]
-        self.slda:   StreamLDA       = StreamLDA(
-            n_classes   = config.slda.n_classes,
-            feature_dim = config.slda.feature_dim,
-            shrinkage   = config.slda.shrinkage,
+        self.slda:   StreamLDA = StreamLDA(
+            n_classes=config.slda.n_classes,
+            feature_dim=config.slda.feature_dim,
+            shrinkage=config.slda.shrinkage,
         )
 
         self._task_history: List[Dict] = []
@@ -132,7 +132,7 @@ class ContinualPipeline:
         -------
         dict with per-phase metrics and optional evaluation accuracy.
         """
-        cfg    = self.config
+        cfg = self.config
         phases = cfg.task1_phases if task_id == 1 else cfg.taskN_phases
 
         logger.info(
@@ -207,12 +207,12 @@ class ContinualPipeline:
 
     def _run_evaluation(self, test_loader: DataLoader) -> Dict[str, float]:
         trainer = SLDATrainer(
-            config      = self.config.slda,
-            slot_model  = self.slot_model,
-            agents      = self.agents,
-            aggregator  = self.aggregator,
-            slda        = self.slda,
-            vaes        = self.vaes,
+            config=self.config.slda,
+            slot_model=self.slot_model,
+            agents=self.agents,
+            aggregator=self.aggregator,
+            slda=self.slda,
+            vaes=self.vaes,
         )
         return trainer.evaluate(test_loader)
 
@@ -261,11 +261,11 @@ class ContinualPipeline:
 
 def _build_adaslot(pipeline: ContinualPipeline, loader: DataLoader):
     """Phase 0: AdaSlot fine-tuning."""
-    cfg     = pipeline.config.adaslot
+    cfg = pipeline.config.adaslot
     trainer = AdaSlotTrainer(
-        config              = cfg,
-        slot_model          = pipeline.slot_model,
-        primitive_predictor = pipeline.primitive_predictor,
+        config=cfg,
+        slot_model=pipeline.slot_model,
+        primitive_predictor=pipeline.primitive_predictor,
     )
     metrics = trainer.train(loader)
     return metrics
@@ -273,17 +273,17 @@ def _build_adaslot(pipeline: ContinualPipeline, loader: DataLoader):
 
 def _build_kmeans(pipeline: ContinualPipeline, loader: DataLoader):
     """Init: slot extraction → KMeans → spawn agents & VAEs."""
-    cfg   = pipeline.config.kmeans
+    cfg = pipeline.config.kmeans
     slots = extract_slots(pipeline.slot_model, loader, cfg)
 
     init = ClusterInitialiser(cfg)
     vaes, agents, result = init.run(
         slots,
-        agent_input_dim  = pipeline.config.slda.feature_dim,
-        agent_output_dim = pipeline.config.slda.feature_dim,
+        agent_input_dim=pipeline.config.slda.feature_dim,
+        agent_output_dim=pipeline.config.slda.feature_dim,
     )
 
-    pipeline.vaes   = vaes
+    pipeline.vaes = vaes
     pipeline.agents = agents
 
     return {"n_clusters": result.n_clusters, "method": cfg.method}
@@ -295,12 +295,12 @@ def _build_phase_a(pipeline: ContinualPipeline, loader: DataLoader):
         logger.warning("[Pipeline] No agents available — skipping Phase A.")
         return {}
 
-    cfg     = pipeline.config.phase_a
+    cfg = pipeline.config.phase_a
     trainer = AgentPhaseATrainer(
-        config     = cfg,
-        slot_model = pipeline.slot_model,
-        vaes       = pipeline.vaes,
-        agents     = pipeline.agents,
+        config=cfg,
+        slot_model=pipeline.slot_model,
+        vaes=pipeline.vaes,
+        agents=pipeline.agents,
     )
     metrics = trainer.train(loader)
     return metrics
@@ -312,13 +312,13 @@ def _build_phase_b(pipeline: ContinualPipeline, loader: DataLoader):
         logger.warning("[Pipeline] No agents available — skipping Phase B.")
         return {}
 
-    cfg     = pipeline.config.phase_b
+    cfg = pipeline.config.phase_b
     trainer = AgentPhaseBTrainer(
-        config     = cfg,
-        slot_model = pipeline.slot_model,
-        vaes       = pipeline.vaes,
-        agents     = pipeline.agents,
-        aggregator = pipeline.aggregator,
+        config=cfg,
+        slot_model=pipeline.slot_model,
+        vaes=pipeline.vaes,
+        agents=pipeline.agents,
+        aggregator=pipeline.aggregator,
     )
     metrics = trainer.train(loader)
 
@@ -335,14 +335,14 @@ def _build_phase_b(pipeline: ContinualPipeline, loader: DataLoader):
 
 def _build_slda(pipeline: ContinualPipeline, loader: DataLoader):
     """Phase C: incremental SLDA fitting."""
-    cfg     = pipeline.config.slda
+    cfg = pipeline.config.slda
     trainer = SLDATrainer(
-        config     = cfg,
-        slot_model = pipeline.slot_model,
-        agents     = pipeline.agents,
-        aggregator = pipeline.aggregator,
-        slda       = pipeline.slda,
-        vaes       = pipeline.vaes,
+        config=cfg,
+        slot_model=pipeline.slot_model,
+        agents=pipeline.agents,
+        aggregator=pipeline.aggregator,
+        slda=pipeline.slda,
+        vaes=pipeline.vaes,
     )
     trainer.fit(loader)
     return {"slda_samples": pipeline.slda._n_total}

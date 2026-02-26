@@ -3,6 +3,7 @@ import textwrap
 
 LINES = []
 
+
 def md(*lines):
     LINES.append("")
     LINES.append("# %% [markdown]")
@@ -10,10 +11,12 @@ def md(*lines):
         LINES.append(f"# {l}" if l else "#")
     LINES.append("")
 
+
 def code(src):
     LINES.append("# %%")
     LINES.append(textwrap.dedent(src).strip())
     LINES.append("")
+
 
 # ── header ──────────────────────────────────────────────────────────────────
 LINES += [

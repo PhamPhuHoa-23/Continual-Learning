@@ -62,7 +62,8 @@ class AdaSlotTrainerConfig(PhaseConfig):
 
     # --- Loss weights ---
     w_recon: float = 2.03e-5        # 1/(C·H·W) normalises mse_sum to per-pixel
-    w_sparse: float = 10.0          # linear sparse coefficient (AdaSlot default)
+    # linear sparse coefficient (AdaSlot default)
+    w_sparse: float = 10.0
     w_prim: float = 5.0             # primitive loss weight
 
     # --- Primitive loss ---
@@ -263,7 +264,8 @@ class PipelineConfig:
 
     # Which phases run for Task 1?
     task1_phases: List[str] = field(
-        default_factory=lambda: ["adaslot", "kmeans", "phase_a", "phase_b", "slda"]
+        default_factory=lambda: ["adaslot",
+                                 "kmeans", "phase_a", "phase_b", "slda"]
     )
     # Which phases run for Tasks 2+?
     taskN_phases: List[str] = field(
@@ -272,10 +274,10 @@ class PipelineConfig:
 
     # Sub-configs  (populated with defaults; override as needed)
     adaslot: AdaSlotTrainerConfig = field(default_factory=AdaSlotTrainerConfig)
-    kmeans:  ClusterInitConfig    = field(default_factory=ClusterInitConfig)
-    phase_a: PhaseAConfig         = field(default_factory=PhaseAConfig)
-    phase_b: PhaseBConfig         = field(default_factory=PhaseBConfig)
-    slda:    SLDAConfig           = field(default_factory=SLDAConfig)
+    kmeans:  ClusterInitConfig = field(default_factory=ClusterInitConfig)
+    phase_a: PhaseAConfig = field(default_factory=PhaseAConfig)
+    phase_b: PhaseBConfig = field(default_factory=PhaseBConfig)
+    slda:    SLDAConfig = field(default_factory=SLDAConfig)
 
     # Global checkpoint root (individual phases write into sub-folders)
     checkpoint_root: str = "checkpoints/continual"

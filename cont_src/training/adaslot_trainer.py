@@ -242,7 +242,8 @@ class AdaSlotTrainer(BaseTrainer):
         same = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
         d_y = same / (same.sum(dim=1, keepdim=True) + 1e-8)
 
-        kl = (d_y * torch.log((d_y + 1e-8) / (d_H + 1e-8))).sum() / primitives.shape[0]
+        kl = (d_y * torch.log((d_y + 1e-8) / (d_H + 1e-8))
+              ).sum() / primitives.shape[0]
         return kl
 
     @staticmethod

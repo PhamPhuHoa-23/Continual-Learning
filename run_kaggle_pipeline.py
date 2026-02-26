@@ -128,6 +128,14 @@ T_FINAL   = 0.1    # routing temperature end
 # ── SLDA ───────────────────────────────────────────────────────────────────
 N_CLASSES = 100     # default; overridden by --n_classes arg
 
+# ── Continual-learning agent expansion ────────────────────────────────────
+# A slot is "novel" (doesn't belong to any existing agent) when its best
+# VAE score is below this percentile of the score distribution from task-0.
+# Lower = more conservative (fewer new agents).
+# Higher = more aggressive (more new agents per task).
+NOVELTY_THRESHOLD   = 0.05   # fraction: slots scoring below 5th-pctile of task-0 → orphan
+MIN_ORPHAN_FRACTION = 0.10   # at least 10% of task slots must be orphans to trigger spawn
+
 # ── Dataset ────────────────────────────────────────────────────────────────
 DATASET   = "cifar100"  # "cifar100" | "tiny_imagenet"; overridden by --dataset
 
@@ -329,6 +337,50 @@ def build_model(checkpoint: str, device: torch.device) -> AdaSlotWrapper:
 #  Visualisation helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _freeze(agents):
+    for ag in agents:
+        for p in ag.parameters(): p.requires_grad_(False)
+
+def _unfreeze(agents):
+    for ag in agents:
+        for p in ag.parameters(): p.requires_grad_(True)
+
+
+def _find_novel_slots(
+    slots_np: np.ndarray,
+    vaes: list,
+    pctile_threshold: float,
+    calibration_scores: np.ndarray | None,
+) -> np.ndarray:
+    """
+    Return the rows of slots_np whose best-VAE score is below threshold.
+
+    threshold = pctile_threshold-th percentile of calibration_scores
+                (computed once on task-0 data).
+    If calibration_scores is None, falls back to raw score < 0.
+    """
+    if not vaes or len(slots_np) == 0:
+        return slots_np
+
+    import torch
+    slots_t = torch.tensor(slots_np, dtype=torch.float32)
+    scores  = torch.stack([vae.score(slots_t) for vae in vaes], dim=-1)  # (N, M)
+    best, _ = scores.max(dim=-1)                                          # (N,)
+    best_np = best.cpu().numpy()
+
+    if calibration_scores is not None:
+        cutoff = float(np.percentile(calibration_scores, pctile_threshold * 100))
+    else:
+        cutoff = 0.0
+
+    orphan_mask = best_np < cutoff
+    log.info(
+        f"  Novel-slot detection: {orphan_mask.sum()}/{len(slots_np)} slots are orphans "
+        f"(score < {cutoff:.4f}, {pctile_threshold*100:.0f}th-pctile)"
+    )
+    return slots_np[orphan_mask]
+
+
 def _plot_cl_results(cl: dict, out_path: Path):
     """Plot accuracy matrix + avg-acc curve + BWT bar and save to file."""
     import json
@@ -444,6 +496,10 @@ def parse_args():
     p.add_argument("--n_clusters",    type=int,   default=N_CLUSTERS)
     p.add_argument("--n_tasks",        type=int,   default=0,
                    help="Split classes into N tasks for CL evaluation (0 = disabled)")
+    p.add_argument("--novelty_threshold",   type=float, default=NOVELTY_THRESHOLD,
+                   help="VAE score percentile below which a slot is 'novel'")
+    p.add_argument("--min_orphan_fraction", type=float, default=MIN_ORPHAN_FRACTION,
+                   help="Min fraction of task slots that must be orphans to spawn new agents")
     p.add_argument("--skip_phase0",   action="store_true", help="Skip AdaSlot fine-tune")
     p.add_argument("--skip_viz",      action="store_true", help="Skip visualisations")
     return p.parse_args()

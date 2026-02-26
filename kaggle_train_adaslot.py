@@ -27,6 +27,32 @@
 # ## 1. Paths  *(stdlib only — project not cloned yet)*
 
 # %%
+from cont_src.training.cluster_init import extract_slots
+from cont_src.training import (
+    AdaSlotTrainer,     AdaSlotTrainerConfig,
+    ClusterInitialiser, ClusterInitConfig,
+    AgentPhaseATrainer, PhaseAConfig,
+    AgentPhaseBTrainer, PhaseBConfig,
+    SLDATrainer,        SLDAConfig, StreamLDA,
+)
+from cont_src.models.aggregators.attention_aggregator import AttentionAggregator
+from cont_src.models.slot_attention.primitives import PrimitiveSelector
+from src.models.adaslot.model import AdaSlotModel
+from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet
+from torch.utils.data import DataLoader, random_split
+from tqdm.notebook import tqdm
+import matplotlib.pyplot as plt
+import matplotlib
+import torchvision.transforms as T
+import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
+import logging
+import random
+import json
+import torchvision.datasets as _D
+import torch
+import os as _os
 import os
 import sys
 import shutil as _sh
@@ -35,8 +61,8 @@ import importlib as _il
 from pathlib import Path
 
 KAGGLE_WORKING = Path("/kaggle/working")
-REPO_NAME      = "Continual-Learning"
-REPO_PATH      = KAGGLE_WORKING / REPO_NAME
+REPO_NAME = "Continual-Learning"
+REPO_PATH = KAGGLE_WORKING / REPO_NAME
 
 print(f"Repo path : {REPO_PATH}")
 print(f"CWD       : {os.getcwd()}")
@@ -46,9 +72,9 @@ print(f"CWD       : {os.getcwd()}")
 
 # %%
 # Settings > Developer settings > Personal access tokens
-GIT_TOKEN  = "YOUR_GITHUB_PAT_HERE"
-GIT_USER   = "PhamPhuHoa-23"
-GIT_REPO   = "Continual-Learning"
+GIT_TOKEN = "YOUR_GITHUB_PAT_HERE"
+GIT_USER = "PhamPhuHoa-23"
+GIT_REPO = "Continual-Learning"
 GIT_BRANCH = "prototype"
 
 
@@ -87,7 +113,8 @@ print("__pycache__ cleared")
 # ## 3. Install Dependencies
 
 # %%
-get_ipython().system("pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+get_ipython().system(
+    "pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
 get_ipython().system("pip install -q tqdm numpy matplotlib scikit-learn hdbscan umap-learn")
 get_ipython().system("pip install -q -e .")
 get_ipython().system("pip install -q avalanche-lib")
@@ -107,17 +134,15 @@ print("Dependencies installed!")
 # | SLDA | Closed-form classifier |
 
 # %%
-import os as _os
-import torch
 
 # ===========================================================================
 # DATASET
 # ===========================================================================
-DATASET     = "cifar100"   # "cifar100" | "tiny_imagenet"
-N_TASKS     = 10           # so task muon train (1 = chi task 0)
-BATCH_SIZE  = 64
+DATASET = "cifar100"   # "cifar100" | "tiny_imagenet"
+N_TASKS = 10           # so task muon train (1 = chi task 0)
+BATCH_SIZE = 64
 NUM_WORKERS = 0
-VAL_SPLIT   = 0.1          # fraction of train set dung lam validation
+VAL_SPLIT = 0.1          # fraction of train set dung lam validation
 
 # ===========================================================================
 # CHECKPOINT  (upload CLEVR10.ckpt len Kaggle dataset roi dien path)
@@ -129,53 +154,53 @@ if not _os.path.exists(CKPT_PATH):
 # ===========================================================================
 # MODEL
 # ===========================================================================
-IMG_SIZE  = 128   # decoder la 4x stride-2 ConvTranspose -> output 128x128
+IMG_SIZE = 128   # decoder la 4x stride-2 ConvTranspose -> output 128x128
 NUM_SLOTS = 7
-SLOT_DIM  = 64
-D_H       = 64    # agent hidden dim / aggregator output dim
+SLOT_DIM = 64
+D_H = 64    # agent hidden dim / aggregator output dim
 
 # ===========================================================================
 # PHASE 0 — AdaSlot fine-tune
 # ===========================================================================
-P0_EPOCHS    = 1
-P0_LR        = 4e-5
-P0_W_RECON   = 1.0
-P0_W_SPARSE  = 10.0
-P0_W_PRIM    = 5.0
+P0_EPOCHS = 1
+P0_LR = 4e-5
+P0_W_RECON = 1.0
+P0_W_SPARSE = 10.0
+P0_W_PRIM = 5.0
 P0_LOG_EVERY = 50
 
 # ===========================================================================
 # CLUSTER INIT
 # ===========================================================================
-CLUSTER_METHOD  = "hdbscan"   # "hdbscan" | "kmeans" | "dbscan" | "gmm"
-CLUSTER_KWARGS  = {"min_cluster_size": 30, "min_samples": 5}
+CLUSTER_METHOD = "hdbscan"   # "hdbscan" | "kmeans" | "dbscan" | "gmm"
+CLUSTER_KWARGS = {"min_cluster_size": 30, "min_samples": 5}
 MAX_BATCH_CLUST = 50
 MAX_SLOTS_CLUST = 20_000      # HDBSCAN O(n^2) -> keep <= 20k
-VAE_LATENT_DIM  = 32
-VAE_EPOCHS      = 1
-SCORING_MODE    = "generative"  # "generative" | "mahal_z" | "mahal_slot"
+VAE_LATENT_DIM = 32
+VAE_EPOCHS = 1
+SCORING_MODE = "generative"  # "generative" | "mahal_z" | "mahal_slot"
 
 # ===========================================================================
 # PHASE A — Agent warm-up (hard routing, L_agent only)
 # ===========================================================================
-PA_EPOCHS    = 1
-PA_LR        = 3e-4
-PA_GAMMA     = 1.0
+PA_EPOCHS = 1
+PA_LR = 3e-4
+PA_GAMMA = 1.0
 PA_LOG_EVERY = 20
 
 # ===========================================================================
 # PHASE B — Full training (soft routing + L_prim + L_SupCon)
 # ===========================================================================
-PB_EPOCHS         = 2
-PB_LR             = 2e-4
-PB_GAMMA          = 1.0       # L_agent weight
-PB_ALPHA          = 0.3       # L_prim weight
-PB_BETA           = 0.3       # L_SupCon weight
-PB_T_INIT         = 2.0
-PB_T_FINAL        = 0.1
-PB_TEMP_ANNEAL    = "cosine"  # "cosine" | "linear" | "constant"
+PB_EPOCHS = 2
+PB_LR = 2e-4
+PB_GAMMA = 1.0       # L_agent weight
+PB_ALPHA = 0.3       # L_prim weight
+PB_BETA = 0.3       # L_SupCon weight
+PB_T_INIT = 2.0
+PB_T_FINAL = 0.1
+PB_TEMP_ANNEAL = "cosine"  # "cosine" | "linear" | "constant"
 PB_FREEZE_ROUTERS = True
-PB_LOG_EVERY      = 20
+PB_LOG_EVERY = 20
 
 # ===========================================================================
 # CONTINUAL LEARNING — novelty detection for agent spawning
@@ -192,7 +217,7 @@ PB_LOG_EVERY      = 20
 #   before clustering + spawning.  Acts as B_min from the paper — avoids
 #   spawning from a handful of noisy outliers.
 NOVEL_SCORE_PERCENTILE = 5     # percentile of task-0 scores → θ_novel
-MIN_ORPHAN_FRACTION    = 0.10  # spawn only if ≥10% of slots are novel
+MIN_ORPHAN_FRACTION = 0.10  # spawn only if ≥10% of slots are novel
 
 # ===========================================================================
 # SLDA
@@ -215,8 +240,8 @@ _DS_META = {
     "tiny_imagenet": {"n_classes": 200, "data_subdir": "tiny_imagenet_data"},
 }
 assert DATASET in _DS_META, f"Unknown dataset '{DATASET}'"
-DATA_ROOT        = Path(f"/kaggle/working/{_DS_META[DATASET]['data_subdir']}")
-N_CLASSES        = _DS_META[DATASET]["n_classes"]
+DATA_ROOT = Path(f"/kaggle/working/{_DS_META[DATASET]['data_subdir']}")
+N_CLASSES = _DS_META[DATASET]["n_classes"]
 CLASSES_PER_TASK = N_CLASSES // N_TASKS
 
 print("=" * 55)
@@ -224,17 +249,18 @@ print(f"  Dataset    : {DATASET}  ({N_CLASSES} classes, {N_TASKS} tasks)")
 print(f"  Device     : {DEVICE}")
 if torch.cuda.is_available():
     print(f"  GPU        : {torch.cuda.get_device_name(0)}")
-    print(f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
+    print(
+        f"  VRAM       : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 print(f"  Checkpoint : {CKPT_PATH}")
 print(f"  Output     : {OUTPUT_DIR}")
-print(f"  Phase 0    : {P0_EPOCHS} epochs  |  Phase A : {PA_EPOCHS}  |  Phase B : {PB_EPOCHS}")
+print(
+    f"  Phase 0    : {P0_EPOCHS} epochs  |  Phase A : {PA_EPOCHS}  |  Phase B : {PB_EPOCHS}")
 print("=" * 55)
 
 # %% [markdown]
 # ## 5. Download Dataset
 
 # %%
-import torchvision.datasets as _D
 
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -246,7 +272,7 @@ if DATASET == "cifar100":
 elif DATASET == "tiny_imagenet":
     import urllib.request
     import zipfile
-    _url  = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    _url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
     _dest = DATA_ROOT / "tiny-imagenet-200.zip"
     if not _dest.exists():
         urllib.request.urlretrieve(
@@ -264,30 +290,7 @@ elif DATASET == "tiny_imagenet":
 # ## 6. Project Imports  *(repo is on disk now)*
 
 # %%
-import json
-import random
-import logging
-import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
-import matplotlib
-import matplotlib.pyplot as plt
-from tqdm.notebook import tqdm
-from torch.utils.data import DataLoader, random_split
-from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet
 
-from src.models.adaslot.model import AdaSlotModel
-from cont_src.models.slot_attention.primitives import PrimitiveSelector
-from cont_src.models.aggregators.attention_aggregator import AttentionAggregator
-from cont_src.training import (
-    AdaSlotTrainer,     AdaSlotTrainerConfig,
-    ClusterInitialiser, ClusterInitConfig,
-    AgentPhaseATrainer, PhaseAConfig,
-    AgentPhaseBTrainer, PhaseBConfig,
-    SLDATrainer,        SLDAConfig, StreamLDA,
-)
-from cont_src.training.cluster_init import extract_slots
 
 print("All imports OK")
 
@@ -298,8 +301,11 @@ print("All imports OK")
 # Resize 32->128 xu ly thang trong transform — khong can ResizeLoader nua.
 
 # %%
+
+
 def _make_tf(train: bool, size: int = IMG_SIZE):
-    aug = [T.RandomHorizontalFlip(), T.ColorJitter(0.2, 0.2, 0.2)] if train else []
+    aug = [T.RandomHorizontalFlip(), T.ColorJitter(
+        0.2, 0.2, 0.2)] if train else []
     return T.Compose(aug + [
         T.Resize((size, size)),
         T.ToTensor(),
@@ -343,9 +349,9 @@ else:
 def get_task_loaders(task_id: int):
     """Return (train_loader, val_loader, test_loader) for task `task_id`."""
     tr_full = _AvDS(benchmark.train_stream[task_id].dataset)
-    te_ds   = _AvDS(benchmark.test_stream[task_id].dataset)
-    n_val   = int(len(tr_full) * VAL_SPLIT)
-    n_tr    = len(tr_full) - n_val
+    te_ds = _AvDS(benchmark.test_stream[task_id].dataset)
+    n_val = int(len(tr_full) * VAL_SPLIT)
+    n_tr = len(tr_full) - n_val
     tr_ds, val_ds = random_split(
         tr_full, [n_tr, n_val],
         generator=torch.Generator().manual_seed(42),
@@ -367,6 +373,8 @@ print(f"Total tasks: {N_TASKS}  |  Classes per task: {CLASSES_PER_TASK}")
 # ## 8. Build Model
 
 # %%
+
+
 class SlotModelWrapper(nn.Module):
     """Maps AdaSlotModel output keys to the trainer convention."""
 
@@ -384,7 +392,8 @@ class SlotModelWrapper(nn.Module):
             **out,
         }
         if self.prim_sel is not None:
-            H = self.prim_sel(out["slots"], slot_mask=out["hard_keep_decision"])
+            H = self.prim_sel(
+                out["slots"], slot_mask=out["hard_keep_decision"])
             result["primitives"] = H.unsqueeze(1)
         return result
 
@@ -421,7 +430,7 @@ def _reset_gumbel_gate(model: nn.Module) -> None:
 _reset_gumbel_gate(backbone)
 print("Gate weights re-initialised")
 
-prim_sel   = PrimitiveSelector(slot_dim=SLOT_DIM, hidden_dim=D_H).to(DEVICE)
+prim_sel = PrimitiveSelector(slot_dim=SLOT_DIM, hidden_dim=D_H).to(DEVICE)
 slot_model = SlotModelWrapper(backbone, prim_sel).to(DEVICE)
 aggregator = AttentionAggregator(hidden_dim=D_H).to(DEVICE)
 
@@ -470,9 +479,9 @@ matplotlib.use("Agg")
 def save_recon_grid(model, loader, path, n: int = 8):
     model.eval()
     imgs, _ = next(iter(loader))
-    imgs   = imgs[:n].to(DEVICE)
-    out    = model(imgs)
-    recon  = out["recon"]
+    imgs = imgs[:n].to(DEVICE)
+    out = model(imgs)
+    recon = out["recon"]
     active = out["mask"].sum(dim=1).float()
 
     def _np(t):
@@ -532,13 +541,14 @@ print(f"Spawned {M} agents  ({CLUSTER_METHOD})")
 # Calibrate novelty threshold (θ_novel) from task-0 slots — ABSOLUTE, not
 # relative.  Any future slot whose best-VAE score < SCORE_FLOOR is novel.
 # ---------------------------------------------------------------------------
-_slots_0_t  = torch.from_numpy(slots_np).float().to(DEVICE)
-_scores_0   = []
+_slots_0_t = torch.from_numpy(slots_np).float().to(DEVICE)
+_scores_0 = []
 for _v in vaes:
     _s = _v.score(_slots_0_t)
-    _scores_0.append(_s.cpu().numpy() if isinstance(_s, torch.Tensor) else np.asarray(_s))
+    _scores_0.append(_s.cpu().numpy() if isinstance(
+        _s, torch.Tensor) else np.asarray(_s))
 _max_scores_0 = np.max(np.stack(_scores_0, axis=1), axis=1)  # (N,)
-SCORE_FLOOR   = float(np.percentile(_max_scores_0, NOVEL_SCORE_PERCENTILE))
+SCORE_FLOOR = float(np.percentile(_max_scores_0, NOVEL_SCORE_PERCENTILE))
 print(f"Novelty threshold θ_novel = {SCORE_FLOOR:.4f}  "
       f"({NOVEL_SCORE_PERCENTILE}th pct of task-0 max-VAE-scores)")
 del _slots_0_t, _scores_0, _max_scores_0
@@ -641,7 +651,7 @@ print(f"SLDA fitted  ({slda._n_total} samples)")
 # ## 14. Evaluate Task 0  *(seed the forgetting matrix)*
 
 # %%
-val_m0  = trainer_slda.evaluate(val_loader)
+val_m0 = trainer_slda.evaluate(val_loader)
 test_m0 = trainer_slda.evaluate(test_loader)
 
 print("=" * 45)
@@ -659,7 +669,7 @@ print("=" * 45)
 #   Forgetting_i  = R[i][i] - R[i][N_TASKS-1]
 #   BWT           = (1/(T-1)) * sum_{i=0}^{T-2} (R[i][T-1] - R[i][i])
 # ---------------------------------------------------------------------------
-R       = [[None] * N_TASKS for _ in range(N_TASKS)]
+R = [[None] * N_TASKS for _ in range(N_TASKS)]
 R[0][0] = test_m0["accuracy"]
 
 task_results = [{"task": 0,
@@ -680,6 +690,8 @@ print("Forgetting matrix initialised (R[0][0] set).")
 # 4. Evaluate all seen tasks → fill forgetting matrix column t
 
 # %%
+
+
 def _find_novel_slots(vaes, slots_np):
     """
     Return indices of slots whose best VAE score < SCORE_FLOOR.
@@ -695,7 +707,8 @@ def _find_novel_slots(vaes, slots_np):
     scores = []
     for vae in vaes:
         s = vae.score(slots_t)
-        scores.append(s.cpu().numpy() if isinstance(s, torch.Tensor) else np.asarray(s))
+        scores.append(s.cpu().numpy() if isinstance(
+            s, torch.Tensor) else np.asarray(s))
     max_score = np.max(np.stack(scores, axis=1), axis=1)   # (N,)
     return np.where(max_score < SCORE_FLOOR)[0]
 
@@ -714,7 +727,7 @@ for t in range(1, N_TASKS):
     # -----------------------------------------------------------------------
     print(f"  Task {t} — extracting slots ...")
     slots_np_t = extract_slots(slot_model, t_train, cfg_clust, device=DEVICE)
-    novel_idx  = _find_novel_slots(vaes, slots_np_t)
+    novel_idx = _find_novel_slots(vaes, slots_np_t)
     novel_frac = len(novel_idx) / max(len(slots_np_t), 1)
     print(f"  Novel slots : {len(novel_idx)}/{len(slots_np_t)} "
           f"({novel_frac*100:.1f}%)")
@@ -781,7 +794,7 @@ for t in range(1, N_TASKS):
     # 4. Update SLDATrainer's agent/vae list to include new additions
     # -----------------------------------------------------------------------
     trainer_slda.agents = [a.to(DEVICE).eval() for a in agents]
-    trainer_slda.vaes   = vaes
+    trainer_slda.vaes = vaes
 
     # -----------------------------------------------------------------------
     # 5. SLDA incremental update on task t
@@ -795,9 +808,10 @@ for t in range(1, N_TASKS):
     print(f"  Task {t} — evaluating all seen tasks ...")
     for i in range(t + 1):
         _, _, i_test = get_task_loaders(i)
-        m_eval   = trainer_slda.evaluate(i_test)
-        R[i][t]  = m_eval["accuracy"]
-        print(f"    R[task={i}][after_task={t}] = {m_eval['accuracy']*100:.2f}%")
+        m_eval = trainer_slda.evaluate(i_test)
+        R[i][t] = m_eval["accuracy"]
+        print(
+            f"    R[task={i}][after_task={t}] = {m_eval['accuracy']*100:.2f}%")
 
     t_val_m = trainer_slda.evaluate(t_val)
     task_results.append({
@@ -812,8 +826,10 @@ for t in range(1, N_TASKS):
         for i in range(t)
         if R[i][t] is not None and R[i][i] is not None
     ]
-    running_bwt = sum(bwt_terms) / len(bwt_terms) if bwt_terms else float("nan")
-    avg_acc_now = sum(R[i][t] for i in range(t + 1) if R[i][t] is not None) / (t + 1)
+    running_bwt = sum(bwt_terms) / \
+        len(bwt_terms) if bwt_terms else float("nan")
+    avg_acc_now = sum(R[i][t]
+                      for i in range(t + 1) if R[i][t] is not None) / (t + 1)
 
     print(f"\n  After task {t}:")
     print(f"    Total agents              : {M}  (+{M - old_M} new)")
@@ -832,14 +848,14 @@ for t in range(1, N_TASKS):
 last_t = len(task_results) - 1   # index of the last trained task
 
 acc_initial = []   # R[i][i]      - right after learning task i
-acc_final   = []   # R[i][last_t] - after all training
-forgetting  = []   # acc_initial[i] - acc_final[i]
+acc_final = []   # R[i][last_t] - after all training
+forgetting = []   # acc_initial[i] - acc_final[i]
 
 for i in range(last_t + 1):
     ai = R[i][i]
     af = R[i][last_t]
     acc_initial.append(ai if ai is not None else float("nan"))
-    acc_final.append(  af if af is not None else float("nan"))
+    acc_final.append(af if af is not None else float("nan"))
     forgetting.append(
         (ai - af) if (ai is not None and af is not None) else float("nan")
     )
@@ -889,7 +905,7 @@ fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
 # --- Plot 1: per-task accuracy (initial vs final) ---
 ax = axes[0]
-w  = 0.35
+w = 0.35
 ax.bar(x - w/2, [v * 100 for v in acc_initial], w,
        label="acc@learn", color="steelblue")
 ax.bar(x + w/2, [v * 100 for v in acc_final], w,
@@ -1001,7 +1017,8 @@ print(f"Checkpoint saved: {ckpt_out}")
 ckpts = sorted(OUTPUT_DIR.rglob("*.pt"))
 print("=" * 65)
 print(f"  Dataset       : {DATASET}")
-print(f"  Tasks trained : {last_t + 1} / {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
+print(
+    f"  Tasks trained : {last_t + 1} / {N_TASKS}  ({CLASSES_PER_TASK} classes/task)")
 print(f"  N agents      : {M}")
 print()
 print(f"  {'Task':>5}  {'val %':>8}  {'test %':>8}  {'forgetting':>12}  {'agents':>7}")
