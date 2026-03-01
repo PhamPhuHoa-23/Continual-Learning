@@ -352,7 +352,7 @@ def _train_projector_step(
     feature_extractor, aggregator, images, targets,
     optimizer, device, num_slots, agent_dim,
 ):
-    """Optional: backprop through projector using CRP's class queries."""
+    """Optional: backprop through projector using CRP's expert classifiers."""
     if not hasattr(aggregator, 'aggregator'):
         return
     crp = aggregator.aggregator
@@ -361,23 +361,29 @@ def _train_projector_step(
 
     features = feature_extractor(images)  # (B, F)
     H = features.view(-1, num_slots, agent_dim)  # (B, S, D)
+    targets_np = targets.cpu().numpy()
 
-    # Forward through CRP experts
-    all_z, all_scores, _ = crp._forward_all_experts(H)
-    repr_vec = crp._moe_aggregate(all_z, all_scores)  # (B, d)
-    logits = repr_vec @ crp.class_queries.T  # (B, C)
+    # Compute loss per sample using correct expert's internal classifier
+    total_loss = torch.tensor(0.0, device=device)
+    count = 0
+    for i in range(H.shape[0]):
+        label = int(targets_np[i])
+        expert_idx = crp._find_expert_for_class(label)
+        if expert_idx is None:
+            continue
+        expert = crp.experts[expert_idx]
+        z, _ = expert(H[i:i+1])  # (1, d)
+        local_logits = expert.classify(z)  # (1, n_owned)
+        local_label = expert.global_to_local(label)
+        local_target = torch.tensor([local_label], dtype=torch.long, device=device)
+        total_loss = total_loss + F.cross_entropy(local_logits, local_target)
+        count += 1
 
-    # Mask unseen classes
-    mask = torch.full_like(logits, float("-inf"))
-    mask[:, list(crp.seen_classes)] = 0.0
-    logits = logits + mask
-
-    targets_dev = targets.to(device)
-    loss = F.cross_entropy(logits, targets_dev)
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    if count > 0:
+        total_loss = total_loss / count
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
 
 
 def _eval_task(feature_extractor, aggregator, test_loader, device):

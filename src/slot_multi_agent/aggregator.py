@@ -1,41 +1,40 @@
 """
 MoE Cross-Attention Expert Aggregator for Continual Learning.
 
-Replaces the prototype-based CRP design with learnable query embeddings
-+ cross-attention, removing dependence on metric geometry of the feature space.
+Exclusive Expert Ownership Design:
+    Each expert owns a NON-OVERLAPPING set of classes and has its own
+    internal classifier.  No two experts share any class.
 
 Expert Identity:
     Each expert holds L learnable query embeddings E ∈ R^(L × d).
     It "asks" agent outputs via cross-attention:
         z = CrossAttn(Q=E, K=agent_outputs, V=agent_outputs)
-    Score = ||z|| (magnitude = expert confidence)
-    Entropy of attention weights → OOD detector for CRP new-expert creation.
+    Score = ||z|| (magnitude = expert confidence for routing)
 
-CRP Routing (no prototype, no distance metric):
+CRP Routing (exclusive, hard assignment):
     For each input H:
-        - Run all active experts → scores, entropies
-        - MoE gate: top-k experts by score, softmax weights
-        - final_repr = Σ gate_j × z_j
-    New expert: if (max_score < threshold OR best_entropy > entropy_threshold)
-                AND Bernoulli(alpha / (N_total + alpha))
+        - Run all active experts → routing scores (magnitude)
+        - Pick expert with highest routing score
+        - That expert classifies internally using its local classifier
+    New expert: when a new class appears that no expert owns
+                AND CRP Bernoulli(alpha / (N_total + alpha)) triggers
 
-Classification (prompt-based CIL style):
-    class_queries ∈ R^(C × d) — one learnable query per class
-    logits = final_repr @ class_queries^T  →  (B, C)
-    Old class queries are frozen when training new tasks.
+Training (dual loss):
+    1. Classification loss: correct expert classifies input → CE loss
+    2. Contrastive routing loss: if input was routed to wrong expert,
+       push correct expert's score UP and wrong expert's score DOWN:
+           L_route = max(0, margin + score_wrong - score_correct)
 
 Continual Learning guarantees:
-    - Agents: frozen throughout → feature space stable
-    - Expert queries: only appended (old frozen at task boundary)
-    - Class queries: old ones frozen when new classes arrive
-    - No prototype to become stale after feature drift
-    - Fully differentiable via backprop through cross-attention
+    - Each expert's local classifier only handles its owned classes
+    - Old experts are frozen when training new tasks
+    - New experts are created for new class groups
+    - Contrastive routing ensures correct expert selection over time
 
 Inspiration:
-    - CompSLOT: Liao et al. (ICLR 2026) — primitive selection via cross-attention
-    - L2P / DualPrompt: Wang et al. (2022) — per-class learnable query vectors
+    - CompSLOT: Liao et al. (ICLR 2026)
     - CRP: Aldous (1985), Pitman (2006)
-    - MoE routing: Mixtral (Jiang et al., 2024)
+    - Hard MoE routing
 """
 
 import torch
@@ -49,19 +48,19 @@ import math
 
 class LearnableExpert(nn.Module):
     """
-    Expert with learnable query embeddings + cross-attention (no prototype).
+    Expert with exclusive class ownership + internal classifier.
 
-    Instead of a centroid in feature space, this expert holds L learnable
-    query embeddings that attend to agent outputs via cross-attention.
-    The expert identity lives in parameter space, not in the geometry of
-    agent outputs — so it never goes stale when the feature distribution
-    changes.
+    Each expert:
+        1. Has learnable query embeddings for cross-attention (routing identity)
+        2. Owns a specific set of classes (non-overlapping with other experts)
+        3. Has its own local classifier to predict within its class set
 
     Args:
-        expert_id:  Unique expert identifier.
-        n_queries:  Number of learnable query embeddings (L).
-        embed_dim:  Query / key / value hidden dimension (d).
-        agent_dim:  Input agent-output dimension per slot.
+        expert_id:       Unique expert identifier.
+        n_queries:       Number of learnable query embeddings (L).
+        embed_dim:       Query / key / value hidden dimension (d).
+        agent_dim:       Input agent-output dimension per slot.
+        max_local_classes: Maximum classes this expert can own.
     """
 
     def __init__(
@@ -70,6 +69,7 @@ class LearnableExpert(nn.Module):
         n_queries: int = 4,
         embed_dim: int = 256,
         agent_dim: int = 256,
+        max_local_classes: int = 20,
     ):
         super().__init__()
 
@@ -77,18 +77,51 @@ class LearnableExpert(nn.Module):
         self.n_queries = n_queries
         self.embed_dim = embed_dim
         self.agent_dim = agent_dim
+        self.max_local_classes = max_local_classes
 
-        # Learnable query embeddings — expert "identity" in parameter space
-        # NOT a prototype centroid; NOT in agent feature geometry
+        # ── Routing: learnable query embeddings ──
         self.queries = nn.Parameter(torch.randn(n_queries, embed_dim) * 0.02)
 
         # Project agent slot outputs to K, V
         self.key_proj = nn.Linear(agent_dim, embed_dim, bias=False)
         self.val_proj = nn.Linear(agent_dim, embed_dim, bias=False)
 
-        # Statistics (not learnable)
+        # ── Internal classifier: predict within owned classes ──
+        self.local_classifier = nn.Linear(embed_dim, max_local_classes)
+
+        # ── Class ownership ──
+        self.owned_classes: List[int] = []          # global class indices
+        self._global_to_local: Dict[int, int] = {}  # global → local index
+        self._local_to_global: Dict[int, int] = {}  # local → global index
+
+        # ── Statistics ──
         self.class_counts: Dict[int, int] = defaultdict(int)
         self.total_assigned: int = 0
+
+    def add_class(self, global_class: int):
+        """Register a new class for this expert."""
+        if global_class in self._global_to_local:
+            return  # already owned
+        local_idx = len(self.owned_classes)
+        assert local_idx < self.max_local_classes, (
+            f"Expert {self.expert_id} exceeded max_local_classes "
+            f"({self.max_local_classes})"
+        )
+        self.owned_classes.append(global_class)
+        self._global_to_local[global_class] = local_idx
+        self._local_to_global[local_idx] = global_class
+
+    def owns_class(self, global_class: int) -> bool:
+        """Check if this expert owns a given class."""
+        return global_class in self._global_to_local
+
+    def global_to_local(self, global_class: int) -> int:
+        """Map global class index to local index within this expert."""
+        return self._global_to_local[global_class]
+
+    def local_to_global(self, local_class: int) -> int:
+        """Map local class index back to global class index."""
+        return self._local_to_global[local_class]
 
     def forward(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -99,7 +132,7 @@ class LearnableExpert(nn.Module):
 
         Returns:
             z:       (B, embed_dim)  aggregated representation
-            entropy: (B,)            attention entropy — high = OOD signal
+            entropy: (B,)            attention entropy — routing confidence
         """
         B, k, _ = H.shape
 
@@ -115,16 +148,33 @@ class LearnableExpert(nn.Module):
         # Mean over L queries → single representation
         z = torch.bmm(attn, V).mean(dim=1)                  # (B, d)
 
-        # Attention entropy averaged over queries — OOD diagnostic
+        # Attention entropy — OOD diagnostic
         attn_avg = attn.mean(dim=1)                         # (B, k)
         entropy = -(attn_avg * (attn_avg + 1e-8).log()).sum(dim=-1)  # (B,)
 
         return z, entropy
 
+    def classify(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Classify using internal classifier (only over owned classes).
+
+        Args:
+            z: (B, embed_dim)
+
+        Returns:
+            logits: (B, num_owned_classes) — masked to only owned indices
+        """
+        all_logits = self.local_classifier(z)  # (B, max_local_classes)
+        n_owned = len(self.owned_classes)
+        # Only return logits for owned classes
+        return all_logits[:, :n_owned]
+
     def get_info(self) -> Dict:
         """Expert statistics."""
         return {
             "expert_id": self.expert_id,
+            "owned_classes": list(self.owned_classes),
+            "num_classes": len(self.owned_classes),
             "total_assigned": self.total_assigned,
             "class_counts": dict(self.class_counts),
             "n_queries": self.n_queries,
@@ -133,40 +183,37 @@ class LearnableExpert(nn.Module):
 
 class CRPExpertAggregator(nn.Module):
     """
-    MoE Cross-Attention Expert Aggregator (no prototypes).
+    CRP Expert Aggregator with Exclusive Class Ownership.
 
-    Combines CRP-style dynamic expert creation with learnable query
-    embeddings + cross-attention routing (no metric-space prototypes).
+    Each expert owns a non-overlapping set of classes and has its own
+    internal classifier.  Routing is hard (pick best expert).
+    Training uses a dual loss:
+        - Classification loss (within correct expert)
+        - Contrastive routing loss (when misrouted)
 
-    Pipeline for each sample (hidden_labels, label):
-        1. Reshape hidden_labels → H: (1, num_slots, agent_dim).
-        2. Run all N active experts on H → scores (magnitude) + entropies.
-        3. CRP check: if (max_score < threshold OR best_entropy > ent_threshold)
-                       AND Bernoulli(alpha / (N + alpha)) → create new expert.
-        4. MoE gate: top-k experts by score, softmax weights.
-        5. final_repr = Σ gate_j × z_j.
-        6. logits = final_repr @ class_queries^T → (C,).
-        7. CE loss + backprop → update expert queries + class query for this label.
-
-    Key properties:
-        - Expert identity = learnable parameter vectors, NOT prototype centroids.
-        - Routing uses attention entropy (OOD signal), NOT Euclidean distance.
-        - Class queries grow by appending new vectors (old ones frozen per task).
-        - Fully differentiable end-to-end.
+    Pipeline for each sample:
+        1. Reshape features → H: (1, num_slots, agent_dim).
+        2. Run all N experts on H → routing scores (||z||).
+        3. Find correct_expert (the one owning the label).
+           If none → CRP creates new expert, assigns class to it.
+        4. Classification: correct_expert classifies → CE loss.
+        5. Routing: if routed_expert ≠ correct_expert →
+           contrastive loss = max(0, margin + score_wrong - score_correct).
+        6. Backprop total loss → update expert queries + classifiers.
 
     Args:
         feature_dim:         Total input dim = num_slots × agent_dim.
-        num_slots:           Number of AdaSlot slots (S).
-        agent_dim:           Agent output dimension per slot (proto_dim).
+        num_slots:           Number of slots (S).
+        agent_dim:           Agent output dimension per slot.
         num_classes:         Maximum total number of classes.
         alpha:               CRP concentration. Higher → more new experts.
         max_experts:         Hard cap on expert pool size.
         n_queries:           Learnable query embeddings per expert (L).
         embed_dim:           Cross-attention hidden dimension (d).
-        top_k:               Number of top experts for MoE gating.
         expert_lr:           Learning rate for all learnable parameters.
-        entropy_threshold:   Attention entropy threshold for OOD detection.
-        score_threshold:     Min MoE score to avoid triggering new expert.
+        routing_margin:      Margin for contrastive routing loss.
+        routing_weight:      Weight for routing loss relative to classification.
+        classes_per_expert:  Max classes each expert can handle.
         device:              Torch device.
     """
 
@@ -175,15 +222,15 @@ class CRPExpertAggregator(nn.Module):
         feature_dim: int,
         num_slots: int,
         agent_dim: int,
-        num_classes: int = 100,
+        num_classes: int = 200,
         alpha: float = 1.0,
-        max_experts: int = 20,
+        max_experts: int = 50,
         n_queries: int = 4,
         embed_dim: int = 256,
-        top_k: int = 3,
         expert_lr: float = 1e-3,
-        entropy_threshold: float = 2.0,
-        score_threshold: float = 0.3,
+        routing_margin: float = 1.0,
+        routing_weight: float = 0.5,
+        classes_per_expert: int = 20,
         device: str = "cpu",
     ):
         super().__init__()
@@ -196,48 +243,43 @@ class CRPExpertAggregator(nn.Module):
         self.max_experts = max_experts
         self.n_queries = n_queries
         self.embed_dim = embed_dim
-        self.top_k = top_k
         self.expert_lr = expert_lr
-        self.entropy_threshold = entropy_threshold
-        self.score_threshold = score_threshold
+        self.routing_margin = routing_margin
+        self.routing_weight = routing_weight
+        self.classes_per_expert = classes_per_expert
         self.device = device
 
         # Expert pool — grows dynamically via CRP
         self.experts = nn.ModuleList()
 
-        # Class query vectors: classification via inner product with final_repr
-        # Shape (num_classes, embed_dim); old queries frozen per task boundary
-        self.class_queries = nn.Parameter(
-            torch.randn(num_classes, embed_dim, device=device) * 0.02
-        )
-
-        # Set of classes whose query vectors are currently trainable
-        self._trainable_classes: Set[int] = set()
+        # Global class → expert mapping (for fast lookup)
+        self._class_to_expert: Dict[int, int] = {}  # global_class → expert_idx
 
         # Global statistics
         self.total_samples: int = 0
         self.num_classes_seen: int = 0
         self.class_counts: Dict[int, int] = defaultdict(int)
         self.seen_classes: Set[int] = set()
-        self.expert_class_map: Dict[int, set] = defaultdict(set)
 
         self._next_expert_id: int = 0
         self._optimizer: Optional[torch.optim.Optimizer] = None
-
-        # CRP usage counts per expert slot
-        self.register_buffer(
-            "_expert_counts", torch.zeros(max_experts, dtype=torch.long, device=device)
-        )
+        self._frozen_experts: Set[int] = set()  # indices of frozen experts
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _init_optimizer(self):
-        """Build Adam optimizer over all current parameters."""
-        self._optimizer = torch.optim.Adam(
-            self.parameters(), lr=self.expert_lr
-        )
+        """Build Adam optimizer over all current trainable parameters."""
+        trainable_params = [
+            p for p in self.parameters() if p.requires_grad
+        ]
+        if trainable_params:
+            self._optimizer = torch.optim.Adam(
+                trainable_params, lr=self.expert_lr
+            )
+        else:
+            self._optimizer = None
 
     def _create_expert(
         self, init_from: Optional[LearnableExpert] = None
@@ -248,6 +290,7 @@ class CRPExpertAggregator(nn.Module):
             n_queries=self.n_queries,
             embed_dim=self.embed_dim,
             agent_dim=self.agent_dim,
+            max_local_classes=self.classes_per_expert,
         ).to(self.device)
 
         if init_from is not None:
@@ -256,7 +299,8 @@ class CRPExpertAggregator(nn.Module):
                 expert.key_proj.weight.data.copy_(init_from.key_proj.weight.data)
                 expert.val_proj.weight.data.copy_(init_from.val_proj.weight.data)
                 # Small noise to break symmetry
-                for p in expert.parameters():
+                for p in [expert.queries, expert.key_proj.weight,
+                          expert.val_proj.weight]:
                     p.add_(torch.randn_like(p) * 0.01)
 
         self._next_expert_id += 1
@@ -267,205 +311,202 @@ class CRPExpertAggregator(nn.Module):
         B = x.shape[0] if x.dim() > 1 else 1
         return x.view(B, self.num_slots, self.agent_dim)
 
-    def _forward_all_experts(
+    def _compute_routing_scores(
         self, H: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
-        Run all active experts on H.
+        Compute routing scores for all experts.
 
         Args:
             H: (B, num_slots, agent_dim)
 
         Returns:
-            all_z:       (B, N, embed_dim)
-            all_scores:  (B, N)   magnitude × log-CRP-count
-            all_entropy: (B, N)   attention entropy per expert
+            all_z:    list of (B, embed_dim) — one per expert
+            scores:   (B, N) — routing scores (||z||)
         """
         N = len(self.experts)
-        zs, raw_scores, entropies = [], [], []
+        all_z = []
+        score_list = []
 
-        for j, expert in enumerate(self.experts):
-            z, ent = expert(H)                      # (B, d), (B,)
-            s = z.norm(dim=-1)                      # (B,)
-            raw_scores.append(s)
-            entropies.append(ent)
-            zs.append(z)
+        for expert in self.experts:
+            z, _ = expert(H)            # (B, d)
+            s = z.norm(dim=-1)           # (B,)
+            all_z.append(z)
+            score_list.append(s)
 
-        all_z = torch.stack(zs, dim=1)              # (B, N, d)
-        all_scores = torch.stack(raw_scores, dim=1) # (B, N)
-        all_entropy = torch.stack(entropies, dim=1) # (B, N)
+        scores = torch.stack(score_list, dim=1)  # (B, N)
+        return all_z, scores
 
-        # Multiply by log(CRP count + 1) as a mild popularity bonus
-        crp_prior = (
-            self._expert_counts[:N].float().to(self.device) + 1.0
-        ).log1p()
-        all_scores = all_scores * crp_prior.unsqueeze(0)
+    def _find_expert_for_class(self, label: int) -> Optional[int]:
+        """Find which expert index owns a given class."""
+        return self._class_to_expert.get(label, None)
 
-        return all_z, all_scores, all_entropy
+    def _assign_class_to_expert(self, label: int, expert_idx: int):
+        """Assign a class to an expert (exclusive ownership)."""
+        self._class_to_expert[label] = expert_idx
+        self.experts[expert_idx].add_class(label)
 
-    def _moe_aggregate(
-        self, all_z: torch.Tensor, all_scores: torch.Tensor
-    ) -> torch.Tensor:
+    def _ensure_expert_for_class(self, label: int) -> int:
         """
-        MoE gating: top-k experts, softmax weights.
-
-        Returns:
-            output: (B, embed_dim)
+        Ensure there is an expert that owns this class.
+        If not, CRP-style: either assign to an existing expert
+        (if it has room and is not frozen) or create a new one.
         """
-        N = all_z.size(1)
-        k = min(self.top_k, N)
+        existing_idx = self._find_expert_for_class(label)
+        if existing_idx is not None:
+            return existing_idx
 
-        topk_scores, topk_idx = all_scores.topk(k, dim=-1)   # (B, k)
-        gate = F.softmax(topk_scores, dim=-1)                  # (B, k)
+        # Try to find an unfrozen expert that has room
+        # Prefer the most recently created expert (likely for current task)
+        for idx in reversed(range(len(self.experts))):
+            if idx in self._frozen_experts:
+                continue
+            expert = self.experts[idx]
+            if len(expert.owned_classes) < self.classes_per_expert:
+                self._assign_class_to_expert(label, idx)
+                return idx
 
-        selected_z = all_z.gather(
-            1, topk_idx.unsqueeze(-1).expand(-1, -1, self.embed_dim)
-        )                                                        # (B, k, d)
-
-        return (gate.unsqueeze(-1) * selected_z).sum(dim=1)    # (B, d)
-
-    def _maybe_add_expert(
-        self, all_scores: torch.Tensor, all_entropy: torch.Tensor
-    ) -> bool:
-        """
-        CRP decision gate: add new expert if needed.
-
-        Trigger condition:
-            (mean_max_score < score_threshold  OR
-             best_expert_entropy > entropy_threshold)
-            AND Bernoulli(alpha / (N + alpha))
-
-        Returns True if a new expert was created.
-        """
-        if len(self.experts) >= self.max_experts:
-            return False
-
-        mean_max_score = all_scores.max(dim=-1).values.mean().item()
-        # Entropy of the currently most confident expert
-        best_j = int(all_scores.mean(0).argmax().item())
-        best_entropy = all_entropy[:, best_j].mean().item()
-
-        p_new = self.alpha / (self.total_samples + self.alpha + 1e-8)
-
-        if (
-            (mean_max_score < self.score_threshold or
-             best_entropy > self.entropy_threshold)
-            and np.random.rand() < p_new
-        ):
-            init_src = self.experts[best_j] if len(self.experts) > 0 else None
+        # No room → CRP: create new expert
+        if len(self.experts) < self.max_experts:
+            init_src = (self.experts[-1] if len(self.experts) > 0
+                        else None)
             new_expert = self._create_expert(init_from=init_src)
             self.experts.append(new_expert)
-            # Register new params in existing optimizer
-            if self._optimizer is not None:
-                self._optimizer.add_param_group(
-                    {"params": new_expert.parameters(), "lr": self.expert_lr}
-                )
-            return True
+            new_idx = len(self.experts) - 1
+            self._assign_class_to_expert(label, new_idx)
 
-        return False
+            # Re-init optimizer with new expert params
+            self._init_optimizer()
+            return new_idx
+
+        # Max experts reached — force-assign to the last unfrozen expert
+        for idx in reversed(range(len(self.experts))):
+            if idx not in self._frozen_experts:
+                self._assign_class_to_expert(label, idx)
+                return idx
+
+        # All frozen — shouldn't happen in normal operation
+        raise RuntimeError(
+            "All experts are frozen and at max capacity. "
+            "Cannot assign new class."
+        )
 
     # ------------------------------------------------------------------
-    # Public API (compatible with BatchCRPAggregator)
+    # Public API
     # ------------------------------------------------------------------
 
-    def freeze_old_classes(self, new_label_set: Set[int]):
+    def freeze_old_classes(self, old_classes: Set[int]):
         """
-        Freeze class-query vectors for all classes NOT in new_label_set.
+        Freeze experts that handle only old classes.
         Call at the start of each new task to protect previous knowledge.
+
+        Args:
+            old_classes: Set of class labels from previous tasks.
+                         Experts whose owned classes are all within this set
+                         will be frozen.
         """
-        self._trainable_classes = new_label_set
+        for idx, expert in enumerate(self.experts):
+            expert_classes = set(expert.owned_classes)
+            # If all of this expert's classes are old → freeze it
+            if expert_classes and expert_classes.issubset(old_classes):
+                self._frozen_experts.add(idx)
+                for p in expert.parameters():
+                    p.requires_grad_(False)
+
+        # Rebuild optimizer with only trainable params
+        self._init_optimizer()
 
     def learn_one(self, hidden_labels: np.ndarray, label: int) -> Dict:
         """
-        Online learning: one example.
+        Online learning: one example with exclusive expert routing.
 
         Args:
             hidden_labels: (feature_dim,) — flattened agent outputs.
             label:         Ground-truth class label (int).
 
         Returns:
-            info Dict with expert routing details.
+            info Dict with routing and classification details.
         """
         x = torch.tensor(
             hidden_labels, dtype=torch.float32, device=self.device
         ).unsqueeze(0)                                          # (1, F)
-        y = torch.tensor([label], dtype=torch.long, device=self.device)
 
-        # Bootstrap: create first expert
-        if len(self.experts) == 0:
-            self.experts.append(self._create_expert())
-            self._init_optimizer()
+        # 1. Ensure correct expert exists for this label
+        correct_expert_idx = self._ensure_expert_for_class(label)
+        correct_expert = self.experts[correct_expert_idx]
 
         H = self._reshape(x)                                    # (1, S, D)
 
-        # Forward all active experts
-        all_z, all_scores, all_entropy = self._forward_all_experts(H)
+        # 2. Classification loss (from correct expert)
+        z_correct, _ = correct_expert(H)   # (1, d)
+        local_logits = correct_expert.classify(z_correct)  # (1, n_owned)
+        local_label = correct_expert.global_to_local(label)
+        local_target = torch.tensor(
+            [local_label], dtype=torch.long, device=self.device
+        )
+        cls_loss = F.cross_entropy(local_logits, local_target)
 
-        # CRP routing: maybe add new expert
-        is_new = self._maybe_add_expert(all_scores, all_entropy)
-        if is_new:
-            all_z, all_scores, all_entropy = self._forward_all_experts(H)
+        # 3. Contrastive routing loss (if multiple experts exist)
+        routing_loss = torch.tensor(0.0, device=self.device)
+        routed_expert_idx = correct_expert_idx  # default
 
-        # MoE aggregate → final representation
-        repr_vec = self._moe_aggregate(all_z, all_scores)       # (1, d)
+        if len(self.experts) > 1:
+            all_z, routing_scores = self._compute_routing_scores(H)
+            # (1, N) → squeeze to (N,)
+            scores = routing_scores.squeeze(0)
+            routed_expert_idx = scores.argmax().item()
 
-        # Classification logits
-        logits = repr_vec @ self.class_queries.T                 # (1, C)
+            score_correct = scores[correct_expert_idx]
 
-        # Mask unseen classes to -inf (except current label)
-        visible = list(self.seen_classes | {label})
-        mask = torch.full_like(logits, float("-inf"))
-        mask[:, visible] = 0.0
-        logits = logits + mask
+            if routed_expert_idx != correct_expert_idx:
+                score_wrong = scores[routed_expert_idx]
+                # Margin loss: push correct up, wrong down
+                routing_loss = F.relu(
+                    self.routing_margin + score_wrong - score_correct
+                )
 
-        # Cross-entropy loss
-        loss = F.cross_entropy(logits, y)
+        # 4. Total loss
+        total_loss = cls_loss + self.routing_weight * routing_loss
 
-        # Backprop (with class-query freezing)
+        # 5. Backprop
         if self._optimizer is None:
             self._init_optimizer()
 
-        self._optimizer.zero_grad()
-        loss.backward()
+        if self._optimizer is not None:
+            self._optimizer.zero_grad()
+            total_loss.backward()
+            self._optimizer.step()
 
-        # Freeze gradients for old class queries if _trainable_classes is set
-        if self._trainable_classes:
-            with torch.no_grad():
-                freeze_mask = torch.ones(
-                    self.num_classes, device=self.device
-                )
-                freeze_mask[list(self._trainable_classes)] = 0.0
-                if self.class_queries.grad is not None:
-                    self.class_queries.grad *= (1.0 - freeze_mask).unsqueeze(1)
+        # 6. Update statistics
+        correct_expert.total_assigned += 1
+        correct_expert.class_counts[label] += 1
 
-        self._optimizer.step()
-
-        # Update CRP counts for top-k used experts
-        N = len(self.experts)
-        k = min(self.top_k, N)
-        topk_idx = all_scores[0].topk(k).indices
-        for idx in topk_idx.cpu().tolist():
-            self._expert_counts[idx] += 1
-            self.experts[idx].total_assigned += 1
-            self.experts[idx].class_counts[label] += 1
-            self.expert_class_map[idx].add(label)
-
-        # Update global statistics
         if label not in self.seen_classes:
             self.seen_classes.add(label)
             self.num_classes_seen += 1
         self.class_counts[label] += 1
         self.total_samples += 1
 
+        is_misrouted = (routed_expert_idx != correct_expert_idx)
+
         return {
-            "expert_idx": topk_idx[0].item() if len(topk_idx) > 0 else -1,
-            "is_new_expert": is_new,
+            "expert_idx": correct_expert_idx,
+            "routed_expert_idx": routed_expert_idx,
+            "is_misrouted": is_misrouted,
             "num_experts": len(self.experts),
-            "loss": loss.item(),
+            "cls_loss": cls_loss.item(),
+            "routing_loss": routing_loss.item() if isinstance(
+                routing_loss, torch.Tensor) else routing_loss,
+            "total_loss": total_loss.item(),
         }
 
     def predict_one(self, hidden_labels: np.ndarray) -> Optional[int]:
-        """Predict class for one example."""
+        """
+        Predict class for one example.
+
+        Routes to the expert with highest routing score,
+        that expert classifies internally.
+        """
         if len(self.experts) == 0:
             return None
 
@@ -475,18 +516,24 @@ class CRPExpertAggregator(nn.Module):
 
         with torch.no_grad():
             H = self._reshape(x)
-            all_z, all_scores, _ = self._forward_all_experts(H)
-            repr_vec = self._moe_aggregate(all_z, all_scores)   # (1, d)
-            logits = repr_vec @ self.class_queries.T             # (1, C)
+            _, routing_scores = self._compute_routing_scores(H)
+            # Pick expert with highest routing score
+            best_expert_idx = routing_scores.squeeze(0).argmax().item()
+            best_expert = self.experts[best_expert_idx]
 
-            mask = torch.full_like(logits, float("-inf"))
-            mask[:, list(self.seen_classes)] = 0.0
-            logits = logits + mask
-            pred = logits.argmax(dim=-1).item()
+            z, _ = best_expert(H)
+            local_logits = best_expert.classify(z)  # (1, n_owned)
+            local_pred = local_logits.argmax(dim=-1).item()
 
-        return pred
+            # Map back to global class
+            if local_pred < len(best_expert.owned_classes):
+                return best_expert.local_to_global(local_pred)
+            else:
+                return None
 
-    def predict_proba_one(self, hidden_labels: np.ndarray) -> Dict[int, float]:
+    def predict_proba_one(
+        self, hidden_labels: np.ndarray
+    ) -> Dict[int, float]:
         """Predict class probabilities for one example."""
         if len(self.experts) == 0:
             return {}
@@ -497,23 +544,22 @@ class CRPExpertAggregator(nn.Module):
 
         with torch.no_grad():
             H = self._reshape(x)
-            all_z, all_scores, _ = self._forward_all_experts(H)
-            repr_vec = self._moe_aggregate(all_z, all_scores)
-            logits = repr_vec @ self.class_queries.T
+            _, routing_scores = self._compute_routing_scores(H)
+            best_expert_idx = routing_scores.squeeze(0).argmax().item()
+            best_expert = self.experts[best_expert_idx]
 
-            mask = torch.full_like(logits, float("-inf"))
-            mask[:, list(self.seen_classes)] = 0.0
-            logits = logits + mask
-            probs = F.softmax(logits, dim=-1).squeeze(0)
+            z, _ = best_expert(H)
+            local_logits = best_expert.classify(z)
+            probs = F.softmax(local_logits, dim=-1).squeeze(0)
 
-        return {
-            i: probs[i].item()
-            for i in range(self.num_classes)
-            if probs[i].item() > 1e-6
-        }
+        result = {}
+        for local_idx in range(len(best_expert.owned_classes)):
+            global_class = best_expert.local_to_global(local_idx)
+            result[global_class] = probs[local_idx].item()
+        return result
 
     def update_all_projection_bases(self):
-        """No-op (API compatibility). GPM not used in this design."""
+        """No-op (API compatibility)."""
         pass
 
     def get_stats(self) -> Dict:
@@ -524,11 +570,10 @@ class CRPExpertAggregator(nn.Module):
             "num_classes_seen": self.num_classes_seen,
             "seen_classes": sorted(self.seen_classes),
             "class_counts": dict(self.class_counts),
-            "expert_class_map": {
-                k: list(v) for k, v in self.expert_class_map.items()
-            },
+            "frozen_experts": sorted(self._frozen_experts),
             "expert_infos": [e.get_info() for e in self.experts],
         }
+
 
 class BatchCRPAggregator:
     """
@@ -623,7 +668,7 @@ def create_aggregator(
         Aggregator instance.
 
     Example:
-        >>> agg = create_aggregator('crp', feature_dim=2688, num_classes=100)
+        >>> agg = create_aggregator('crp', feature_dim=2816, num_classes=200)
         >>> agg.learn_one(hidden_labels, label)
         >>> pred = agg.predict_one(hidden_labels)
     """
