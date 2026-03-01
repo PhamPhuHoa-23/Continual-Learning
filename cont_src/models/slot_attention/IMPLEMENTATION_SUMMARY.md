@@ -180,67 +180,228 @@ Example config: [configs/cifar100_adaslot.yaml](configs/cifar100_adaslot.yaml)
 - **Softmax attention**: Normalizes slot contributions
 - **Mask-aware**: Zeros out dropped slots before aggregation
 
-## 🎓 References
+## Basic AdaSlot Configuration
 
-1. **AdaSlot**: Adaptive Slot Attention implementation
-   - Source: `Setup/AdaSlot/`
-   - Gumbel-Softmax selection mechanism
-   - Temperature annealing schedule
+```yaml
+# Adaptive Slot Attention with default settings
+adaslot:
+  num_slots: 7
+  slot_dim: 128
+  feature_dim: 768  # ViT-B/16 feature dim
+  num_iterations: 3
+  num_heads: 1
+  
+  # Adaptive selection
+  use_gumbel: true
+  gumbel_low_bound: 1  # Keep at least 1 slot
+  init_temperature: 1.0
+  min_temperature: 0.5
+  temperature_anneal_rate: 0.00003
+  
+  # Primitive selection
+  use_primitive: true
+  primitive_hidden_dim: 128
+  
+  # Reconstruction
+  use_decoder: true
+  decoder_hidden_dim: 256
+  decoder_layers: 2
+```
 
-2. **CompSLOT** (ICLR 2026):
-   - Primitive selection mechanism (Section 4.1, Eq. 2)
-   - Primitive loss (Section 4.1, Eq. 3)
-   - Concept-level understanding for continual learning
+## Loss Configuration with AdaSlot
 
-3. **Slot Attention** (Locatello et al., 2020):
-   - Iterative attention mechanism
-   - GRU-based slot updates
-   - Permutation equivariance
+```yaml
+loss:
+  # Standard classification loss
+  use_cross_entropy: true
+  
+  # Primitive loss (concept-level KL divergence)
+  use_primitive: true
+  weight_primitive: 10.0
+  primitive_temperature: 10.0
+  
+  # Reconstruction loss
+  use_reconstruction: true
+  weight_reconstruction: 1.0
+  
+  # Supervised contrastive loss (optional)
+  use_supcon: false
+  weight_supcon: 0.1
+  supcon_temperature: 0.07
+```
 
-## 🚀 Next Steps
+## Training Configuration
 
-To use AdaSlot in training:
+```yaml
+training:
+  batch_size: 64
+  learning_rate: 0.0001
+  epochs_per_task: 20
+  
+  # AdaSlot specific
+  global_step_tracking: true  # For temperature annealing
+  
+optimizer:
+  type: "adam"
+  lr: 0.0001
+  weight_decay: 0.0001
+  
+  # Separate LR for slot attention (optional)
+  slot_lr_multiplier: 1.0
+```
 
-1. **Integrate with training pipeline**:
-   - Add AdaSlotModule to model architecture
-   - Compute primitive and reconstruction losses
-   - Track global step for temperature annealing
+## Complete Example: CIFAR-100 with AdaSlot
 
-2. **Experiment configurations**:
-   - CIFAR-100: 10 tasks, 10 classes/task
-   - CGQA/COBJ: Compositional benchmarks
-   - ImageNet-R: 200 classes, 20 tasks
+```yaml
+experiment_name: "cifar100_adaslot_baseline"
 
-3. **Hyperparameter tuning**:
-   - Number of slots (5-10)
-   - Slot dimension (64-256)
-   - Temperature schedule
-   - Loss weights
+# Data
+data:
+  dataset: "cifar100"
+  n_tasks: 10
+  batch_size: 64
+  num_workers: 4
+  seed: 42
 
-4. **Ablation studies**:
-   - With/without Gumbel selection
-   - With/without primitive loss
-   - Different minimum slot constraints
+# Backbone
+backbone:
+  type: "vit_b_16"
+  pretrained: true
+  freeze: false  # Fine-tune backbone
 
-## ✨ Key Advantages
+# AdaSlot Module
+adaslot:
+  num_slots: 7
+  slot_dim: 128
+  feature_dim: 768
+  num_iterations: 3
+  
+  use_gumbel: true
+  gumbel_low_bound: 2
+  
+  use_primitive: true
+  use_decoder: true
 
-1. **Adaptive**: Dynamically selects relevant slots
-2. **Differentiable**: Gumbel-Softmax allows gradient flow
-3. **Compositional**: Learns concept-level representations
-4. **Efficient**: Lightweight decoder, ~500K params total
-5. **Interpretable**: Slot attention maps reveal concepts
-6. **Modular**: Easy to integrate with any backbone
+# Losses
+loss:
+  use_primitive: true
+  weight_primitive: 10.0
+  primitive_temperature: 10.0
+  
+  use_reconstruction: true
+  weight_reconstruction: 1.0
 
-## 📈 Expected Benefits for Continual Learning
+# Training
+training:
+  epochs_per_task: 20
+  learning_rate: 0.0001
+  
+# Classifier
+classifier:
+  type: "slda"  # or "linear"
+  hidden_dim: 256
+```
 
-- **Reduced forgetting**: Concept reuse across tasks
-- **Fast adaptation**: Few slots needed for new classes
-- **Better generalization**: Compositional understanding
-- **Interpretability**: Visual analysis of learned concepts
-- **Stability**: Temperature annealing provides smooth transitions
+## AdaSlot with Few Slots
 
----
+```yaml
+# Minimal slot configuration for faster training
+adaslot:
+  num_slots: 4
+  slot_dim: 64
+  num_iterations: 2
+  
+  gumbel_low_bound: 1
+  init_temperature: 1.5  # Higher = more exploration
+```
 
-**Status**: ✅ Implementation complete and tested
-**Integration**: Ready for training pipeline
-**Documentation**: Complete with examples
+## AdaSlot with Many Slots
+
+```yaml
+# Many slots for complex scenes
+adaslot:
+  num_slots: 10
+  slot_dim: 256
+  num_iterations: 5
+  
+  gumbel_low_bound: 3  # Keep at least 3
+  temperature_anneal_rate: 0.00005  # Slower annealing
+```
+
+## Compositional Learning Tasks
+
+```yaml
+# For compositional benchmarks (CGQA, COBJ)
+data:
+  dataset: "cgqa"  # or "cobj"
+  n_tasks: 3
+
+adaslot:
+  num_slots: 8
+  slot_dim: 192
+  
+  # More aggressive selection
+  gumbel_low_bound: 2
+  init_temperature: 2.0
+  min_temperature: 0.3
+
+loss:
+  # Strong primitive loss for concept learning
+  weight_primitive: 20.0
+  primitive_temperature: 15.0
+  
+  # Enable all losses
+  use_supcon: true
+  weight_supcon: 0.5
+```
+
+## Usage in Code
+
+```python
+from cont_src.config import Config
+from cont_src.models.slot_attention import AdaSlotModule
+
+# Load config
+config = Config.from_yaml("configs/cifar100_adaslot.yaml")
+
+# Build AdaSlot module
+adaslot = AdaSlotModule(
+    num_slots=config.adaslot.num_slots,
+    slot_dim=config.adaslot.slot_dim,
+    feature_dim=config.adaslot.feature_dim,
+    **config.adaslot.__dict__
+)
+
+# Forward pass
+features = backbone(images)  # (B, N, D)
+outputs = adaslot(features, global_step=current_step)
+
+slots = outputs["slots"]            # (B, K, D_s)
+primitives = outputs["primitives"]  # (B, D_s)
+reconstruction = outputs["reconstruction"]  # (B, N, D)
+```
+
+## Notes
+
+- **Temperature Annealing**: Starts at `init_temperature`, exponentially decays to `min_temperature`
+- **Low Bound**: Ensures minimum slots kept for stability
+- **Primitive Loss**: Higher weight (10-20) recommended for concept learning
+- **Reconstruction**: Helps slot attention learn meaningful decompositions
+- **Global Step**: Must track global step for temperature annealing to work
+
+## Advanced: Custom Temperature Schedule
+
+```python
+# Custom temperature function
+def custom_temperature(step, init=1.0, min_temp=0.5):
+    # Linear decay
+    decay = 1.0 - (step / 10000.0)
+    temp = init * max(decay, min_temp)
+    return max(temp, min_temp)
+
+# Use in model
+adaslot.slot_attention.get_temperature = custom_temperature
+```
+
+
+

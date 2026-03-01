@@ -166,7 +166,7 @@ def build_adaslot_from_checkpoint(
     Returns:
         Loaded AdaSlotModel.
     """
-    from src.models.adaslot.model import AdaSlotModel
+    from cont_src.models.adaslot.model import AdaSlotModel
 
     cfg = get_adaslot_config(checkpoint_name)
 

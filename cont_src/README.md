@@ -59,6 +59,7 @@ agent = AGENT_REGISTRY.build(
 )
 ```
 
+
 ### 2. Using YAML Config
 
 ```yaml
@@ -363,3 +364,161 @@ Follow [RULE.md](../RULE.md) for code quality standards:
 ---
 
 **Built with modularity and extensibility in mind. Happy researching! 🚀**
+
+---
+
+## 📐 Architecture Overview
+
+The `cont_src/` framework is designed with **modularity**, **config-driven development**, and **easy extensibility** as core principles.
+
+## 🏗️ Core Design Patterns
+
+### 1. Registry Pattern
+
+All components are registered and instantiated through a central registry:
+
+```python
+from cont_src.core.registry import AGENT_REGISTRY
+
+@AGENT_REGISTRY.register("my_agent")
+class MyAgent(BaseAgent):
+    pass
+
+# Later, instantiate from config
+agent = AGENT_REGISTRY.build("my_agent", hidden_dim=256)
+```
+
+**Benefits:**
+- No hardcoding of component types
+- Easy to add new components without modifying existing code
+- Config can specify any registered component by name
+
+### 2. Config-Driven Architecture
+
+Everything is configured through structured dataclasses:
+
+```python
+@dataclass
+class AgentConfig:
+    type: str = "mlp"
+    hidden_dim: int = 256
+
+config = Config.from_yaml("configs/experiment.yaml")
+agent = AGENT_REGISTRY.build(config.agent.type, **vars(config.agent))
+```
+
+### 3. Base Classes
+
+All components inherit from base classes that define common interface:
+
+```python
+class BaseAgent(BaseModule):
+    @abstractmethod
+    def forward(self, slots: torch.Tensor) -> torch.Tensor:
+        pass
+```
+
+---
+
+## 📦 Component Structure
+
+### Core (`core/`)
+- **registry.py** — `Registry` class, global registries (MODEL, AGENT, ROUTER, LOSS, …)
+- **base_module.py** — `BaseModule`, `BaseAgent`, `BaseRouter`, `BaseAggregator`, `BaseClassifier`
+- **trainer.py** — `BaseTrainer`, `Task1Trainer`, `IncrementalTrainer` *(TODO)*
+
+### Configuration (`config/`)
+- **base.py** — `Config` dataclasses, `from_yaml()`, `save_yaml()`, `to_dict()`
+- **defaults.py** — `get_config("cifar100")`, `get_config("tiny_imagenet")`
+- **schema.py** — `validate_config()`, `auto_fix_config()`
+
+### Models (`models/`)
+- **agents/** — `MLPAgent`, `MLPAgentWithDecoder`, `IdentityAgent`
+- **routers/** — `VAERouter` (Mahalanobis distance, Welford incremental stats)
+- **aggregators/** — `AttentionAggregator` (block-diagonal), `AverageAggregator`
+- **classifiers/** — `SLDAClassifier`, `LinearClassifier` *(TODO)*
+
+### Losses (`losses/`)
+- `PrimitiveLoss` — Matrix-level KL divergence (L_p)
+- `SupervisedContrastiveLoss` — Pair-level metric learning (L_SupCon)
+- `AgentReconstructionLoss` — Anti-collapse loss (L_agent)
+- `ReconstructionLoss` — Slot attention reconstruction (L_recon)
+- `LocalGeometryLoss` — Neighborhood preservation (L_local)
+- `CompositeLoss` — Combines multiple losses based on config
+
+### Data (`data/`) *(TODO)*
+- `base_dataset.py`, `cifar100.py`, `tiny_imagenet.py`
+
+### Training (`training/`) *(TODO)*
+- `task1_trainer.py`, `incremental_trainer.py`, `callbacks.py`
+
+---
+
+## 🔄 Data Flow
+
+### Task 1 (Warm-up)
+
+```
+Images → Backbone (ViT) → Slot Attention → Slots
+                                          ↓
+                                    [Cluster Slots]
+                                          ↓
+Slots → Agent (MLP) → Hidden → Aggregator → H → SLDA → Predictions
+        ↓
+        VAE Router (train) → Freeze network, init stats
+        ↓
+Loss: L_p + L_SupCon + L_agent → Update agents → Freeze
+```
+
+### Task t > 1 (Incremental)
+
+```
+Images → Backbone (frozen) → Slot Attention (frozen) → Slots
+                                                       ↓
+                        Route via VAE (Mahalanobis distance)
+                                ↓                      ↓
+                        Existing Agent          Novel Slots
+                        (frozen)                      ↓
+                             ↓                   [Cluster]
+                        Update stats                  ↓
+                                              Spawn New Agents
+                                                     ↓
+                        Hidden States → Aggregator (add new keys)
+                                           ↓
+                                          H → SLDA (update new classes only)
+```
+
+---
+
+## 📊 Component Interaction Diagram
+
+```
+┌─────────────────────────────────────────────────┐
+│                   Config                        │
+│  (YAML → Python Dataclasses)                    │
+└────────────┬────────────────────────────────────┘
+             │
+             ├──→ Registry → Build Components
+             │
+┌────────────┴────────────────────────────────────┐
+│               Training Pipeline                 │
+│                                                 │
+│  ┌──────────┐     ┌──────────┐     ┌────────┐ │
+│  │ Backbone │ ──→ │  Slots   │ ──→ │ Router │ │
+│  └──────────┘     └──────────┘     └────┬───┘ │
+│                         │                 │     │
+│                    ┌────▼─────┐      [Existing │
+│                    │  Agent   │       / Novel] │
+│                    └────┬─────┘           │    │
+│                         │            ┌────▼───┐│
+│                    ┌────▼──────┐     │  New   ││
+│                    │Aggregator │◄────┤ Agent  ││
+│                    └────┬──────┘     └────────┘│
+│                         │                       │
+│                    ┌────▼──────┐               │
+│                    │   SLDA    │               │
+│                    └───────────┘               │
+│                                                 │
+│  Loss: CompositeLoss(L_p + L_SupCon + ...)    │
+└─────────────────────────────────────────────────┘
+```
