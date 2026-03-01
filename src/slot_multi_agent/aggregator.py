@@ -401,20 +401,22 @@ class CRPExpertAggregator(nn.Module):
 
     def freeze_old_classes(self, old_classes: Set[int]):
         """
-        Freeze experts that handle only old classes.
+        Freeze old experts' CLASSIFIERS only (not routing params).
         Call at the start of each new task to protect previous knowledge.
+
+        Only local_classifier is frozen (preserves classification knowledge).
+        Routing params (queries, key_proj, val_proj) stay trainable so
+        old experts can still compete for routing against new experts.
 
         Args:
             old_classes: Set of class labels from previous tasks.
-                         Experts whose owned classes are all within this set
-                         will be frozen.
         """
         for idx, expert in enumerate(self.experts):
             expert_classes = set(expert.owned_classes)
-            # If all of this expert's classes are old → freeze it
             if expert_classes and expert_classes.issubset(old_classes):
                 self._frozen_experts.add(idx)
-                for p in expert.parameters():
+                # Only freeze the classifier — keep routing params trainable
+                for p in expert.local_classifier.parameters():
                     p.requires_grad_(False)
 
         # Rebuild optimizer with only trainable params
