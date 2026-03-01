@@ -21,10 +21,10 @@ Full training flow (3 phases):
       → Incremental decision tree grows online, never resets
 
 Usage:
-    python -m src.models.adaslot.train --phase 1 --data_dir data/clevr
-    python -m src.models.adaslot.train --phase 2 --adaslot_ckpt checkpoints/adaslot.pth
-    python -m src.models.adaslot.train --phase 3 --adaslot_ckpt ... --agent_ckpt ...
-    python -m src.models.adaslot.train --phase all  # run all 3 sequentially
+    python -m src.train --phase 1 --data_dir data/clevr
+    python -m src.train --phase 2 --adaslot_ckpt checkpoints/adaslot.pth
+    python -m src.train --phase 3 --adaslot_ckpt ... --agent_ckpt ...
+    python -m src.train --phase all  # run all 3 sequentially
 """
 
 import argparse
@@ -246,7 +246,7 @@ def train_phase2_agents(
       3. Student-teacher cross-entropy loss (DINO)
       4. Update teacher via EMA
     """
-    from .atomic_agent import DINOLoss, update_all_teachers
+    from src.slot_multi_agent.atomic_agent import DINOLoss, update_all_teachers
 
     print("=" * 60)
     print("PHASE 2: Agent DINO Training")
@@ -306,7 +306,6 @@ def train_phase2_agents(
             teacher = teacher_agents[agent_idx]
 
             # Flatten kept slots across batch
-            # Use keep mask to select active slots
             flat_slots = slots.reshape(B * num_slots, slot_dim)
             flat_keep = keep.reshape(B * num_slots)
             active_slots = flat_slots[flat_keep > 0.5]  # (N_active, slot_dim)
@@ -393,7 +392,7 @@ def train_phase3_tree(
       3. Concatenate/mean-pool across slots
       4. Hoeffding Tree learns incrementally (partial_fit)
     """
-    from .aggregator import create_aggregator
+    from src.slot_multi_agent.aggregator import create_aggregator
     import numpy as np
 
     print("=" * 60)
@@ -449,7 +448,6 @@ def train_phase3_tree(
                 sample_hidden = []
                 for slot_idx in range(S):
                     slot = slots[b, slot_idx].unsqueeze(0)  # (1, D)
-                    # Use top-k agents (simplification: use first k agents)
                     slot_labels = []
                     for a_idx in range(min(k, num_agents)):
                         agent = student_agents[a_idx]
@@ -541,8 +539,8 @@ def main():
     args = parser.parse_args()
 
     # ── Build models ──
-    from . import AdaSlotModel
-    from .atomic_agent_compat import create_agent_pool_compat
+    from src.models.adaslot.model import AdaSlotModel
+    from src.slot_multi_agent.atomic_agent import create_agent_pool
 
     adaslot = AdaSlotModel(
         resolution=(args.resolution, args.resolution),
@@ -590,14 +588,11 @@ def main():
             )
 
         elif phase == "2":
-            # Load AdaSlot
             if args.adaslot_ckpt:
                 ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
                 state = ckpt.get('model', ckpt.get('state_dict', ckpt))
                 adaslot.load_state_dict(state, strict=False)
 
-            # Create agent pool
-            from ..slot_multi_agent.atomic_agent import create_agent_pool
             student_agents, teacher_agents = create_agent_pool(
                 num_agents=args.num_agents,
                 slot_dim=args.slot_dim,
@@ -618,14 +613,11 @@ def main():
             )
 
         elif phase == "3":
-            # Load AdaSlot
             if args.adaslot_ckpt:
                 ckpt = torch.load(args.adaslot_ckpt, map_location='cpu')
                 state = ckpt.get('model', ckpt.get('state_dict', ckpt))
                 adaslot.load_state_dict(state, strict=False)
 
-            # Load Agents
-            from ..slot_multi_agent.atomic_agent import create_agent_pool
             student_agents, _ = create_agent_pool(
                 num_agents=args.num_agents,
                 slot_dim=args.slot_dim,

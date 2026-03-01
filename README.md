@@ -1,287 +1,526 @@
 # Slot-Based Multi-Agent Continual Learning
 
-## 🎯 Core Idea
+A continual learning system combining **Slot Attention** (object-centric decomposition), **DINO-style self-supervised learning** (agent training), **bandit algorithms** (agent selection), and **Hoeffding Trees** (incremental classification) for class-incremental learning on CIFAR-100.
+
+---
+
+## Architecture Overview
 
 ```
-Image
-  ↓
-Slot Attention → Decompose thành N slots (objects)
-  ↓
-For EACH slot:
-  ├─ Sub-network₁ (VAE/MLP) → score₁
-  ├─ Sub-network₂ (VAE/MLP) → score₂
-  ├─ ...
-  └─ Sub-networkₙ (VAE/MLP) → scoreₙ
-  ↓
-  Select top-k agents (highest scores)
-  ↓
-  Run agents → hidden representations
-  ↓
-Aggregate all slots → Decision Tree
-  ↓
-Final prediction
+Input Image (B, C, H, W)
+      ↓
+ AdaSlotModel / SlotAttentionAutoEncoder
+      ↓
+ Slots: (B, num_slots, slot_dim)
+      ↓  [For each slot]
+ Performance Estimators (VAE / MLP / Hybrid)
+      ↓
+ Agent Selection (TopK / UCB / Thompson / ε-Greedy)
+      ↓
+ ResidualMLPAgent × k  →  Hidden Labels (softmax over prototypes)
+      ↓  [Concatenate across all slots × k agents]
+ IncrementalTreeAggregator (Hoeffding Tree)
+      ↓
+ Final Class Prediction
 ```
 
-## 📁 Project Structure
+---
+
+## Project Structure
 
 ```
 Continual-Learning/
 ├── src/
+│   ├── __init__.py                      # Package root (v0.1.0)
+│   ├── train.py                         # End-to-end training pipeline (Phase 1→2→3)
 │   ├── base/
-│   │   ├── types.py              # Common types
-│   │   └── base_agent.py         # Base agent class
-│   │
+│   │   ├── types.py
+│   │   └── base_agent.py
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── continual_cifar100.py        # Class-incremental CIFAR-100 pipeline
+│   │   ├── continual_cifar100_avalanche.py
+│   │   └── continual_tinyimagenet.py
 │   ├── models/
-│   │   ├── slot_attention/       # ✅ Slot decomposition
+│   │   ├── __init__.py
+│   │   ├── slot_attention/              # Classic Slot Attention (encoder/decoder)
 │   │   │   ├── slot_attention.py
 │   │   │   ├── encoder.py
 │   │   │   ├── decoder.py
 │   │   │   └── model.py
-│   │   │
-│   │   └── vae/                  # ✅ VAE estimator
+│   │   ├── adaslot/                     # AdaSlot (adaptive slot count via Gumbel)
+│   │   │   ├── model.py                 # AdaSlotModel
+│   │   │   ├── perceptual_grouping.py   # SlotAttentionGroupingGumbelV1
+│   │   │   ├── feature_extractor.py
+│   │   │   ├── conditioning.py          # RandomConditioning
+│   │   │   ├── decoder.py
+│   │   │   ├── mlp.py
+│   │   │   └── positional_embedding.py
+│   │   └── vae/                         # Standalone VAE
 │   │       ├── vae.py
 │   │       └── uncertainty.py
-│   │
-│   ├── data/                     # Data loaders
-│   │   ├── continual_cifar100_avalanche.py
-│   │   └── continual_tinyimagenet.py
-│   │
-│   └── slot_multi_agent/         # ✅ COMPLETE
-│       ├── estimators.py         # ✅ VAE, MLP estimators
-│       ├── selector.py           # ✅ Top-k selection
-│       ├── atomic_agent.py       # ✅ 50 agents (ResidualMLP)
-│       ├── aggregator.py         # ✅ Hoeffding Tree
-│       └── system.py             # ✅ End-to-end pipeline
-│
+│   ├── slot_multi_agent/                # Core multi-agent system
+│   │   ├── __init__.py
+│   │   ├── atomic_agent.py              # ResidualMLPAgent, DINOLoss
+│   │   ├── estimators.py               # VAEEstimator, MLPEstimator, HybridEstimator
+│   │   ├── selector.py                  # TopKAgentSelector, AdaptiveKSelector
+│   │   ├── bandit_selector.py          # UCB, Thompson, ε-Greedy, WeightedTopK
+│   │   ├── aggregator.py               # IncrementalTreeAggregator, EnsembleTreeAggregator
+│   │   └── system.py                   # SlotMultiAgentSystem (end-to-end)
+│   └── utils/
 ├── tests/
-│   └── data/                     # Basic tests
-│
-├── README.md                     # This file
-├── environment.yml               # Conda environment
-└── requirements.txt              # Dependencies
+├── checkpoints/
+├── data/
+├── requirements.txt
+└── README.md
 ```
-
-## 🚀 Architecture Components
-
-### 1. Slot Attention (✅ Done)
-Decomposes image into object-centric slots.
-
-```python
-from src.models.slot_attention import SlotAttention
-
-slots, attn = slot_attention(features)  # → (B, num_slots, slot_dim)
-```
-
-### 2. Sub-network Estimators (✅ Done)
-Lightweight networks ước lượng performance của agent trên slot:
-- **VAE-based**: Reconstruction error
-- **MLP-based**: Direct score prediction
-
-```python
-from src.slot_multi_agent import VAEEstimator, MLPEstimator
-
-estimator = VAEEstimator(agent_id=0, slot_dim=64)
-score = estimator.estimate_performance(slot)  # [0, 1]
-```
-
-### 3. Top-k Selector (✅ Done)
-Chọn k agents tốt nhất cho mỗi slot.
-
-```python
-from src.slot_multi_agent import TopKAgentSelector
-
-selector = TopKAgentSelector(estimators, k=3)
-selected_ids, scores = selector.select_top_k(slot)
-```
-
-### 4. Atomic Agents (✅ Done)
-Generate hidden representations (not final predictions).
-
-```python
-from src.slot_multi_agent import ResidualMLPAgent
-
-agent = ResidualMLPAgent(agent_id=0, slot_dim=64, output_dim=128)
-hidden_label = agent(slot)  # 128-dim embedding
-```
-
-### 5. Decision Tree Aggregator (✅ Done)
-Combines hidden labels, supports continual learning.
-
-```python
-from src.slot_multi_agent import HoeffdingTreeAggregator
-
-tree = HoeffdingTreeAggregator()  # Incremental, no retraining
-tree.partial_fit(hidden_labels, targets)  # Add new classes
-predictions = tree.predict(hidden_labels)
-```
-
-## 🎓 Training Strategy
-
-### Phase 1: DINO-style Self-Supervised Learning (Agents)
-
-Agents learn hidden representations via **simplified DINO** (no augmentation, only centering + sharpening):
-
-```python
-from src.slot_multi_agent import DINOLoss
-
-# Student and Teacher agents (Teacher updated via EMA)
-student_logits = student_agent(slot)  # (B, num_prototypes)
-teacher_logits = teacher_agent(slot)  # (B, num_prototypes)
-
-# DINO Loss: Centering + Temperature Sharpening
-dino_loss = DINOLoss(
-    num_prototypes=256,
-    student_temp=0.1,    # Higher temp (softer)
-    teacher_temp=0.07,   # Lower temp (sharper, more confident)
-    center_momentum=0.9  # EMA for center (prevents collapse)
-)
-loss = dino_loss(student_logits, teacher_logits)
-```
-
-**Key mechanisms:**
-- ✅ **Centering**: Subtract running mean from teacher outputs (prevent mode collapse)
-- ✅ **Sharpening**: Lower temperature for teacher (more confident predictions)
-- ✅ **EMA Teacher**: Teacher updated via exponential moving average (no backprop)
-- ❌ **NO multi-crop augmentation** (simplified version)
-
-### Phase 2: Supervised Tree Training
-
-```python
-# Get hidden labels from trained agents
-hidden_labels = []
-for slot in slots:
-    selected_agents = selector.select_top_k(slot, k=3)
-    labels = [agent(slot) for agent in selected_agents]
-    hidden_labels.append(torch.cat(labels))
-
-# Train Hoeffding Tree incrementally
-tree.partial_fit(hidden_labels, targets)  # Supports new classes
-```
-
-## 📊 Key Features
-
-- ✅ **Slot Attention**: Object-centric decomposition (adaptive slots 3-10)
-- ✅ **VAE/MLP Estimators**: Lightweight performance estimation
-- ✅ **Top-k Selection**: Efficient agent selection per slot (k=3)
-- ✅ **Bandit Strategies**: UCB, Thompson Sampling, Epsilon-Greedy
-- ✅ **50 Agents**: ResidualMLP (same architecture, specialized weights)
-- ✅ **Hoeffding Tree**: True incremental learning (no retraining)
-- ✅ **Hidden Labels**: Softmax probabilities over 256 prototypes
-- ✅ **DINO Training**: Centering + sharpening (simplified, no augmentation)
-- ✅ **Complete System**: End-to-end pipeline with checkpointing
-
-## 🚀 Quick Start
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Load configuration
-python -c "
-from src.utils import load_config
-cfg = load_config('config.yaml')
-print(f'Agents: {cfg.agents.num_agents}')
-print(f'Prototypes: {cfg.agents.num_prototypes}')
-print(f'Slots: {cfg.slot_attention.min_slots}-{cfg.slot_attention.max_slots}')
-"
-
-# 3. Quick test
-python -c "
-from src.slot_multi_agent import create_agent_pool
-students, teachers = create_agent_pool(50, 64, 256)
-print(f'✓ Created {len(students)} agents')
-"
-```
-
-See **QUICKSTART.md** for training examples and **CONFIG_GUIDE.md** for all options!
-
-## ⚙️ Configuration
-
-All system parameters are managed via **`config.yaml`**:
-
-```yaml
-# Example: config.yaml
-slot_attention:
-  adaptive: true        # AdaSlot (adaptive slot count)
-  min_slots: 3
-  max_slots: 10
-  slot_dim: 64
-
-agents:
-  num_agents: 50
-  num_prototypes: 256   # Hidden label dimension
-  dino:
-    student_temp: 0.1
-    teacher_temp: 0.07
-    center_momentum: 0.9
-
-selection:
-  strategy: "top_k"     # "top_k" | "ucb" | "thompson" | "epsilon_greedy"
-  k: 3
-
-aggregator:
-  type: "hoeffding_tree"  # Incremental learning
-```
-
-**8 Pre-configured Variants:**
-- `01_baseline_adaptive_slots.yaml` - Standard setup
-- `02_ucb_bandit_exploration.yaml` - UCB agent selection
-- `03_large_prototypes.yaml` - 512 prototypes (more expressive)
-- `04_ensemble_tree.yaml` - 5 trees for robustness
-- `05_thompson_sampling.yaml` - Bayesian agent selection
-- `06_fixed_slots.yaml` - Fixed 7 slots (no adaptation)
-- `07_pretrained_slot_attention.yaml` - Load AdaSlot checkpoint
-- `08_pretrained_agents_phase2.yaml` - Skip Phase 1
-
-See **CONFIG_GUIDE.md** for all options!
-
-## 🔧 Next Steps
-
-1. ✅ ~~Implement all components~~ **DONE!**
-2. 🎯 Train Phase 1 (agents with DINO)
-3. 🎯 Train Phase 2 (incremental tree)
-4. 🎯 Compare selection strategies (top-k vs bandit)
-5. 🎯 Experiment with prototype dimensions
-6. 🎯 Research better estimation methods (see RESEARCH_PROMPT...md)
-
-## 📚 Documentation
-
-- **ARCHITECTURE_FINAL.md** (651 lines) - Complete system architecture
-- **CONFIG_GUIDE.md** (700+ lines) - All configuration options
-- **CHECKPOINT_GUIDE.md** (500+ lines) - Loading/saving models
-- **DINOV2_TRAINING_DETAILS.md** (376 lines) - DINO mechanism deep dive
-- **RESEARCH_PROMPT_PERFORMANCE_ESTIMATION.md** (304 lines) - Research directions
-- **QUICKSTART.md** (190 lines) - Step-by-step examples
-
-## 📝 Implementation Notes
-
-- **Agents**: Same architecture (ResidualMLP), specialized via DINO training
-- **Estimators**: VAE (reconstruction-based) or MLP (direct prediction)
-- **Selection**: Top-k (deterministic) or bandit (exploration)
-- **Hidden Labels**: Softmax probabilities (continuous, not discrete)
-- **Tree**: Hoeffding Tree (true incremental, no retraining)
-- **DINO**: Simplified version (centering + sharpening, no augmentation)
-- **Checkpoints**: Full support for resuming training
-
-## 🌟 Key Design Decisions
-
-1. **Why simplified DINO?** 
-   - Full DINOv2 requires multi-crop augmentation (expensive)
-   - Centering + sharpening capture core mechanism
-   - Faster training, still prevents collapse
-
-2. **Why softmax probabilities?**
-   - Decision trees handle continuous features well
-   - More expressive than discrete IDs
-   - Gradual confidence levels
-
-3. **Why Hoeffding Tree?**
-   - True online learning (no retraining)
-   - Supports new classes dynamically
-   - Handles high-dimensional continuous features
 
 ---
 
-**Status**: ✅ **COMPLETE** - All components implemented (~10,500+ lines)
+## Component Details
 
-**Last Updated**: 2026-02-14
+### 1. Slot Decomposition
+
+Two implementations available:
+
+#### Classic Slot Attention (`src/models/slot_attention/`)
+Standard encoder-decoder with fixed slot count.
+
+#### AdaSlot (`src/models/adaslot/`)
+Adaptive slot count using Gumbel-Softmax hard decisions. Can load from pretrained checkpoint.
+
+```python
+from src.models.adaslot.model import AdaSlotModel
+
+model = AdaSlotModel(
+    resolution=(128, 128),
+    num_slots=11,   # Max slots; actual active count decided by Gumbel
+    slot_dim=64,
+    num_iterations=3,
+    feature_dim=64,
+    kvq_dim=128,
+    low_bound=1     # Minimum active slots
+)
+
+# Forward: returns dict with 'slots', 'masks', 'reconstruction', etc.
+out = model(image, global_step=step)
+
+# Encode only
+slots = model.encode(image)  # (B, num_slots, slot_dim)
+```
+
+---
+
+### 2. Atomic Agents (`atomic_agent.py`)
+
+Each agent is a `ResidualMLPAgent` trained with DINO-style SSL.
+
+```python
+from src.slot_multi_agent import ResidualMLPAgent, DINOLoss, create_agent_pool
+
+# Create a pool of 50 agent pairs (student + teacher)
+student_agents, teacher_agents = create_agent_pool(
+    num_agents=50,
+    slot_dim=64,
+    num_prototypes=256,   # Hidden label dimension
+    hidden_dim=256,
+    num_blocks=3,
+    dropout=0.1,
+    device='cuda'
+)
+
+# Forward: slot → softmax probabilities (hidden label)
+hidden_label = student_agents[i](slot)              # (B, 256) softmax probs
+logits       = student_agents[i](slot, return_logits=True, temperature=0.1)
+
+# DINO Loss (centering + temperature sharpening)
+criterion = DINOLoss(
+    num_prototypes=256,
+    student_temp=0.1,
+    teacher_temp=0.07,
+    center_momentum=0.9   # EMA for center (prevents collapse)
+)
+loss = criterion(student_logits, teacher_logits)
+```
+
+**ResidualMLPAgent architecture:**
+```
+slot (64) → Linear + LayerNorm → [ResidualBlock × 3] → Linear → prototypes (256) → softmax
+```
+Each `ResidualBlock`: `x → Linear → LayerNorm → GELU → Dropout → Linear → LayerNorm → Dropout → (+x)`
+
+**EMA teacher update:**
+```python
+from src.slot_multi_agent import update_teacher, update_all_teachers
+
+# Single pair
+update_teacher(student, teacher, momentum=0.996)
+
+# Entire pool
+update_all_teachers(student_agents, teacher_agents, momentum=0.996)
+```
+
+---
+
+### 3. Performance Estimators (`estimators.py`)
+
+Lightweight networks that predict how well a given agent will perform on a slot *without running the agent*.
+
+```python
+from src.slot_multi_agent import VAEEstimator, MLPEstimator, HybridEstimator, create_estimator_pool
+
+# VAE-based (one per agent)
+vae = VAEEstimator(agent_id=0, slot_dim=64, latent_dim=16, hidden_dim=64)
+score = vae.estimate_performance(slot)   # [0, 1] – lower recon error → higher score
+
+# MLP-based (shared across agents, uses agent embedding)
+mlp = MLPEstimator(num_agents=50, slot_dim=64, hidden_dim=128, agent_embed_dim=32)
+score = mlp.estimate_performance(slot, agent_id=5)
+
+# Hybrid: weighted combination of VAE + MLP
+hybrid = HybridEstimator(agent_id=0, num_agents=50, slot_dim=64, vae_weight=0.5)
+
+# Create a pool of 50 estimators
+estimators = create_estimator_pool(num_agents=50, estimator_type='vae', slot_dim=64)
+```
+
+---
+
+### 4. Agent Selection
+
+#### Simple Top-K (`selector.py`)
+
+```python
+from src.slot_multi_agent import TopKAgentSelector, AdaptiveKSelector, create_selector
+
+selector = TopKAgentSelector(estimators, k=3, temperature=1.0)
+
+# Deterministic top-k
+selected_ids, scores = selector.select_top_k(slot)
+
+# Probabilistic (for exploration during training)
+selected_ids = selector.select_probabilistic(slot)
+
+# Batch selection
+ids_batch, scores_batch = selector.select_batch(slots)  # slots: (B, num_slots, slot_dim)
+
+# Adaptive k (adjusts based on score uncertainty)
+adaptive = AdaptiveKSelector(estimators, k_min=2, k_max=5)
+selected_ids, scores, k_used = adaptive.select_adaptive(slot)
+```
+
+#### Bandit-Based Selection (`bandit_selector.py`)
+
+Exploration-exploitation trade-off using multi-armed bandit algorithms.
+
+| Strategy | Class | Key Parameters |
+|---|---|---|
+| UCB | `UCBSelector` | `exploration_constant=2.0` |
+| Thompson Sampling | `ThompsonSamplingSelector` | `alpha_init=1.0`, `beta_init=1.0` |
+| Epsilon-Greedy | `EpsilonGreedySelector` | `epsilon=0.1`, `epsilon_decay=0.995`, `min_epsilon=0.01` |
+| Weighted Top-K | `WeightedTopKSelector` | — (pure exploitation baseline) |
+
+```python
+from src.slot_multi_agent import create_bandit_selector
+
+bandit = create_bandit_selector(strategy='ucb', num_agents=50, exploration_constant=2.0)
+
+# Select k agents + compute softmax weights
+selected_indices, weights = bandit.select_and_weight(
+    slot=slot,                  # (B, slot_dim)
+    estimated_scores=scores,    # (B, num_agents)
+    k=3
+)
+# selected_indices: (B, 3),  weights: (B, 3) sums to 1
+
+# Update bandit statistics after observing reward
+bandit.update(agent_idx=2, slot=slot, reward=0.85)
+```
+
+**UCB formula:**
+```
+UCB(i) = μ_i + c × sqrt(log(t) / n_i)
+```
+
+**Thompson Sampling:** maintains Beta(α, β) distribution per agent, samples from posterior.
+
+**Epsilon-Greedy:** ε decays from `epsilon` to `min_epsilon` by factor `epsilon_decay` each step.
+
+---
+
+### 5. Aggregator – Incremental Decision Tree (`aggregator.py`)
+
+Learns online from concatenated hidden labels → class, using Hoeffding Trees from the [`river`](https://riverml.xyz/) library.
+
+```python
+from src.slot_multi_agent import IncrementalTreeAggregator, EnsembleTreeAggregator, BatchTreeAggregator, create_aggregator
+
+# Single Hoeffding Tree
+tree = IncrementalTreeAggregator(
+    grace_period=200,
+    split_confidence=1e-5,
+    leaf_prediction='nba',   # Naive Bayes Adaptive
+    adaptive=True            # HoeffdingAdaptiveTreeClassifier (handles concept drift)
+)
+tree.learn_one(hidden_labels, label)          # hidden_labels: numpy array
+pred   = tree.predict_one(hidden_labels)
+proba  = tree.predict_proba_one(hidden_labels)  # Dict[class → prob]
+
+# Ensemble (Adaptive Random Forest from river)
+ensemble = EnsembleTreeAggregator(n_models=10, max_features='sqrt')
+
+# Batch wrapper (loops internally one-by-one)
+batch_tree = BatchTreeAggregator(tree)
+batch_tree.learn_batch(hidden_labels_batch, labels_batch)   # Tensor inputs
+preds = batch_tree.predict_batch(hidden_labels_batch)
+
+# Factory
+aggregator = create_aggregator('hoeffding_adaptive')  # or 'hoeffding', 'ensemble'
+```
+
+**Input feature size**: `num_slots × k × num_prototypes` (e.g. 7 × 3 × 256 = **5376** features)
+
+---
+
+### 6. End-to-End System (`system.py`)
+
+```python
+from src.slot_multi_agent.system import SlotMultiAgentSystem
+
+system = SlotMultiAgentSystem(
+    num_agents=50,
+    num_slots=7,
+    slot_dim=64,
+    num_prototypes=256,
+    k=3,
+    estimator_type='vae',          # 'vae' or 'mlp'
+    aggregator_type='hoeffding',   # 'hoeffding', 'incremental', 'soft'
+    aggregate_mode='concat',       # 'concat' or 'mean'
+    device='cuda'
+)
+
+# Full forward pass
+predictions, metadata = system.forward(images, return_metadata=True)
+
+# Incremental training step
+info = system.train_step(images, targets)
+
+# Evaluate
+metrics = system.evaluate(images, targets)
+
+# Checkpointing
+system.save_checkpoint('checkpoints/system.pt')
+system.load_checkpoint('checkpoints/system.pt')
+```
+
+---
+
+## Data Pipeline (`src/data/`)
+
+### CIFAR-100 Class-Incremental
+
+```python
+from src.data import get_continual_cifar100_loaders
+
+train_loaders, test_loaders, class_order = get_continual_cifar100_loaders(
+    n_tasks=5,          # Supported: 2, 5, 10, 20, 50, 100
+    batch_size=128,
+    num_workers=4,
+    root='./data',
+    seed=42
+)
+
+# train_loaders[i] → classes for task i only (20 classes/task for n_tasks=5)
+# test_loaders[i]  → all classes seen up to task i
+```
+
+- Configurable splits: 2 / 5 / 10 / 20 / 50 / 100 tasks
+- Standard CIFAR-100 augmentation (RandomCrop, HorizontalFlip, Normalize)
+- Cumulative test evaluation (all seen classes)
+
+Also available:
+- `continual_cifar100_avalanche.py` — Avalanche-lib integration
+- `continual_tinyimagenet.py` — Tiny-ImageNet support
+
+---
+
+## Training Pipeline
+
+### Phase 1 – DINO SSL (Unsupervised Agent Training)
+
+```python
+# Initialize
+student_agents, teacher_agents = create_agent_pool(50, 64, 256, device='cuda')
+estimators = create_estimator_pool(50, 'vae', 64)
+dino_losses = [DINOLoss(256) for _ in range(50)]
+
+for epoch in range(epochs):
+    for images in unlabeled_loader:
+        slots = slot_model.encode(images)    # (B, 7, 64)
+        total_loss = 0
+
+        for slot_idx in range(7):
+            slot = slots[:, slot_idx, :]
+            scores = torch.stack([est.estimate_performance(slot) for est in estimators], dim=1)
+            top_k = torch.topk(scores, k=3).indices
+
+            for agent_idx in top_k[0]:
+                student_logits = student_agents[agent_idx](slot, return_logits=True)
+                with torch.no_grad():
+                    teacher_logits = teacher_agents[agent_idx](slot, return_logits=True)
+                total_loss += dino_losses[agent_idx](student_logits, teacher_logits)
+
+        total_loss.backward()
+        optimizer.step()
+        update_all_teachers(student_agents, teacher_agents, momentum=0.996)
+```
+
+**DINO Loss mechanics:**
+- Teacher: `softmax((logits - center) / teacher_temp)`, center updated via EMA (momentum 0.9)
+- Student: `log_softmax(logits / student_temp)`
+- Loss: cross-entropy (teacher || student)
+- *Simplified*: no multi-crop augmentation (vs. full DINOv2)
+
+### Phase 2 – Incremental Tree Training (Supervised)
+
+```python
+# Freeze agents
+for agent in student_agents: agent.eval()
+
+bandit = create_bandit_selector('ucb', num_agents=50)
+tree = create_aggregator('hoeffding_adaptive')
+
+for images, labels in labeled_loader:
+    with torch.no_grad():
+        slots = slot_model.encode(images)
+
+    for i in range(images.size(0)):
+        hidden_labels = []
+        for slot_idx in range(7):
+            slot = slots[i:i+1, slot_idx, :]
+            scores = torch.stack([est.estimate_performance(slot) for est in estimators], dim=1)
+            top_k_indices, weights = bandit.select_and_weight(slot, scores, k=3)
+
+            for k_idx in range(3):
+                agent_idx = top_k_indices[0, k_idx].item()
+                prob_dist = student_agents[agent_idx](slot)  # (1, 256)
+                hidden_labels.append(prob_dist.cpu().numpy().flatten())
+
+        features = np.concatenate(hidden_labels)   # (5376,)
+        tree.learn_one(features, labels[i].item())
+```
+
+### Phase 3 – Continual Learning (New Tasks)
+
+```python
+# Agents stay frozen; only tree receives new examples
+for images, labels in new_task_loader:
+    for i in range(images.size(0)):
+        features = extract_hidden_labels(images[i:i+1])
+        tree.learn_one(features, labels[i].item())
+# Tree grows new branches; old knowledge preserved
+```
+
+---
+
+## Key Hyperparameters
+
+| Component | Parameter | Default | Notes |
+|---|---|---|---|
+| **AdaSlot** | `num_slots` | 11 | Max slots (adaptive) |
+| | `slot_dim` | 64 | Slot embedding dim |
+| | `low_bound` | 1 | Min active slots |
+| **Agents** | `num_agents` | 50 | Pool size |
+| | `num_prototypes` | 256 | Hidden label dim |
+| | `num_blocks` | 3 | Residual blocks |
+| | `hidden_dim` | 256 | MLP hidden dim |
+| **DINO** | `teacher_temp` | 0.07 | Sharp teacher |
+| | `student_temp` | 0.1 | Softer student |
+| | `center_momentum` | 0.9 | EMA for centering |
+| | `ema_momentum` | 0.996 | Teacher weight update |
+| **Selection** | `k` | 3 | Agents per slot |
+| **UCB** | `exploration_constant` | 2.0 | Exploration bonus |
+| **ε-Greedy** | `epsilon` | 0.1 | Initial exploration |
+| | `epsilon_decay` | 0.995 | Decay per step |
+| **Tree** | `grace_period` | 200 | Examples before split |
+| | `split_confidence` | 1e-5 | Hoeffding bound δ |
+| | `leaf_prediction` | `'nba'` | Naive Bayes Adaptive |
+
+---
+
+## Quick Start
+
+```bash
+# Run all 3 phases sequentially
+python -m src.train --phase all --data_dir data/clevr
+
+# Phase 1 only: train AdaSlot slot decomposition
+python -m src.train --phase 1 --data_dir data/clevr --p1_steps 500000
+
+# Phase 2 only: train agents with DINO SSL (requires AdaSlot checkpoint)
+python -m src.train --phase 2 --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth
+
+# Phase 3 only: fit Hoeffding Tree incrementally
+python -m src.train --phase 3 \
+    --adaslot_ckpt checkpoints/adaslot/adaslot_final.pth \
+    --agent_ckpt checkpoints/agents/agents_final.pth \
+    --num_classes 100
+```
+
+---
+
+## Installation
+
+```bash
+# PyTorch 2.1 with CUDA 12.1
+pip install -r requirements.txt
+
+# Requirements include:
+# torch==2.1.0+cu121, torchvision==0.16.0+cu121
+# avalanche-lib==0.4.0
+# river  (Hoeffding Trees)
+# numpy, pandas, scipy
+# matplotlib, seaborn
+# tensorboard, wandb
+# pytest
+```
+
+---
+
+## Implementation Status
+
+| Component | Status | File |
+|---|---|---|
+| ResidualMLPAgent | ✅ Done | `atomic_agent.py` |
+| DINOLoss | ✅ Done | `atomic_agent.py` |
+| VAEEstimator | ✅ Done | `estimators.py` |
+| MLPEstimator | ✅ Done | `estimators.py` |
+| HybridEstimator | ✅ Done | `estimators.py` |
+| TopKAgentSelector | ✅ Done | `selector.py` |
+| AdaptiveKSelector | ✅ Done | `selector.py` |
+| UCBSelector | ✅ Done | `bandit_selector.py` |
+| ThompsonSamplingSelector | ✅ Done | `bandit_selector.py` |
+| EpsilonGreedySelector | ✅ Done | `bandit_selector.py` |
+| IncrementalTreeAggregator | ✅ Done | `aggregator.py` |
+| EnsembleTreeAggregator | ✅ Done | `aggregator.py` |
+| SlotMultiAgentSystem | ✅ Done | `system.py` |
+| AdaSlotModel | ✅ Done | `models/adaslot/model.py` |
+| ContinualCIFAR100 pipeline | ✅ Done | `data/continual_cifar100.py` |
+| Bandit reward definition | ⏳ TODO | — |
+| Experiments on CIFAR-100 | ⏳ TODO | — |
+| Ablation studies | ⏳ TODO | — |
+
+---
+
+## References
+
+1. **Slot Attention** — Locatello et al. (2020) *Object-Centric Learning with Slot Attention*
+2. **DINOv2** — Oquab et al. (2023) *DINOv2: Learning Robust Visual Features without Supervision* · [GitHub](https://github.com/facebookresearch/dinov2)
+4. **Hoeffding Tree** — Domingos & Hulten (2000) *Mining High-Speed Data Streams* · [River](https://riverml.xyz/)
+5. **UCB Bandits** — Auer et al. (2002) *Finite-time Analysis of the Multiarmed Bandit Problem*
+6. **Thompson Sampling** — Thompson (1933)
+7. **Avalanche** — [avalanche.continualai.org](https://avalanche.continualai.org/)
+
+---
+
+**Version**: 0.1.0 | **Last Updated**: 2026-03-01
