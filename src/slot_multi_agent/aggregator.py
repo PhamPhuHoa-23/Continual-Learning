@@ -230,7 +230,7 @@ class CRPExpertAggregator(nn.Module):
         expert_lr: float = 1e-3,
         routing_margin: float = 1.0,
         routing_weight: float = 0.5,
-        classes_per_expert: int = 20,
+        classes_per_expert: int = 10,
         device: str = "cpu",
     ):
         super().__init__()
