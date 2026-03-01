@@ -1,0 +1,103 @@
+# AdaSlot Configuration for CIFAR-100
+
+experiment_name: "cifar100_adaslot_baseline"
+
+# Data Configuration
+data:
+  dataset: "cifar100"
+  n_tasks: 10                # 10 classes per task
+  batch_size: 64
+  num_workers: 4
+  seed: 42
+  data_root: "./data"
+
+# Backbone Configuration  
+backbone:
+  type: "vit_b_16"          # ViT-B/16
+  pretrained: true
+  pretrained_source: "imagenet21k"
+  freeze: false             # Fine-tune backbone
+
+# AdaSlot Module Configuration
+adaslot:
+  # Slot Attention Parameters
+  num_slots: 7
+  slot_dim: 128
+  feature_dim: 768          # ViT-B/16 output dim
+  num_iterations: 3
+  num_heads: 1
+  mlp_hidden_dim: 256
+  epsilon: 1.0e-8
+  
+  # Adaptive Selection (Gumbel-Softmax)
+  use_gumbel: true
+  gumbel_low_bound: 1       # Keep at least 1 slot
+  init_temperature: 1.0
+  min_temperature: 0.5
+  temperature_anneal_rate: 0.00003
+  
+  # Primitive Selection
+  use_primitive: true
+  primitive_hidden_dim: 128
+  
+  # Reconstruction Decoder
+  use_decoder: true
+  decoder_hidden_dim: 256
+  decoder_layers: 2
+
+# Loss Configuration
+loss:
+  # Classification loss
+  use_cross_entropy: true
+  weight_cross_entropy: 1.0
+  
+  # Primitive loss (concept-level KL divergence)
+  use_primitive: true
+  weight_primitive: 10.0
+  primitive_temperature: 10.0
+  
+  # Reconstruction loss
+  use_reconstruction: true
+  weight_reconstruction: 1.0
+  
+  # Supervised contrastive loss (optional)
+  use_supcon: false
+  weight_supcon: 0.1
+  supcon_temperature: 0.07
+
+# Training Configuration
+training:
+  epochs_per_task: 20
+  learning_rate: 0.0001
+  optimizer: "adam"
+  weight_decay: 0.0001
+  
+  # Learning rate schedule
+  lr_scheduler: "cosine"
+  warmup_epochs: 2
+  
+  # Global step tracking (for temperature annealing)
+  track_global_step: true
+  
+  # Gradient clipping
+  gradient_clip_val: 1.0
+
+# Classifier Configuration
+classifier:
+  type: "linear"
+  hidden_dim: 256
+  dropout: 0.1
+
+# Logging and Checkpointing
+logging:
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  
+checkpoint:
+  save_top_k: 3
+  monitor: "val_acc"
+  mode: "max"
+  save_last: true
+
+# Output
+output_dir: "./checkpoints/cifar100_adaslot"

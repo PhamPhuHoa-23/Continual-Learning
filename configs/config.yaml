@@ -1,0 +1,387 @@
+# ============================================
+# SLOT MULTI-AGENT SYSTEM CONFIGURATION
+# Continual Learning with Slot Attention & DINO
+# ============================================
+
+# Project metadata
+project:
+  name: "slot-multi-agent-cl"
+  version: "0.1.0"
+  description: "Continual Learning with Slot Attention and Multi-Agent System"
+
+# Device configuration
+device:
+  type: "cuda"  # 'cuda', 'cpu', or 'cuda:0', 'cuda:1', etc.
+  mixed_precision: true  # Use automatic mixed precision (fp16)
+
+# Random seed for reproducibility
+seed: 42
+
+# ============================================
+# SLOT ATTENTION CONFIGURATION
+# ============================================
+slot_attention:
+  # Adaptive vs Fixed slots
+  adaptive: true  # If true, use AdaSlot (adaptive slot count)
+  
+  # For adaptive slots (AdaSlot)
+  min_slots: 3      # Minimum number of slots
+  max_slots: 10     # Maximum number of slots
+  slot_dim: 64      # Dimension of each slot
+  
+  # For fixed slots (original Slot Attention)
+  # num_slots: 7    # Only used if adaptive=false
+  
+  # Slot Attention hyperparameters
+  num_iterations: 3              # Number of attention iterations
+  encoder_hidden_dim: 64         # Encoder CNN hidden dimension
+  decoder_hidden_dim: 64         # Decoder CNN hidden dimension
+  
+  # Input preprocessing
+  input_channels: 3              # RGB images
+  input_size: 64                 # Image size (64x64 for Tiny-ImageNet, 32x32 for CIFAR)
+  
+  # Pretrained checkpoint
+  pretrained:
+    enabled: false               # Load pretrained Slot Attention weights
+    checkpoint_path: null        # Path to checkpoint file
+                                 # Example: "./checkpoints/CLEVR10.ckpt" (AdaSlot)
+                                 #          "./checkpoints/slot_attention_pretrained.pth"
+    strict_load: false           # Strict mode for loading (false = ignore missing keys)
+    freeze: false                # Freeze Slot Attention weights during training
+
+
+# ============================================
+# ATOMIC AGENTS CONFIGURATION
+# ============================================
+agents:
+  num_agents: 50                 # Total number of agents in the pool
+  
+  # Agent architecture
+  architecture: "residual_mlp"   # 'residual_mlp' or 'lightweight_mlp'
+  slot_dim: 64                   # Must match slot_attention.slot_dim
+  hidden_dim: 256                # Internal MLP hidden dimension
+  num_blocks: 3                  # Number of residual blocks
+  dropout: 0.1                   # Dropout rate
+  
+  # Output configuration (CRITICAL!)
+  num_prototypes: 256            # Number of discrete concepts per agent
+                                 # Options: 128, 256, 512, 1024
+                                 # Larger = more expressive but slower
+                                 # DINOv2 uses 65536 but that requires huge batch size
+  
+  # DINO training hyperparameters
+  dino:
+    student_temp: 0.1            # Student temperature (sharpening)
+    teacher_temp: 0.07           # Teacher temperature (sharper, more confident)
+    center_momentum: 0.9         # EMA momentum for center update
+    teacher_momentum: 0.996      # EMA momentum for teacher update
+                                 # Higher = slower teacher update (more stable)
+  
+  # Pretrained checkpoint (for Phase 1 trained agents)
+  pretrained:
+    enabled: false               # Load pretrained agent weights
+    checkpoint_path: null        # Path to checkpoint file
+                                 # Example: "./checkpoints/agents_phase1_epoch10.pth"
+    load_teacher: true           # Also load teacher weights (if available)
+    strict_load: false           # Strict mode for loading
+    freeze: false                # Freeze agent weights (skip Phase 1 training)
+
+
+# ============================================
+# PERFORMANCE ESTIMATORS CONFIGURATION
+# ============================================
+estimators:
+  # Type of estimator for each agent
+  type: "vae"                    # Options: 'vae', 'mlp', 'hybrid'
+  
+  # VAE estimator config
+  vae:
+    latent_dim: 16               # Latent space dimension
+    hidden_dims: [64, 32]        # Encoder/decoder hidden dimensions
+    beta: 1.0                    # KL divergence weight (β-VAE)
+  
+  # MLP estimator config
+  mlp:
+    hidden_dim: 128              # Hidden dimension
+    num_layers: 3                # Number of layers
+
+
+# ============================================
+# AGENT SELECTION CONFIGURATION
+# ============================================
+selection:
+  # Selection strategy
+  # Options:
+  #   - 'topk_estimator': Simple top-k by estimator score (no exploration)
+  #   - 'bandit_ucb': Upper Confidence Bound (exploration-exploitation)
+  #   - 'bandit_thompson': Thompson Sampling (Bayesian)
+  #   - 'bandit_epsilon_greedy': Epsilon-greedy strategy
+  #   - 'weighted_topk': Softmax-weighted top-k (baseline)
+  strategy: "topk_estimator"     # START WITH THIS (simpler)
+  
+  # Top-k parameter
+  k: 3                           # Number of agents per slot
+  
+  # Bandit-specific parameters (only used if strategy starts with 'bandit_')
+  bandit:
+    # UCB parameters
+    ucb:
+      exploration_constant: 2.0  # Higher = more exploration
+    
+    # Thompson Sampling parameters
+    thompson:
+      alpha_init: 1.0            # Prior for Beta distribution (successes)
+      beta_init: 1.0             # Prior for Beta distribution (failures)
+    
+    # Epsilon-Greedy parameters
+    epsilon_greedy:
+      epsilon: 0.1               # Exploration probability (0.1 = 10%)
+      epsilon_decay: 0.995       # Decay rate per step
+      min_epsilon: 0.01          # Minimum epsilon value
+    
+    # Weighted Top-K parameters
+    weighted_topk:
+      temperature: 1.0           # Softmax temperature for weighting
+  
+  # Agent weighting
+  use_weights: true              # If true, weight agents by estimated performance
+  weight_temperature: 1.0        # Temperature for softmax weighting
+
+
+# ============================================
+# AGGREGATOR CONFIGURATION (Decision Tree)
+# ============================================
+aggregator:
+  # Type of aggregator
+  # Options:
+  #   - 'hoeffding': Basic Hoeffding Tree (VFDT)
+  #   - 'hoeffding_adaptive': Adaptive Hoeffding Tree (handles concept drift)
+  #   - 'ensemble': Adaptive Random Forest (multiple trees)
+  type: "hoeffding_adaptive"     # Recommended for continual learning
+  
+  # Hoeffding Tree parameters
+  hoeffding:
+    grace_period: 200            # Number of instances before attempting split
+    split_confidence: 1.0e-5     # Confidence level for Hoeffding bound (δ)
+    leaf_prediction: "nba"       # Leaf prediction: 'mc' (majority class), 
+                                 # 'nb' (naive bayes), 'nba' (naive bayes adaptive)
+  
+  # Ensemble parameters (only if type='ensemble')
+  ensemble:
+    n_models: 10                 # Number of trees in the forest
+    max_features: "sqrt"         # Max features per tree: 'sqrt', 'log2', or int
+    grace_period: 200            # Per-tree grace period
+    split_confidence: 1.0e-5     # Per-tree split confidence
+
+
+# ============================================
+# TRAINING CONFIGURATION
+# ============================================
+training:
+  # Phase 1: Agent training (DINO SSL, unsupervised)
+  phase1_agents:
+    enabled: true
+    epochs: 10                   # Number of epochs
+    batch_size: 32               # Batch size
+    learning_rate: 1.0e-3        # Learning rate
+    weight_decay: 0.04           # Weight decay (AdamW)
+    clip_grad_norm: 3.0          # Gradient clipping (max norm)
+    warmup_epochs: 1             # Learning rate warmup
+    scheduler: "cosine"          # LR scheduler: 'cosine', 'step', 'none'
+    
+    # Optimizer
+    optimizer: "adamw"           # 'adam', 'adamw', 'sgd'
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    
+    # Logging
+    log_every_n_steps: 10
+    validate_every_n_epochs: 1
+  
+  # Phase 2: Tree training (supervised, incremental)
+  phase2_tree:
+    enabled: true
+    # No epochs/batch size - incremental learning (one-by-one)
+    # Tree learns online as examples arrive
+    
+    # Evaluation
+    eval_every_n_examples: 100   # Evaluate after N examples
+    
+    # Bandit update (if using bandit strategy)
+    update_bandit: true          # Update bandit statistics during training
+    reward_type: "accuracy"      # Reward: 'accuracy', 'loss', 'confidence'
+
+
+# ============================================
+# DATA CONFIGURATION
+# ============================================
+data:
+  # Dataset
+  dataset: "cifar100"            # Options: 'cifar100', 'tiny_imagenet', 'imagenet'
+  data_root: "./data"            # Data directory
+  
+  # Continual learning setup
+  continual_learning:
+    scenario: "class_incremental" # 'class_incremental', 'domain_incremental', 'task_incremental'
+    num_experiences: 10           # Number of tasks/experiences
+    shuffle: true                 # Shuffle classes before splitting
+    task_incremental_at_test: false  # Provide task ID at test time? (usually false)
+  
+  # Data preprocessing
+  preprocessing:
+    # Normalization (ImageNet stats)
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std: [0.229, 0.224, 0.225]
+    
+    # Augmentation (Phase 1 - DINO training)
+    augmentation_phase1:
+      enabled: true
+      color_jitter:
+        brightness: 0.4
+        contrast: 0.4
+        saturation: 0.2
+        hue: 0.1
+        prob: 0.8
+      random_grayscale_prob: 0.2
+      gaussian_blur_prob: 0.5
+      horizontal_flip_prob: 0.5
+    
+    # Augmentation (Phase 2 - Tree training)
+    augmentation_phase2:
+      enabled: false             # Usually no augmentation for tree training
+  
+  # DataLoader
+  dataloader:
+    num_workers: 4               # Number of workers for data loading
+    pin_memory: true             # Pin memory for faster GPU transfer
+    persistent_workers: true     # Keep workers alive between epochs
+
+
+# ============================================
+# EVALUATION CONFIGURATION
+# ============================================
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "accuracy"                 # Overall accuracy
+    - "per_class_accuracy"       # Per-class accuracy
+    - "forgetting"               # Average forgetting
+    - "forward_transfer"         # Forward transfer
+    - "backward_transfer"        # Backward transfer (negative forgetting)
+  
+  # Evaluation frequency
+  eval_every_n_experiences: 1    # Evaluate after each task
+  eval_on_all_seen_classes: true # Evaluate on all classes seen so far
+  
+  # Save predictions
+  save_predictions: true
+  predictions_dir: "./predictions"
+
+
+# ============================================
+# CHECKPOINTING & LOGGING
+# ============================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "./checkpoints"
+  
+  # What to save
+  save_agents: true              # Save agent weights
+  save_estimators: true          # Save estimator weights
+  save_tree: true                # Save tree state (pickle)
+  save_optimizer: true           # Save optimizer state
+  
+  # Checkpointing frequency
+  save_every_n_epochs: 5         # Phase 1
+  save_every_n_experiences: 1    # Phase 2
+  
+  # Keep only best/last
+  save_best_only: false          # If true, only save best checkpoint
+  keep_last_n: 3                 # Keep last N checkpoints
+
+logging:
+  enabled: true
+  log_dir: "./logs"
+  
+  # Logging backend
+  backend: "tensorboard"         # Options: 'tensorboard', 'wandb', 'mlflow', 'none'
+  
+  # Wandb config (if backend='wandb')
+  wandb:
+    project: "slot-multi-agent-cl"
+    entity: null                 # Your wandb username/team
+    tags: ["continual-learning", "slot-attention", "dino"]
+  
+  # What to log
+  log_gradients: false           # Log gradient histograms (expensive)
+  log_weights: false             # Log weight histograms (expensive)
+  log_images: true               # Log sample images + reconstructions
+  log_slots: true                # Log slot attention maps
+  num_images_to_log: 8           # Number of images per log
+
+
+# ============================================
+# ABLATION STUDIES (Optional)
+# ============================================
+ablation:
+  enabled: false
+  
+  # Disable certain components for ablation
+  disable_slot_attention: false  # Use full image features instead
+  disable_dino_training: false   # Random init agents instead
+  disable_bandit_exploration: false  # Pure greedy selection
+  disable_adaptive_slots: false  # Use fixed slot count
+
+
+# ============================================
+# ADVANCED OPTIONS
+# ============================================
+advanced:
+  # Multi-GPU
+  distributed: false             # Use distributed training
+  world_size: 1                  # Number of GPUs
+  dist_backend: "nccl"           # 'nccl' for GPU, 'gloo' for CPU
+  
+  # Gradient accumulation
+  gradient_accumulation_steps: 1 # Accumulate gradients over N steps
+  
+  # Memory optimization
+  gradient_checkpointing: false  # Save memory at cost of speed
+  empty_cache_every_n_steps: 100 # Empty CUDA cache periodically
+  
+  # Reproducibility
+  deterministic: false           # Use deterministic algorithms (slower)
+  benchmark: true                # cudnn.benchmark (faster but non-deterministic)
+  
+  # Debugging
+  detect_anomaly: false          # Detect autograd anomalies (very slow)
+  profile: false                 # Profile execution time
+
+
+# ============================================
+# EXPERIMENT TRACKING
+# ============================================
+experiment:
+  name: "baseline"               # Experiment name
+  description: |
+    Baseline experiment with:
+    - Adaptive slot attention (AdaSlot)
+    - 50 agents with 256 prototypes each
+    - VAE-based performance estimators
+    - Simple top-k selection (no bandit)
+    - Hoeffding Adaptive Tree
+    - CIFAR-100 class-incremental (10 tasks)
+  
+  tags:
+    - "baseline"
+    - "adaptive-slots"
+    - "vae-estimator"
+    - "topk-selection"
+  
+  # Notes
+  notes: |
+    This is the baseline configuration.
+    Start with simple top-k selection before trying bandit methods.
+    AdaSlot will automatically determine slot count per image.
+

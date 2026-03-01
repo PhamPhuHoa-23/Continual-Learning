@@ -205,6 +205,10 @@ class DINOLoss(nn.Module):
         Returns:
             loss: Scalar cross-entropy loss
         """
+        # Ensure 2D (batch_size, num_prototypes)
+        student_logits = student_logits.reshape(-1, student_logits.shape[-1])
+        teacher_logits = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+        
         # Teacher: centering + sharpening
         teacher_centered = teacher_logits - self.center
         teacher_probs = F.softmax(teacher_centered / self.teacher_temp, dim=-1)
@@ -223,6 +227,8 @@ class DINOLoss(nn.Module):
     @torch.no_grad()
     def _update_center(self, teacher_logits: torch.Tensor):
         """Update running center with EMA."""
+        # Ensure 2D for mean calculation
+        teacher_logits = teacher_logits.reshape(-1, teacher_logits.shape[-1])
         batch_center = teacher_logits.mean(dim=0, keepdim=True)
         self.center = self.center * self.center_momentum + \
                       batch_center * (1 - self.center_momentum)

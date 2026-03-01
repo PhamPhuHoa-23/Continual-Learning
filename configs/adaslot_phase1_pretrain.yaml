@@ -1,0 +1,69 @@
+# AdaSlot Phase 1: Pretraining with Reconstruction + Primitive Loss
+# 
+# Goal: Learn good slot representations and primitive concepts
+# Focus: Unsupervised/self-supervised learning on all data
+
+seed: 42
+output_dir: "checkpoints/adaslot_phase1"
+
+# Model Configuration
+model:
+  name: "adaslot_module"
+  feature_dim: 128            # Feature dimension from encoder
+  slot_dim: 64                # Dimension of each slot
+  num_slots: 7                # Number of slots to initialize
+  num_iterations: 3           # Slot attention iterations
+  
+  # Temperature annealing for Gumbel-Softmax
+  temperature_init: 1.0
+  temperature_min: 0.5
+  temperature_decay: 0.00003  # τ(t) = max(0.5, 1.0 * exp(-0.00003*t))
+  
+  # Slot selection
+  min_slots: 1                # Minimum slots to keep
+  
+  # Decoder
+  decoder_hidden_dims: [256, 256]
+  position_encoding: true
+
+# Data Configuration
+data:
+  dataset: "cifar100"
+  root: "./data"
+  n_experiences: 10           # Total tasks
+  train_transform: "standard"
+  eval_transform: "standard"
+
+# Phase 1 Specific Config
+phase1:
+  epochs: 50                  # Pretrain for 50 epochs
+  tasks: null                 # Use all tasks (null = all)
+  save_interval: 10           # Save checkpoint every 10 epochs
+
+# Training Configuration
+training:
+  batch_size: 64
+  num_workers: 4
+  
+  optimizer:
+    type: "adamw"
+    lr: 0.0003                # 3e-4
+    weight_decay: 0.0001
+  
+  scheduler:
+    type: "cosine"
+
+# Loss Configuration
+losses:
+  reconstruction:
+    type: "mse"
+    weight: 1.0
+  
+  primitive:
+    type: "primitive"
+    weight: 30.0              # Balanced: ~25% of total loss (from weight tuning)
+    temperature: 10.0         # τ_p = 10
+  
+  sparsity:
+    type: "l1"
+    weight: 0.1               # Encourage dropping unnecessary slots
