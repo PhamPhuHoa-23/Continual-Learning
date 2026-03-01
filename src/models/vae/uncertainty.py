@@ -13,11 +13,12 @@ import torch.nn as nn
 from typing import Optional
 import numpy as np
 
+from ...base.base_uncertainty import BaseUncertaintyEstimator
 from ...base.types import UncertaintyOutput
 from .vae import ConvVAE, VAE
 
 
-class VAEUncertaintyEstimator:
+class VAEUncertaintyEstimator(BaseUncertaintyEstimator):
     """Estimate uncertainty using VAE reconstruction error.
     
     Core Idea:
@@ -54,7 +55,7 @@ class VAEUncertaintyEstimator:
             normalize: Whether to normalize errors using running statistics
             device: Device to run on
         """
-        
+        super().__init__()
         
         self.vae = vae.to(device)
         self.normalize = normalize

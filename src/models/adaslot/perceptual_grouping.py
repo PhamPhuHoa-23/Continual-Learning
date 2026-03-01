@@ -24,8 +24,7 @@ def sample_slot_lower_bound(A: torch.Tensor, lower_bound: int = 1) -> torch.Tens
     """
     B_out = torch.zeros_like(A, device=A.device)
     batch_slot_leftnum = (A != 0).sum(-1)
-    lesser_column_idx = torch.nonzero(
-        batch_slot_leftnum < lower_bound).reshape(-1)
+    lesser_column_idx = torch.nonzero(batch_slot_leftnum < lower_bound).reshape(-1)
     for j in lesser_column_idx:
         left_slot_mask = A[j]
         sample_slot_zero_idx = torch.nonzero(left_slot_mask == 0).reshape(-1)
@@ -80,10 +79,8 @@ class SlotAttentionGumbelV1(nn.Module):
         self.scale = self.dims_per_head ** -0.5
 
         self.to_q = nn.Linear(dim, self.kvq_dim, bias=use_projection_bias)
-        self.to_k = nn.Linear(feature_dim, self.kvq_dim,
-                              bias=use_projection_bias)
-        self.to_v = nn.Linear(feature_dim, self.kvq_dim,
-                              bias=use_projection_bias)
+        self.to_k = nn.Linear(feature_dim, self.kvq_dim, bias=use_projection_bias)
+        self.to_v = nn.Linear(feature_dim, self.kvq_dim, bias=use_projection_bias)
 
         self.gru = nn.GRUCell(self.kvq_dim, dim)
 
@@ -99,8 +96,7 @@ class SlotAttentionGumbelV1(nn.Module):
         slots_prev = slots
 
         slots = self.norm_slots(slots)
-        q = self.to_q(slots).view(
-            bs, n_slots, self.n_heads, self.dims_per_head)
+        q = self.to_q(slots).view(bs, n_slots, self.n_heads, self.dims_per_head)
 
         dots = torch.einsum("bihd,bjhd->bihj", q, k) * self.scale
         if masks is not None:
@@ -137,7 +133,6 @@ class SlotAttentionGumbelV1(nn.Module):
         conditioning: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
         global_step=None,
-        dynamic_slots: bool = True,
     ):
         b, n, d = inputs.shape
         slots = conditioning
@@ -152,19 +147,9 @@ class SlotAttentionGumbelV1(nn.Module):
         else:
             slots, attn = self.iterate(slots, k, v, masks)
 
-        _, k_slots, _ = conditioning.shape
-
-        if not dynamic_slots:
-            # Fixed slots: keep all, skip Gumbel entirely
-            hard_keep_decision = torch.ones(
-                b, k_slots, dtype=slots.dtype, device=slots.device)
-            slots_keep_prob = torch.ones(
-                b, k_slots, dtype=slots.dtype, device=slots.device)
-            return slots, attn, slots_keep_prob, hard_keep_decision
-
         # Gumbel selection
-        prev_decision = torch.ones(
-            b, k_slots, dtype=slots.dtype, device=slots.device)
+        _, k_slots, _ = conditioning.shape
+        prev_decision = torch.ones(b, k_slots, dtype=slots.dtype, device=slots.device)
 
         slots_keep_prob = self.single_gumbel_score_network(slots)
         if global_step is None:
@@ -243,7 +228,6 @@ class SlotAttentionGroupingGumbelV1(nn.Module):
         conditioning: torch.Tensor,
         slot_masks: Optional[torch.Tensor] = None,
         global_step=None,
-        dynamic_slots: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -252,7 +236,6 @@ class SlotAttentionGroupingGumbelV1(nn.Module):
             conditioning: (B, num_slots, object_dim) initial slot embeddings.
             slot_masks: Optional mask for slots.
             global_step: Optional global step for temperature scheduling.
-            dynamic_slots: If False, all slots are kept (Gumbel disabled).
 
         Returns:
             Dict with 'objects', 'is_empty', 'feature_attributions',
@@ -262,8 +245,7 @@ class SlotAttentionGroupingGumbelV1(nn.Module):
             features = self.positional_embedding(features, positions)
 
         slots, attn, slots_keep_prob, hard_keep_decision = self.slot_attention(
-            features, conditioning, slot_masks, global_step=global_step,
-            dynamic_slots=dynamic_slots,
+            features, conditioning, slot_masks, global_step=global_step
         )
 
         return {

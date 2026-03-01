@@ -80,9 +80,6 @@ experiments/
 temp/
 tmp/
 
-# Bins (deprecated/debug files)
-bins/
-
 # Large files
 *.zip
 *.tar

@@ -229,8 +229,7 @@ class ContinualCIFAR100Dataset(Dataset):
         train: bool,
         task_classes: List[int],
         transform: Optional[transforms.Compose] = None,
-        download: bool = True,
-        max_samples: Optional[int] = None
+        download: bool = True
     ):
         """
         Initialize task-specific CIFAR-100 dataset.
@@ -241,7 +240,6 @@ class ContinualCIFAR100Dataset(Dataset):
             task_classes: List of class indices for this task
             transform: Torchvision transforms to apply
             download: If True, download CIFAR-100 if not present
-            max_samples: If set, limit to this many samples (for fast testing)
         """
         self.base_dataset = datasets.CIFAR100(
             root=root,
@@ -254,28 +252,10 @@ class ContinualCIFAR100Dataset(Dataset):
         self.task_classes_set = set(task_classes)
         
         # Find indices of samples belonging to task_classes
-        # If max_samples is set, limit to max_samples PER CLASS (not total)
-        self.indices = []
-        
-        if max_samples is not None:
-            # Track samples per class to ensure balanced sampling
-            class_counts = {cls: 0 for cls in task_classes}
-            max_per_class = max_samples
-            
-            for idx, (_, label) in enumerate(self.base_dataset):
-                if label in self.task_classes_set:
-                    if class_counts[label] < max_per_class:
-                        self.indices.append(idx)
-                        class_counts[label] += 1
-                    
-                    # Stop when all classes have max_samples
-                    if all(cnt >= max_per_class for cnt in class_counts.values()):
-                        break
-        else:
-            # No limit - collect all samples
-            for idx, (_, label) in enumerate(self.base_dataset):
-                if label in self.task_classes_set:
-                    self.indices.append(idx)
+        self.indices = [
+            idx for idx, (_, label) in enumerate(self.base_dataset)
+            if label in self.task_classes_set
+        ]
         
         # We keep original labels (not remapped)
         # This is important for class-incremental learning
@@ -284,7 +264,6 @@ class ContinualCIFAR100Dataset(Dataset):
         logger.info(
             f"Created {'train' if train else 'test'} dataset for "
             f"{len(task_classes)} classes with {len(self.indices)} samples"
-            f"{f' ({max_samples} per class)' if max_samples else ''}"
         )
     
     def __len__(self) -> int:
@@ -351,8 +330,7 @@ def get_continual_cifar100_loaders(
     num_workers: int = 4,
     root: str = './data',
     seed: Optional[int] = 42,
-    pin_memory: bool = True,
-    max_samples_per_task: Optional[int] = None
+    pin_memory: bool = True
 ) -> Tuple[List[DataLoader], List[DataLoader], np.ndarray]:
     """
     Create data loaders for class-incremental learning on CIFAR-100.
@@ -372,7 +350,6 @@ def get_continual_cifar100_loaders(
         root: Root directory for data storage
         seed: Random seed for reproducibility
         pin_memory: If True, pin memory for faster GPU transfer
-        max_samples_per_task: If set, limit each task to this many samples (for fast testing)
     
     Returns:
         Tuple of (train_loaders, test_loaders, class_order):
@@ -440,8 +417,7 @@ def get_continual_cifar100_loaders(
             train=True,
             task_classes=task_classes,
             transform=train_transform,
-            download=True,
-            max_samples=max_samples_per_task
+            download=True
         )
         
         train_loader = DataLoader(
@@ -459,8 +435,7 @@ def get_continual_cifar100_loaders(
             train=False,
             task_classes=seen_classes,
             transform=test_transform,
-            download=True,
-            max_samples=max_samples_per_task
+            download=True
         )
         
         test_loader = DataLoader(
