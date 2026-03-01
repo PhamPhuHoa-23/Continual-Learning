@@ -13,10 +13,11 @@ At inference, class is predicted by:
 
 Usage
 -----
-    from cont_src.training.configs      import SLDAConfig
-    from cont_src.training.slda_trainer import SLDATrainer, StreamLDA
+    from cont_src.training.configs                import SLDAConfig
+    from cont_src.training.slda_trainer           import SLDATrainer
+    from cont_src.models.classifiers              import SLDAClassifier
 
-    slda    = StreamLDA(n_classes=100, feature_dim=64)
+    slda    = SLDAClassifier(feature_dim=64, n_classes=100)
     cfg     = SLDAConfig(feature_dim=64, n_classes=100)
     trainer = SLDATrainer(cfg, slot_model, agents, aggregator, slda)
     trainer.fit(train_loader)
@@ -26,7 +27,6 @@ Usage
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -34,147 +34,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from cont_src.training.configs import SLDAConfig
+from cont_src.training.configs              import SLDAConfig
+from cont_src.models.classifiers.slda       import SLDAClassifier
+
+# Backward-compat alias so old code that used StreamLDA still works
+StreamLDA = SLDAClassifier
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# StreamLDA: online mean + covariance
-# ---------------------------------------------------------------------------
-
-class StreamLDA:
-    """
-    Incremental SLDA accumulator.
-
-    Maintains:
-        n_c      : class counts           dict[int → int]
-        mu_c     : class means            dict[int → Tensor(D,)]
-        S        : shared scatter matrix  Tensor(D, D)   (Welford)
-        n_total  : total samples seen
-    """
-
-    def __init__(self, n_classes: int, feature_dim: int, shrinkage: float = 1e-4):
-        self.n_classes = n_classes
-        self.feature_dim = feature_dim
-        self.shrinkage = shrinkage
-
-        self._n_c:     Dict[int, int] = {}
-        self._mu_c:    Dict[int, torch.Tensor] = {}
-        self._S:       torch.Tensor = torch.zeros(feature_dim, feature_dim)
-        self._n_total: int = 0
-
-    # ------------------------------------------------------------------
-    # Incremental update
-    # ------------------------------------------------------------------
-
-    def update(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        """
-        Update statistics with a new batch.
-
-        Parameters
-        ----------
-        features : (B, D) – L2-normalised recommended but not required
-        labels   : (B,)   – integer class indices
-        """
-        features = features.detach().cpu().float()
-        labels = labels.detach().cpu()
-
-        for feat, lbl in zip(features, labels):
-            c = int(lbl.item())
-
-            # --- update class mean (online) ---
-            if c not in self._n_c:
-                self._n_c[c] = 0
-                self._mu_c[c] = torch.zeros(self.feature_dim)
-
-            n_old = self._n_c[c]
-            n_new = n_old + 1
-            delta = feat - self._mu_c[c]
-            self._mu_c[c] = self._mu_c[c] + delta / n_new
-            self._n_c[c] = n_new
-
-            # --- update scatter matrix (Welford) ---
-            delta2 = feat - self._mu_c[c]
-            self._S = self._S + torch.outer(delta, delta2)
-            self._n_total += 1
-
-    # ------------------------------------------------------------------
-    # Prediction
-    # ------------------------------------------------------------------
-
-    @property
-    def cov(self) -> torch.Tensor:
-        """Regularised shared covariance matrix."""
-        if self._n_total <= 1:
-            return torch.eye(self.feature_dim) * (self.shrinkage + 1.0)
-        cov = self._S / (self._n_total - 1)
-        cov = cov + self.shrinkage * torch.eye(self.feature_dim)
-        return cov
-
-    def predict(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Predict class labels using LDA decision rule.
-
-        Parameters
-        ----------
-        features : (B, D)
-
-        Returns
-        -------
-        preds : (B,) LongTensor
-        """
-        if not self._mu_c:
-            raise RuntimeError(
-                "StreamLDA has not been updated with any data yet.")
-
-        features = features.detach().cpu().float()
-
-        cov_inv = torch.linalg.inv(self.cov)             # (D, D)
-
-        # Gather class means into (C, D)
-        classes = sorted(self._mu_c.keys())
-        mu_stack = torch.stack([self._mu_c[c]
-                               for c in classes], dim=0)  # (C, D)
-
-        # Scores:  H @ Σ^{-1} @ μ_c^T  -  ½ μ_c @ Σ^{-1} @ μ_c^T
-        # (B, D) @ (D, D) → (B, D) @ (D, C) → (B, C)
-        h_proj = features @ cov_inv                           # (B, D)
-        scores = h_proj @ mu_stack.t()                        # (B, C)
-        quadform = 0.5 * (mu_stack @ cov_inv * mu_stack).sum(dim=1)   # (C,)
-        scores = scores - quadform.unsqueeze(0)
-
-        idx = scores.argmax(dim=1)                            # (B,)
-        preds = torch.tensor([classes[i] for i in idx.tolist()])
-        return preds
-
-    # ------------------------------------------------------------------
-    # Serialisation
-    # ------------------------------------------------------------------
-
-    def state_dict(self) -> dict:
-        return {
-            "n_c":     self._n_c,
-            "mu_c":    {k: v.clone() for k, v in self._mu_c.items()},
-            "S":       self._S.clone(),
-            "n_total": self._n_total,
-        }
-
-    def load_state_dict(self, state: dict) -> None:
-        self._n_c = state["n_c"]
-        self._mu_c = {k: v.clone() for k, v in state["mu_c"].items()}
-        self._S = state["S"].clone()
-        self._n_total = state["n_total"]
-
-    def save(self, path: str) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(self.state_dict(), path)
-
-    @classmethod
-    def load(cls, path: str, n_classes: int, feature_dim: int, shrinkage: float = 1e-4) -> "StreamLDA":
-        obj = cls(n_classes, feature_dim, shrinkage)
-        obj.load_state_dict(torch.load(path, weights_only=False))
-        return obj
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +123,7 @@ class SLDATrainer:
             images = images.to(self.device)
 
             H = self._extract_H(images)     # (B, D_h)
-            self.slda.update(H, labels)
+            self.slda.fit(H, labels)
             total += images.shape[0]
             pbar.set_postfix(samples=total)
 
