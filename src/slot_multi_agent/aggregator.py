@@ -349,24 +349,31 @@ class CRPExpertAggregator(nn.Module):
     def _ensure_expert_for_class(self, label: int) -> int:
         """
         Ensure there is an expert that owns this class.
-        If not, CRP-style: either assign to an existing expert
-        (if it has room and is not frozen) or create a new one.
+        Assigns classes in INTERLEAVED order: new classes go to the
+        unfrozen expert with the fewest owned classes (round-robin).
+        If all unfrozen experts are full, create a new one.
         """
         existing_idx = self._find_expert_for_class(label)
         if existing_idx is not None:
             return existing_idx
 
-        # Try to find an unfrozen expert that has room
-        # Prefer the most recently created expert (likely for current task)
-        for idx in reversed(range(len(self.experts))):
+        # Find unfrozen expert with fewest classes (interleaved assignment)
+        best_idx = None
+        best_count = float('inf')
+        for idx in range(len(self.experts)):
             if idx in self._frozen_experts:
                 continue
             expert = self.experts[idx]
-            if len(expert.owned_classes) < self.classes_per_expert:
-                self._assign_class_to_expert(label, idx)
-                return idx
+            n = len(expert.owned_classes)
+            if n < self.classes_per_expert and n < best_count:
+                best_count = n
+                best_idx = idx
 
-        # No room → CRP: create new expert
+        if best_idx is not None:
+            self._assign_class_to_expert(label, best_idx)
+            return best_idx
+
+        # No room → create new expert
         if len(self.experts) < self.max_experts:
             init_src = (self.experts[-1] if len(self.experts) > 0
                         else None)
@@ -374,8 +381,6 @@ class CRPExpertAggregator(nn.Module):
             self.experts.append(new_expert)
             new_idx = len(self.experts) - 1
             self._assign_class_to_expert(label, new_idx)
-
-            # Re-init optimizer with new expert params
             self._init_optimizer()
             return new_idx
 
@@ -385,7 +390,6 @@ class CRPExpertAggregator(nn.Module):
                 self._assign_class_to_expert(label, idx)
                 return idx
 
-        # All frozen — shouldn't happen in normal operation
         raise RuntimeError(
             "All experts are frozen and at max capacity. "
             "Cannot assign new class."
